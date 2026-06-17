@@ -128,6 +128,35 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   loopback integration test (register, look up, dial, sync 200 KB of content)
   that runs in CI because the rendezvous is plain QUIC, not multicast; also
   verified end to end through the `horizon` binary against a running rendezvous.
+- Phase 5 Constellation relay (`net` feature): reach a peer when no address
+  either side learns is dialable, both behind NATs that refuse every inbound
+  packet. A relay is a meeting point both peers reach with an outbound connection
+  (which a NAT allows): a serving peer dials the relay and binds under its
+  identity fingerprint (the same non-secret label mDNS and the rendezvous use,
+  from the shared `label` module), and a dialing peer asks the relay to reach that
+  fingerprint; the relay opens a fresh stream to the serving peer and splices the
+  two together, forwarding opaque bytes. The Noise NNpsk0 handshake still runs end
+  to end between the two real peers through the tunnel, so everything past it is
+  ciphertext to the relay and a wrong identity is refused at the far peer exactly
+  as on a direct link. The relay holds no identity (it sees only a fingerprint and
+  the bytes it forwards) so it can run on an untrusted host: the worst a hostile
+  one does is deny service or splice the wrong peers, who then fail each other's
+  handshake. Because the sync runs over the same Noise channel either way, the
+  relay path reuses the serve loop and the dialing transport unchanged; only how
+  the stream is obtained differs. Presence is a live connection, not a lease: the
+  relay keeps a bound peer's connection and withdraws it when that connection
+  closes (QUIC keep-alive holds an idle binding open, a clean unbind flushes the
+  close so withdrawal is prompt, and an ungraceful exit ages out on the idle
+  timeout). This is the path that always works, the fallback a direct dial or a
+  future hole punch is tried before. CLI: `constellation relay` runs the meeting
+  point; `serve --relay <addr>` binds a server to it; `sync --relay <addr>`
+  tunnels to a peer through it after any direct candidates fail. Tests: wire-codec
+  units, plus a loopback integration test that binds, tunnels and syncs 200 KB in
+  both directions, refuses a dialer with no bound peer and one of a wrong
+  identity, and confirms a dropped binding is withdrawn; all run in CI because the
+  relay is plain QUIC. Also verified end to end through the `horizon` binary: an
+  empty replica pulled a full generation through a running relay with no direct
+  address for the peer anywhere. Slim builds turn `net` off.
 
 ## Next
 
@@ -138,15 +167,17 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
-- Phase 5 Constellation beyond the LAN, remaining: the rendezvous (an
-  internet-reachable meeting point that maps identity fingerprints to addresses,
-  bridging discovery across subnets) is done and tested on darwin, alongside the
+- Phase 5 Constellation beyond the LAN, remaining: the rendezvous (a meeting
+  point mapping identity fingerprints to addresses across subnets) and the relay
+  (the fallback that forwards bytes for peers that cannot reach each other at all)
+  are both done and tested, the relay end to end through the binary, alongside the
   QUIC + Noise transport, serve/sync CLI, concurrent multi-peer serving, and mDNS
-  LAN discovery. What is left needs real hosts behind real NATs: UDP hole punching
-  (the rendezvous already records each peer's observed public address, the input a
-  punch needs, and quinn can open a connection from a bound socket toward a peer
-  dialing back) and a relay that carries bytes for peers that cannot reach each
-  other directly at all. Real-host and network work.
+  LAN discovery. The relay is the path that always works; what is left is the
+  optimisation that avoids it when possible: UDP hole punching, which wants real
+  hosts behind real NATs to test. The rendezvous already records each peer's
+  observed public address (the input a punch needs), and quinn can open a
+  connection from a bound socket toward a peer dialing back. Real-host and network
+  work.
 - Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
   re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
   device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

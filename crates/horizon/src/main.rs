@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use constellation::{
-    LocalTransport, NetworkTransport, Rendezvous, RendezvousClient, Server, SyncReport,
+    LocalTransport, NetworkTransport, Relay, Rendezvous, RendezvousClient, Server, SyncReport,
 };
 use lifestream::{Lifestream, Object, ObjectId};
 use reconstitution::Share;
@@ -67,6 +67,9 @@ enum ConstellationOp {
         /// Also register at this rendezvous (host:port) so peers beyond the LAN can find this server
         #[arg(long)]
         rendezvous: Option<String>,
+        /// Also serve through this relay (host:port) so peers can reach this server when no address is dialable
+        #[arg(long)]
+        relay: Option<String>,
     },
     /// Sync with a peer that is serving the same identity
     Sync {
@@ -79,6 +82,9 @@ enum ConstellationOp {
         /// Find a peer of this identity through a rendezvous (host:port) instead of an address
         #[arg(long)]
         rendezvous: Option<String>,
+        /// Reach the peer through this relay (host:port) if no direct address works
+        #[arg(long)]
+        relay: Option<String>,
         /// Push local -> peer instead of the default pull
         #[arg(long)]
         push: bool,
@@ -91,6 +97,13 @@ enum ConstellationOp {
     Rendezvous {
         /// Address to listen on (host:port)
         #[arg(long, default_value = "0.0.0.0:7778")]
+        listen: String,
+    },
+    /// Run a relay server: forwards bytes between two peers that cannot reach
+    /// each other directly. Holds no identity and sees only ciphertext.
+    Relay {
+        /// Address to listen on (host:port)
+        #[arg(long, default_value = "0.0.0.0:7779")]
         listen: String,
     },
 }
@@ -466,13 +479,15 @@ fn print_report(from: &str, to: &str, r: &SyncReport) {
 
 // Constellation over the network. `serve` opens this store and answers peers
 // that prove the same identity through the Noise handshake, advertises itself on
-// the LAN over mDNS (unless --no-announce), and optionally registers at a
-// rendezvous (--rendezvous) so peers beyond the LAN can find it too. `sync` dials
-// such a peer (given as host:port, found with --discover, or looked up with
-// --rendezvous) and runs the same diff-and-ship the in-process sync runs, only
-// the far transport is a QUIC link. Direction defaults to pull (bring the peer's
-// objects here); --push reverses it and --both converges the two. `rendezvous`
-// runs the meeting point itself.
+// the LAN over mDNS (unless --no-announce), optionally registers at a rendezvous
+// (--rendezvous) so peers beyond the LAN can find it, and optionally binds to a
+// relay (--relay) so peers can reach it even when no address is dialable. `sync`
+// reaches such a peer (given as host:port, found with --discover, looked up with
+// --rendezvous, or tunneled through --relay) and runs the same diff-and-ship the
+// in-process sync runs, only the far transport is a QUIC link. Direction defaults
+// to pull (bring the peer's objects here); --push reverses it and --both
+// converges the two. `rendezvous` and `relay` run those meeting points
+// themselves; both hold no identity.
 fn constellation_cmd(op: ConstellationOp) -> Result<()> {
     match op {
         ConstellationOp::Serve {
@@ -480,6 +495,7 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
             listen,
             no_announce,
             rendezvous,
+            relay,
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
@@ -523,6 +539,17 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
                     Some(reg)
                 }
             };
+            // Likewise hold the relay binding: it keeps a connection to the relay
+            // open so dialers can be tunneled in, and withdraws when serve exits.
+            let _binding = match relay {
+                None => None,
+                Some(rladdr) => {
+                    let rl: SocketAddr = rladdr.parse().context("parse --relay host:port")?;
+                    let binding = server.bind_relay(rl).context("bind to relay")?;
+                    eprintln!("bound to relay {rl}; peers can reach this server through it");
+                    Some(binding)
+                }
+            };
             eprintln!("peers must prove the same identity; ctrl-c to stop");
             server.wait();
         }
@@ -531,14 +558,14 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
             peer,
             discover,
             rendezvous,
+            relay,
             push,
             both,
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
             let candidates = resolve_peers(peer, discover, rendezvous, &key)?;
-            let (addr, remote) = connect_any(&candidates, key)?;
-            let peer = addr.to_string();
+            let (peer, remote) = connect_peer(candidates, relay, key)?;
             let local = LocalTransport::new(ls);
             let here = store.display().to_string();
             if both {
@@ -561,15 +588,27 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
             );
             rz.wait();
         }
+        ConstellationOp::Relay { listen } => {
+            let addr: SocketAddr = listen.parse().context("parse --listen host:port")?;
+            let relay = Relay::start(addr)?;
+            println!("relay serving on {}", relay.local_addr());
+            eprintln!(
+                "peers bind and connect by identity fingerprint; this server only forwards \
+                 ciphertext and holds no identity; ctrl-c to stop"
+            );
+            relay.wait();
+        }
     }
     Ok(())
 }
 
-// The addresses to try dialing, in order. An explicit host:port is the sole
-// candidate when given. Otherwise we gather what was asked for: a rendezvous
+// The direct addresses to try dialing, in order. An explicit host:port is the
+// sole candidate when given. Otherwise we gather what was asked for: a rendezvous
 // lookup (peers beyond the LAN) and/or an mDNS browse (peers on it). One peer can
 // surface as several addresses, and a rendezvous entry could even be stale or
-// wrong, so the caller tries each until one completes the handshake.
+// wrong, so the caller tries each until one completes the handshake. The list may
+// be empty (nothing asked, or asked and nothing found); the caller decides what
+// to do then, including falling back to a relay.
 fn resolve_peers(
     peer: Option<String>,
     discover: bool,
@@ -580,9 +619,6 @@ fn resolve_peers(
         return Ok(vec![p.parse().context("parse peer host:port")?]);
     }
 
-    // Remember whether a source was even requested before `rendezvous` is moved,
-    // so the empty result can tell "you asked for nothing" from "nothing found".
-    let asked = discover || rendezvous.is_some();
     let mut candidates: Vec<SocketAddr> = Vec::new();
 
     if let Some(rzaddr) = rendezvous {
@@ -609,14 +645,6 @@ fn resolve_peers(
         candidates.extend(found);
     }
 
-    if candidates.is_empty() {
-        return Err(if asked {
-            anyhow!("no peer of this identity found")
-        } else {
-            anyhow!("give a peer address, or pass --discover or --rendezvous to find one")
-        });
-    }
-
     // One peer can resolve to several addresses (loopback and LAN, say); keep
     // them distinct and ordered so the dial is deterministic.
     candidates.sort();
@@ -624,26 +652,47 @@ fn resolve_peers(
     Ok(candidates)
 }
 
-// Try each candidate in turn, returning the first that connects. A wrong address
-// (a stale or poisoned rendezvous entry, a peer of another identity) fails the
-// Noise handshake here and we move on; only when none accept do we give up.
-fn connect_any(addrs: &[SocketAddr], key: [u8; 32]) -> Result<(SocketAddr, NetworkTransport)> {
+// Connect to the peer. Try each direct candidate in turn; a wrong address (a
+// stale or poisoned rendezvous entry, a peer of another identity) fails the Noise
+// handshake here and we move on. Then, if a relay was given, fall back to
+// tunneling through it, the path that works when no address is dialable at all.
+// Returns a label for the route taken alongside the transport.
+fn connect_peer(
+    addrs: Vec<SocketAddr>,
+    relay: Option<String>,
+    key: [u8; 32],
+) -> Result<(String, NetworkTransport)> {
     let mut last: Option<String> = None;
-    for &addr in addrs {
-        match NetworkTransport::connect(addr, key) {
-            Ok(t) => return Ok((addr, t)),
+    for addr in &addrs {
+        match NetworkTransport::connect(*addr, key) {
+            Ok(t) => return Ok((addr.to_string(), t)),
             Err(e) => {
                 eprintln!("could not connect to {addr}: {e}");
                 last = Some(e.to_string());
             }
         }
     }
-    match last {
-        Some(e) => Err(anyhow!(
-            "no candidate peer accepted the connection (same identity/passphrase?); last error: {e}"
-        )),
-        None => Err(anyhow!("no peer address to dial")),
+
+    if let Some(rladdr) = relay {
+        let rl: SocketAddr = rladdr.parse().context("parse --relay host:port")?;
+        if addrs.is_empty() {
+            eprintln!("reaching the peer through relay {rl}...");
+        } else {
+            eprintln!("no direct route worked; tunneling through relay {rl}...");
+        }
+        let t = NetworkTransport::connect_via_relay(rl, key).context("connect through relay")?;
+        return Ok((format!("relay {rl}"), t));
     }
+
+    Err(match last {
+        Some(e) => anyhow!(
+            "no candidate peer accepted the connection (same identity/passphrase?); \
+             pass --relay to tunnel through a relay. last error: {e}"
+        ),
+        None => {
+            anyhow!("give a peer address, or pass --discover, --rendezvous, or --relay to find one")
+        }
+    })
 }
 
 // Reconstitution. split turns the store's master key into recovery shares you

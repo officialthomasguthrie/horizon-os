@@ -18,7 +18,10 @@
 //! dial on a LAN, without typing a host:port, lives in [`discovery`] (the default
 //! `discovery` feature); finding one beyond the LAN, through a rendezvous server,
 //! lives in [`net::rendezvous`]. Both use the same non-secret identity label from
-//! [`label`].
+//! [`label`]. When no address either side learns is dialable (both behind NATs),
+//! [`net::relay`] is the fallback that still works: an untrusted host that
+//! forwards opaque bytes between the two peers, the Noise handshake still running
+//! end to end through it.
 
 mod error;
 mod transport;
@@ -39,7 +42,10 @@ pub use transport::{LocalTransport, Transport};
 pub use label::fingerprint;
 
 #[cfg(feature = "net")]
-pub use net::{NetworkTransport, Rendezvous, RendezvousClient, RendezvousRegistration, Server};
+pub use net::{
+    NetworkTransport, Relay, RelayBinding, Rendezvous, RendezvousClient, RendezvousRegistration,
+    Server,
+};
 
 #[cfg(feature = "discovery")]
 pub use discovery::{discover, Beacon};

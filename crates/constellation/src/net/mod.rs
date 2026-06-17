@@ -21,10 +21,12 @@
 //! transport envelope (see [`tls`]).
 
 mod noise;
+pub mod relay;
 pub mod rendezvous;
 mod tls;
 mod wire;
 
+pub use relay::{Relay, RelayBinding};
 pub use rendezvous::{Rendezvous, RendezvousClient, RendezvousRegistration};
 
 use std::collections::HashSet;
@@ -44,6 +46,10 @@ use wire::{NoiseChannel, Req, Resp};
 pub struct Server {
     endpoint: quinn::Endpoint,
     local_addr: SocketAddr,
+    // Held so the same store and identity can also be served through a relay
+    // (see [`Server::bind_relay`]), not only on the direct endpoint above.
+    master: [u8; 32],
+    transport: Arc<LocalTransport>,
     // Kept alive so the spawned accept loop keeps running.
     _rt: tokio::runtime::Runtime,
 }
@@ -64,17 +70,30 @@ impl Server {
         let local_addr = endpoint.local_addr().map_err(net)?;
 
         let transport = Arc::new(LocalTransport::new(ls));
-        rt.spawn(accept_loop(endpoint.clone(), master, transport));
+        rt.spawn(accept_loop(endpoint.clone(), master, transport.clone()));
 
         Ok(Server {
             endpoint,
             local_addr,
+            master,
+            transport,
             _rt: rt,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    // Also serve this identity's store through a relay at `relay_addr`, for
+    // peers that cannot reach the direct endpoint (both sides behind NATs, say).
+    // The relay forwards opaque bytes between this server and a dialing peer; the
+    // same Noise handshake still authenticates the peer end to end through it, so
+    // the relay sees only ciphertext. The returned handle keeps the binding live;
+    // dropping it stops accepting relayed peers and withdraws from the relay. The
+    // direct endpoint keeps serving regardless.
+    pub fn bind_relay(&self, relay_addr: SocketAddr) -> Result<RelayBinding> {
+        relay::bind(relay_addr, self.master, self.transport.clone())
     }
 
     // Block the calling thread while the server keeps serving in the background.
@@ -103,14 +122,29 @@ async fn accept_loop(endpoint: quinn::Endpoint, master: [u8; 32], transport: Arc
     }
 }
 
-// One peer session: a single bi-directional stream carrying the Noise handshake
-// and then a stream of request/response frames until the peer says Bye or drops.
+// One peer session over a direct connection: take its single bi-directional
+// stream and serve it. The relay path serves the same way over a stream the
+// relay forwards instead (see [`serve_stream`]).
 async fn serve_conn(
     conn: quinn::Connection,
     master: [u8; 32],
     transport: Arc<LocalTransport>,
 ) -> Result<()> {
     let (send, recv) = conn.accept_bi().await.map_err(net)?;
+    serve_stream(send, recv, master, &*transport).await
+}
+
+// Serve one peer session over a bi-directional stream: the Noise handshake, then
+// request/response frames until the peer says Bye or drops. The stream may be a
+// direct QUIC stream or one a relay forwards on this peer's behalf; either way
+// the Noise layer authenticates the peer here, before any object moves. Shared
+// by the direct accept loop and the relay binding so serving is one code path.
+pub(super) async fn serve_stream(
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    master: [u8; 32],
+    transport: &(dyn Transport + Sync),
+) -> Result<()> {
     let mut ch = NoiseChannel::responder(send, recv, &master).await?;
     loop {
         // A read error here is the ordinary end of a session (peer closed), not
@@ -121,7 +155,7 @@ async fn serve_conn(
         };
         let req = Req::decode(&frame)?;
         let done = matches!(req, Req::Bye);
-        let resp = handle(&*transport, req);
+        let resp = handle(transport, req);
         ch.send(&resp.encode()).await?;
         if done {
             break;
@@ -204,12 +238,35 @@ impl NetworkTransport {
             Ok::<_, Error>((endpoint, conn, ch))
         })?;
 
-        Ok(NetworkTransport {
+        Ok(NetworkTransport::from_parts(rt, endpoint, conn, ch))
+    }
+
+    // Connect to a Server through a relay at `relay_addr` instead of dialing it
+    // directly, for a peer that cannot be reached on any address (behind a NAT).
+    // The relay tunnels bytes to a serving peer bound under the same identity
+    // fingerprint; the Noise handshake then authenticates that peer end to end
+    // through the tunnel, exactly as on a direct link. A wrong identity, or no
+    // peer of this identity bound at the relay, fails here before any object
+    // moves.
+    pub fn connect_via_relay(relay_addr: SocketAddr, master: [u8; 32]) -> Result<NetworkTransport> {
+        relay::connect(relay_addr, master)
+    }
+
+    // Assemble the transport from an established connection and Noise channel.
+    // Shared by the direct [`NetworkTransport::connect`] and the relay path,
+    // which differ only in how they obtain the stream the channel runs over.
+    pub(super) fn from_parts(
+        rt: tokio::runtime::Runtime,
+        endpoint: quinn::Endpoint,
+        conn: quinn::Connection,
+        ch: NoiseChannel,
+    ) -> NetworkTransport {
+        NetworkTransport {
             rt,
             session: Mutex::new(ch),
             _conn: conn,
             _endpoint: endpoint,
-        })
+        }
     }
 
     fn call(&self, req: Req) -> Result<Resp> {

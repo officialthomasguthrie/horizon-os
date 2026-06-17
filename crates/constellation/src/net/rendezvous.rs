@@ -23,9 +23,10 @@
 //! its lease expires. Nothing is persisted, so a rendezvous restart just waits
 //! for everyone to re-register.
 //!
-//! What this is not, yet: a relay (carrying bytes for peers that cannot reach
-//! each other at all) or NAT hole punching. The rendezvous already records the
-//! public address it observes a peer at, which is the input a hole punch needs,
+//! Two things build on this. A relay ([`super::relay`]) carries bytes for peers
+//! that cannot reach each other at all, when no address either side learns is
+//! dialable; it is done. NAT hole punching is not: the rendezvous already records
+//! the public address it observes a peer at, which is the input a punch needs,
 //! but the punch itself wants real hosts behind real NATs to test, so it is left
 //! for that setting.
 
