@@ -16,10 +16,15 @@
 //! the default `net` feature): a QUIC + Noise link that implements the same
 //! [`Transport`] trait, so the algorithm here does not change. Finding a peer to
 //! dial on a LAN, without typing a host:port, lives in [`discovery`] (the default
-//! `discovery` feature).
+//! `discovery` feature); finding one beyond the LAN, through a rendezvous server,
+//! lives in [`net::rendezvous`]. Both use the same non-secret identity label from
+//! [`label`].
 
 mod error;
 mod transport;
+
+#[cfg(any(feature = "net", feature = "discovery"))]
+mod label;
 
 #[cfg(feature = "net")]
 pub mod net;
@@ -30,11 +35,14 @@ pub mod discovery;
 pub use error::{Error, Result};
 pub use transport::{LocalTransport, Transport};
 
+#[cfg(any(feature = "net", feature = "discovery"))]
+pub use label::fingerprint;
+
 #[cfg(feature = "net")]
-pub use net::{NetworkTransport, Server};
+pub use net::{NetworkTransport, Rendezvous, RendezvousClient, RendezvousRegistration, Server};
 
 #[cfg(feature = "discovery")]
-pub use discovery::{discover, fingerprint, Beacon};
+pub use discovery::{discover, Beacon};
 
 use std::collections::HashSet;
 

@@ -21,8 +21,11 @@
 //! transport envelope (see [`tls`]).
 
 mod noise;
+pub mod rendezvous;
 mod tls;
 mod wire;
+
+pub use rendezvous::{Rendezvous, RendezvousClient, RendezvousRegistration};
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

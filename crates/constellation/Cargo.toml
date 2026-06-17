@@ -12,7 +12,9 @@ repository.workspace = true
 default = ["net", "discovery"]
 # The QUIC + Noise network skin. A default off build keeps the sync core and its
 # dependency footprint minimal (e.g. a slim Key build); CI exercises the feature.
-net = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow", "dep:tokio", "dep:blake3"]
+# hex + blake3 also derive the identity label the rendezvous client registers
+# under (the same label the discovery feature uses).
+net = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:snow", "dep:tokio", "dep:blake3", "dep:hex"]
 # mDNS LAN peer discovery. Independent of net (it only needs the identity master
 # to derive a fingerprint), but useful alongside it: find a peer to dial.
 discovery = ["dep:mdns-sd", "dep:blake3", "dep:hex"]

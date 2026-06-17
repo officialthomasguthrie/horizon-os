@@ -105,6 +105,29 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   an end-to-end CLI push to a discovered peer. CLI: `constellation serve`
   announces unless --no-announce, and `constellation sync <store> --discover`
   finds a peer instead of taking an address. Slim builds turn `discovery` off.
+- Phase 5 Constellation rendezvous (`net` feature): find a peer beyond the LAN,
+  where mDNS multicast does not reach. A rendezvous is a meeting point at a known
+  address that every device of an identity can reach: a serving peer registers
+  under its identity fingerprint (the same non-secret label mDNS broadcasts, now
+  shared in one `label` module), and another peer of that identity looks the
+  fingerprint up and gets the addresses to dial. The rendezvous holds no identity.
+  It never sees the master, an object, or the Noise PSK, only a fingerprint and
+  the IP a packet arrived from, so it can run on an untrusted shared host: the
+  worst a hostile one can do is deny service or return a wrong address, and a
+  wrong address simply fails the Noise handshake when dialed (so the dialer tries
+  each returned address until one authenticates). The link to the rendezvous is
+  QUIC with the same throwaway-cert envelope the sync uses; identity stays in the
+  Noise layer between the two real peers alone. Registrations are leased presence
+  (90s lease, 30s heartbeat) held only in memory, so a peer that stops serving
+  ages out and a rendezvous restart just waits for everyone to re-register. The
+  public address the rendezvous observes a peer at is recorded too, which is the
+  input a future NAT hole punch needs. CLI: `constellation rendezvous` runs the
+  meeting point; `serve --rendezvous <addr>` registers and heartbeats while
+  serving; `sync --rendezvous <addr>` looks a peer up and dials it. Tests:
+  registry lease/expiry/heartbeat/scoping and wire-codec units, plus a full
+  loopback integration test (register, look up, dial, sync 200 KB of content)
+  that runs in CI because the rendezvous is plain QUIC, not multicast; also
+  verified end to end through the `horizon` binary against a running rendezvous.
 
 ## Next
 
@@ -115,11 +138,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.
 - Phase 3: shell + Wayland compositor (Smithay/iced). Linux-only.
-- Phase 5 Constellation discovery and NAT traversal: the QUIC + Noise transport,
-  its serve/sync CLI, concurrent multi-peer serving, and mDNS LAN discovery are
-  done and tested on darwin. What remains is reaching peers beyond the LAN: a
-  rendezvous or relay for the open internet and hole punching through NAT, plus
-  bridging discovery across subnets. Real-host and network work.
+- Phase 5 Constellation beyond the LAN, remaining: the rendezvous (an
+  internet-reachable meeting point that maps identity fingerprints to addresses,
+  bridging discovery across subnets) is done and tested on darwin, alongside the
+  QUIC + Noise transport, serve/sync CLI, concurrent multi-peer serving, and mDNS
+  LAN discovery. What is left needs real hosts behind real NATs: UDP hole punching
+  (the rendezvous already records each peer's observed public address, the input a
+  punch needs, and quinn can open a connection from a bound socket toward a peer
+  dialing back) and a relay that carries bytes for peers that cannot reach each
+  other directly at all. Real-host and network work.
 - Phase 5 Reconstitution boot/identity wiring: bind recovery shares to FIDO2
   re-enrollment and the boot-time unlock path, and a phone as a post-boot trusted
   device. Linux-only; the secret-sharing core and CLI are done and cross-platform.

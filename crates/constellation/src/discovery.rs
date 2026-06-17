@@ -26,21 +26,13 @@ use std::time::{Duration, Instant};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::error::{Error, Result};
+use crate::label::fingerprint;
 
 // RFC 6763 caps the service-name label at 15 bytes, so the type is abbreviated
 // (horizon-cstl, 12). UDP because the link underneath it is QUIC.
 const SERVICE_TYPE: &str = "_horizon-cstl._udp.local.";
 // TXT key carrying the identity fingerprint peers match on.
 const FP_KEY: &str = "fp";
-
-// A short, non-secret label for an identity, derived one-way from the master
-// under its own domain so it reveals neither the master nor any other derived
-// key. Stable across a device's restarts and identical on every device of the
-// same identity, which is exactly what lets them recognise each other.
-pub fn fingerprint(master: &[u8; 32]) -> String {
-    let tag = blake3::derive_key("horizon constellation discovery fingerprint v1", master);
-    hex::encode(&tag[..8])
-}
 
 // A live mDNS announcement that this device serves `master`'s identity on a
 // port. Hold it for as long as you serve; dropping it withdraws the
@@ -123,30 +115,4 @@ pub fn discover(master: &[u8; 32], timeout: Duration) -> Result<Vec<SocketAddr>>
 
 fn err(e: impl std::fmt::Display) -> Error {
     Error::Net(e.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fingerprint_is_stable_and_identity_specific() {
-        let a = [7u8; 32];
-        let b = [8u8; 32];
-        assert_eq!(fingerprint(&a), fingerprint(&a));
-        assert_ne!(fingerprint(&a), fingerprint(&b));
-        // 8 bytes, hex encoded.
-        assert_eq!(fingerprint(&a).len(), 16);
-        assert!(fingerprint(&a).bytes().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn fingerprint_is_not_the_auth_key() {
-        // The broadcast label must be a different derivation from the Noise PSK,
-        // which is what actually authenticates a peer. Same master, different
-        // domain separator, so the values must not coincide.
-        let m = [42u8; 32];
-        let psk = blake3::derive_key("horizon constellation noise psk v1", &m);
-        assert_ne!(fingerprint(&m), hex::encode(&psk[..8]));
-    }
 }

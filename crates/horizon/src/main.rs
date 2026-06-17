@@ -5,7 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use constellation::{LocalTransport, NetworkTransport, Server, SyncReport};
+use constellation::{
+    LocalTransport, NetworkTransport, Rendezvous, RendezvousClient, Server, SyncReport,
+};
 use lifestream::{Lifestream, Object, ObjectId};
 use reconstitution::Share;
 use weave::{Broker, Event, GrantId, Limits, Resource, Rights};
@@ -62,21 +64,34 @@ enum ConstellationOp {
         /// Do not announce this server to peers on the LAN over mDNS
         #[arg(long)]
         no_announce: bool,
+        /// Also register at this rendezvous (host:port) so peers beyond the LAN can find this server
+        #[arg(long)]
+        rendezvous: Option<String>,
     },
     /// Sync with a peer that is serving the same identity
     Sync {
         store: PathBuf,
-        /// Peer address (host:port); omit and pass --discover to find one on the LAN
+        /// Peer address (host:port); omit and use --discover or --rendezvous to find one
         peer: Option<String>,
         /// Find a peer of this identity on the LAN over mDNS instead of an address
         #[arg(long)]
         discover: bool,
+        /// Find a peer of this identity through a rendezvous (host:port) instead of an address
+        #[arg(long)]
+        rendezvous: Option<String>,
         /// Push local -> peer instead of the default pull
         #[arg(long)]
         push: bool,
         /// Sync both directions so the two stores converge
         #[arg(long)]
         both: bool,
+    },
+    /// Run a rendezvous server: a meeting point that maps identity fingerprints
+    /// to addresses so peers find each other beyond the LAN. Holds no identity.
+    Rendezvous {
+        /// Address to listen on (host:port)
+        #[arg(long, default_value = "0.0.0.0:7778")]
+        listen: String,
     },
 }
 
@@ -450,18 +465,21 @@ fn print_report(from: &str, to: &str, r: &SyncReport) {
 }
 
 // Constellation over the network. `serve` opens this store and answers peers
-// that prove the same identity through the Noise handshake, and (unless
-// --no-announce) advertises itself on the LAN over mDNS so a peer can find it
-// without a typed address. `sync` dials such a peer (given as host:port, or
-// found with --discover) and runs the same diff-and-ship the in-process sync
-// runs, only the far transport is a QUIC link. Direction defaults to pull (bring
-// the peer's objects here); --push reverses it and --both converges the two.
+// that prove the same identity through the Noise handshake, advertises itself on
+// the LAN over mDNS (unless --no-announce), and optionally registers at a
+// rendezvous (--rendezvous) so peers beyond the LAN can find it too. `sync` dials
+// such a peer (given as host:port, found with --discover, or looked up with
+// --rendezvous) and runs the same diff-and-ship the in-process sync runs, only
+// the far transport is a QUIC link. Direction defaults to pull (bring the peer's
+// objects here); --push reverses it and --both converges the two. `rendezvous`
+// runs the meeting point itself.
 fn constellation_cmd(op: ConstellationOp) -> Result<()> {
     match op {
         ConstellationOp::Serve {
             store,
             listen,
             no_announce,
+            rendezvous,
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
@@ -488,6 +506,23 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
                     }
                 }
             };
+            // Likewise hold the rendezvous registration: it heartbeats in the
+            // background and withdraws when serve exits.
+            let _registration = match rendezvous {
+                None => None,
+                Some(rzaddr) => {
+                    let rz: SocketAddr = rzaddr.parse().context("parse --rendezvous host:port")?;
+                    let client = RendezvousClient::connect(rz).context("connect to rendezvous")?;
+                    let reg = client
+                        .keepalive(constellation::fingerprint(&key), local.port())
+                        .context("register at rendezvous")?;
+                    eprintln!(
+                        "registered at rendezvous {rz}; it sees this host as {}",
+                        reg.observed()
+                    );
+                    Some(reg)
+                }
+            };
             eprintln!("peers must prove the same identity; ctrl-c to stop");
             server.wait();
         }
@@ -495,15 +530,15 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
             store,
             peer,
             discover,
+            rendezvous,
             push,
             both,
         } => {
             let key = master_key(&store)?;
             let ls = Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
-            let addr = resolve_peer(peer, discover, &key)?;
+            let candidates = resolve_peers(peer, discover, rendezvous, &key)?;
+            let (addr, remote) = connect_any(&candidates, key)?;
             let peer = addr.to_string();
-            let remote = NetworkTransport::connect(addr, key)
-                .context("connect to peer (same identity/passphrase?)")?;
             let local = LocalTransport::new(ls);
             let here = store.display().to_string();
             if both {
@@ -516,37 +551,98 @@ fn constellation_cmd(op: ConstellationOp) -> Result<()> {
             }
             remote.close().ok();
         }
+        ConstellationOp::Rendezvous { listen } => {
+            let addr: SocketAddr = listen.parse().context("parse --listen host:port")?;
+            let rz = Rendezvous::start(addr)?;
+            println!("rendezvous serving on {}", rz.local_addr());
+            eprintln!(
+                "peers register and look up by identity fingerprint; this server holds no \
+                 identity and sees no objects; ctrl-c to stop"
+            );
+            rz.wait();
+        }
     }
     Ok(())
 }
 
-// Where to dial: an explicit host:port wins; otherwise --discover browses the
-// LAN over mDNS for a peer of this identity and takes the first one found.
-fn resolve_peer(peer: Option<String>, discover: bool, key: &[u8; 32]) -> Result<SocketAddr> {
+// The addresses to try dialing, in order. An explicit host:port is the sole
+// candidate when given. Otherwise we gather what was asked for: a rendezvous
+// lookup (peers beyond the LAN) and/or an mDNS browse (peers on it). One peer can
+// surface as several addresses, and a rendezvous entry could even be stale or
+// wrong, so the caller tries each until one completes the handshake.
+fn resolve_peers(
+    peer: Option<String>,
+    discover: bool,
+    rendezvous: Option<String>,
+    key: &[u8; 32],
+) -> Result<Vec<SocketAddr>> {
     if let Some(p) = peer {
-        return p.parse().context("parse peer host:port");
+        return Ok(vec![p.parse().context("parse peer host:port")?]);
     }
-    if !discover {
-        return Err(anyhow!(
-            "give a peer address, or pass --discover to find one"
-        ));
-    }
-    eprintln!("searching the LAN for a peer of this identity...");
-    let found = constellation::discover(key, Duration::from_secs(3))?;
-    let mut iter = found.into_iter();
-    match iter.next() {
-        Some(addr) => {
-            // Each entry is an address, and one peer can resolve to several (a
-            // loopback and a LAN address, say), so report addresses, not peers.
-            let extra = iter.count();
-            if extra > 0 {
-                eprintln!("found {} addresses; dialing {addr}", extra + 1);
-            } else {
-                eprintln!("found peer at {addr}");
-            }
-            Ok(addr)
+
+    // Remember whether a source was even requested before `rendezvous` is moved,
+    // so the empty result can tell "you asked for nothing" from "nothing found".
+    let asked = discover || rendezvous.is_some();
+    let mut candidates: Vec<SocketAddr> = Vec::new();
+
+    if let Some(rzaddr) = rendezvous {
+        let rz: SocketAddr = rzaddr.parse().context("parse --rendezvous host:port")?;
+        eprintln!("asking rendezvous {rz} for a peer of this identity...");
+        let client = RendezvousClient::connect(rz).context("connect to rendezvous")?;
+        let found = client.lookup(&constellation::fingerprint(key))?;
+        if found.is_empty() {
+            eprintln!("rendezvous knows no peer of this identity");
+        } else {
+            eprintln!("rendezvous returned {} address(es)", found.len());
         }
-        None => Err(anyhow!("no peer of this identity found on the LAN")),
+        candidates.extend(found);
+    }
+
+    if discover {
+        eprintln!("searching the LAN for a peer of this identity...");
+        let found = constellation::discover(key, Duration::from_secs(3))?;
+        if found.is_empty() {
+            eprintln!("no peer of this identity found on the LAN");
+        } else {
+            eprintln!("LAN discovery returned {} address(es)", found.len());
+        }
+        candidates.extend(found);
+    }
+
+    if candidates.is_empty() {
+        return Err(if asked {
+            anyhow!("no peer of this identity found")
+        } else {
+            anyhow!("give a peer address, or pass --discover or --rendezvous to find one")
+        });
+    }
+
+    // One peer can resolve to several addresses (loopback and LAN, say); keep
+    // them distinct and ordered so the dial is deterministic.
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+// Try each candidate in turn, returning the first that connects. A wrong address
+// (a stale or poisoned rendezvous entry, a peer of another identity) fails the
+// Noise handshake here and we move on; only when none accept do we give up.
+fn connect_any(addrs: &[SocketAddr], key: [u8; 32]) -> Result<(SocketAddr, NetworkTransport)> {
+    let mut last: Option<String> = None;
+    for &addr in addrs {
+        match NetworkTransport::connect(addr, key) {
+            Ok(t) => return Ok((addr, t)),
+            Err(e) => {
+                eprintln!("could not connect to {addr}: {e}");
+                last = Some(e.to_string());
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(anyhow!(
+            "no candidate peer accepted the connection (same identity/passphrase?); last error: {e}"
+        )),
+        None => Err(anyhow!("no peer address to dial")),
     }
 }
 

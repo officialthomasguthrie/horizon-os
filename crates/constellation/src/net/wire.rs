@@ -281,7 +281,11 @@ async fn read_seg(s: &mut quinn::RecvStream) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn put_u32(o: &mut Vec<u8>, v: u32) {
+pub(crate) fn put_u16(o: &mut Vec<u8>, v: u16) {
+    o.extend_from_slice(&v.to_be_bytes());
+}
+
+pub(crate) fn put_u32(o: &mut Vec<u8>, v: u32) {
     o.extend_from_slice(&v.to_be_bytes());
 }
 
@@ -290,7 +294,7 @@ fn put_bytes(o: &mut Vec<u8>, b: &[u8]) {
     o.extend_from_slice(b);
 }
 
-fn put_str(o: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_str(o: &mut Vec<u8>, s: &str) {
     put_bytes(o, s.as_bytes());
 }
 
@@ -311,16 +315,16 @@ fn put_opt_id(o: &mut Vec<u8>, id: Option<&ObjectId>) {
     }
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     b: &'a [u8],
     p: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Reader<'a> {
+    pub(crate) fn new(b: &'a [u8]) -> Reader<'a> {
         Reader { b, p: 0 }
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
         if self.p + n > self.b.len() {
             return Err(net("short frame"));
         }
@@ -328,10 +332,14 @@ impl<'a> Reader<'a> {
         self.p += n;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8> {
+    pub(crate) fn u8(&mut self) -> Result<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u32(&mut self) -> Result<u32> {
+    pub(crate) fn u16(&mut self) -> Result<u16> {
+        let s = self.take(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+    pub(crate) fn u32(&mut self) -> Result<u32> {
         let s = self.take(4)?;
         Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
     }
@@ -344,7 +352,7 @@ impl<'a> Reader<'a> {
         let n = self.u32()? as usize;
         self.take(n)
     }
-    fn string(&mut self) -> Result<String> {
+    pub(crate) fn string(&mut self) -> Result<String> {
         String::from_utf8(self.bytes()?.to_vec()).map_err(net)
     }
     fn ids(&mut self) -> Result<Vec<ObjectId>> {
