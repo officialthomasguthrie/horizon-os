@@ -1,0 +1,16 @@
+[package]
+name = "horizon"
+description = "Horizon system command line tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+lifestream = { path = "../lifestream" }
+clap.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+rand.workspace = true
