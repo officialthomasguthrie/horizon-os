@@ -383,6 +383,7 @@ dependencies = [
  "clap",
  "lifestream",
  "rand",
+ "weave",
 ]
 
 [[package]]
@@ -798,6 +799,17 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "weave"
+version = "0.0.0"
+dependencies = [
+ "hex",
+ "lifestream",
+ "rand",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 [package]
-name = "horizon"
-description = "Horizon system command line tools"
+name = "weave"
+description = "Object-capability broker and audited IPC for Horizon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,9 @@ repository.workspace = true
 
 [dependencies]
 lifestream = { path = "../lifestream" }
-weave = { path = "../weave" }
-clap.workspace = true
-anyhow.workspace = true
-argon2.workspace = true
 rand.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
