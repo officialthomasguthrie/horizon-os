@@ -22,6 +22,8 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
+pub mod portal;
+#[cfg(target_os = "linux")]
 mod seccomp;
 
 use std::ffi::OsString;
@@ -126,15 +128,43 @@ impl Cell {
         self
     }
 
-    // Spawn the payload confined, wait for it, and report how it exited.
-    pub fn run(self, payload: Payload) -> Result<Status> {
+    // Spawn the payload confined and return without waiting, so the broker can
+    // serve the principal over a kept socket before collecting it.
+    pub fn spawn(self, payload: Payload) -> Result<Child> {
         #[cfg(target_os = "linux")]
         {
-            linux::run(self, payload)
+            Ok(Child {
+                inner: linux::spawn(self, payload)?,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (self, payload);
+            Err(Error::Unsupported)
+        }
+    }
+
+    // Spawn the payload confined, wait for it, and report how it exited.
+    pub fn run(self, payload: Payload) -> Result<Status> {
+        self.spawn(payload)?.wait()
+    }
+}
+
+// A running cell. Wait collects the payload's outcome; the init child is reaped
+// either way.
+pub struct Child {
+    #[cfg(target_os = "linux")]
+    inner: linux::ChildHandle,
+}
+
+impl Child {
+    pub fn wait(self) -> Result<Status> {
+        #[cfg(target_os = "linux")]
+        {
+            linux::wait(self.inner)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
             Err(Error::Unsupported)
         }
     }

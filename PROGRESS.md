@@ -217,17 +217,31 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the kernel forbids unprivileged user namespaces (a hardened host or a
   restricted CI runner), so it stays green everywhere. Built and tested on a
   Linux container driven from the darwin host.
+- Phase 2 Cells broker fd-passing seam (`cells::portal`, Linux): the channel that
+  makes weave's `Lease` real. A confined principal's one ambient channel is a
+  Unix socket to the broker; it sends a resource and rights, the broker checks
+  the request against the capability it holds (weave `access()`), materializes
+  the resulting Lease into a real fd (an open file with rights-mapped flags, or a
+  connected socket for a Net grant), and passes that fd back over SCM_RIGHTS. The
+  principal ends up holding a working fd it could never have opened itself: the
+  cell has no path to the file and no route to the host, only what the broker
+  chose to hand it, and the access lands in the audit log. `Cell::spawn` and
+  `Child::wait` let the broker serve a principal over the kept socket while it
+  runs. Tests prove the seam end to end: a confined principal that cannot open a
+  host file by path reads it through a brokered fd, and one with an empty network
+  namespace sends bytes over a brokered socket to a local listener; the file
+  access shows up as a use on the grant. Green as root and as an unprivileged
+  user. weave is a Linux-only dependency of cells (the seam is Linux fd passing),
+  so the workspace still builds on darwin.
 
 ## Next
 
-- Finish Phase 2 on a Linux host: the cells confinement primitive is done
-  (above). Next is the broker seam, where the weave broker hands a confined
-  principal a brokered fd over a Unix socket: materialize a Lease into an open
-  file (rights-mapped flags) or a connected/bound socket, then pass it with
-  SCM_RIGHTS to a principal that has no other authority, and confirm the use
-  lands in the audit log. Then exec of real principals (a private /proc and a
-  minimal /dev mounted from PID 1 inside the cell) and a `horizon cell` demo over
-  the audit log. Linux-only, so build and test there, not on darwin.
+- Finish Phase 2 on a Linux host: the cells confinement primitive and the broker
+  fd-passing seam are done (above). What remains is exec of real principals (a
+  private /proc and a minimal /dev mounted from PID 1 inside the cell, so a
+  brokered binary runs, not just an in-process closure) and a `horizon cell` demo
+  that drives the broker and a confined principal over the audit log (the Glass
+  stand-in). Linux-only, so build and test there, not on darwin.
 - Glass: the live transparency surface over the weave audit log. It lands with
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.

@@ -83,7 +83,13 @@ pub(crate) fn available() -> bool {
         .unwrap_or(false)
 }
 
-pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {
+pub(crate) struct ChildHandle {
+    a_pid: nix::unistd::Pid,
+    report_r: RawFd,
+    stage: String,
+}
+
+pub(crate) fn spawn(cell: Cell, payload: Payload) -> Result<ChildHandle> {
     let stage = stage_path();
     let (report_r, report_w) = pipe_raw()?;
     match unsafe { fork() }.map_err(|e| Error::Confine(format!("fork init: {e}")))? {
@@ -94,15 +100,27 @@ pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {
         }
         ForkResult::Parent { child } => {
             close(report_w);
-            let out = read_report(report_r);
-            close(report_r);
-            let _ = waitpid(child, None);
-            // The cell's mount namespace is gone now, so the staging dir is an
-            // empty leftover on the host; remove it.
-            let _ = std::fs::remove_dir(&stage);
-            out
+            Ok(ChildHandle {
+                a_pid: child,
+                report_r,
+                stage,
+            })
         }
     }
+}
+
+pub(crate) fn wait(h: ChildHandle) -> Result<Status> {
+    let out = read_report(h.report_r);
+    close(h.report_r);
+    let _ = waitpid(h.a_pid, None);
+    // The cell's mount namespace is gone now, so the staging dir is an empty
+    // leftover on the host; remove it.
+    let _ = std::fs::remove_dir(&h.stage);
+    out
+}
+
+pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {
+    wait(spawn(cell, payload)?)
 }
 
 // Child A: build the cell, fork B, bridge its outcome into the report pipe.
