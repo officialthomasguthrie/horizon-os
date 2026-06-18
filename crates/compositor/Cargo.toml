@@ -8,16 +8,30 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Software (pixman) offscreen compositing: import client shm buffers and
+# composite the Space into an offscreen framebuffer whose pixels can be read
+# back. Headless and CI-testable (the readback is asserted on, no display), so
+# turning client buffers into pixels is proven the same way the protocol is. The
+# default build stays protocol + scene only, with no renderer. Pulls one more
+# system library, libpixman.
+render = ["smithay/renderer_pixman"]
+# Nested winit presentation: open a real window inside an existing Wayland/X
+# session and present the composited Space on screen. This is the part that needs
+# a display and a GPU, verified by eye, not in CI. Pulls libwayland, EGL, and GL.
+winit = ["render", "smithay/backend_winit"]
+
 [dependencies]
 thiserror.workspace = true
 
 # The compositor is a Linux Wayland server built on Smithay. On other hosts the
 # crate still compiles (so the workspace builds on darwin) but there is no
-# Compositor, only `available()` reporting false. Only the wayland_frontend and
-# desktop features are pulled: a real Wayland server plus the scene graph, no
-# display backend (winit/DRM) and no GPU renderer, so the core builds and tests
-# headlessly. The one system dependency this draws in is libxkbcommon (the seat
-# keyboard compiles an xkb keymap); the rest of the Wayland stack is pure Rust.
+# Compositor, only `available()` reporting false. The default build pulls only
+# wayland_frontend and desktop: a real Wayland server plus the scene graph, no
+# display backend and no renderer, so the core builds and tests headlessly. The
+# one system dependency that draws in is libxkbcommon (the seat keyboard compiles
+# an xkb keymap); the rest of that stack is pure Rust. The `render` and `winit`
+# features add a software renderer and an on-screen backend on top.
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay = { version = "0.7", default-features = false, features = ["wayland_frontend", "desktop"] }
 

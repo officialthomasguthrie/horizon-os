@@ -8,6 +8,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Build the compositor's software renderer into the CLI: `horizon compositor
+# screenshot` dumps a composited frame to an image with no display. Off by
+# default so the standard binary stays renderer-free.
+compositor-render = ["compositor/render"]
+# Build the on-screen (winit) backend in too: `horizon compositor show` opens a
+# nested window. Off by default so the standard binary does not pull EGL/GL.
+compositor-winit = ["compositor/winit", "compositor-render"]
+
 [dependencies]
 lifestream = { path = "../lifestream" }
 weave = { path = "../weave" }

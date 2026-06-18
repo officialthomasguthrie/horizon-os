@@ -82,6 +82,11 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Track the committed buffer so the renderer can import it. Only the
+        // render/winit features paint, so the headless core skips this.
+        #[cfg(feature = "render")]
+        smithay::backend::renderer::utils::on_commit_buffer_handler::<State>(surface);
+
         // xdg-shell requires a configure before the client attaches a buffer.
         // The client's initial commit (no buffer) is our cue to send it.
         if let Some(window) = self.window_for(surface) {
@@ -324,5 +329,55 @@ impl Compositor {
                 })
             })
             .collect()
+    }
+
+    /// Composite the current scene into an offscreen framebuffer the size of the
+    /// output and read the pixels back. This is the headless render path: it
+    /// imports each window's shm buffer and paints the `Space` with a software
+    /// (pixman) renderer, no display or GPU, so a test can assert on the result.
+    #[cfg(feature = "render")]
+    pub fn render(&mut self) -> Result<crate::render::RenderedFrame> {
+        crate::render::render_space(&self.state.space, &self.state.output)
+    }
+
+    /// The output's pixel size (width, height). The offscreen framebuffer and the
+    /// winit window both render at this size.
+    #[cfg(feature = "render")]
+    pub fn output_size(&self) -> (i32, i32) {
+        self.state
+            .output
+            .current_mode()
+            .map(|m| (m.size.w, m.size.h))
+            .unwrap_or((0, 0))
+    }
+
+    // The scene the winit backend paints: the same `Space` the headless render
+    // path composites.
+    #[cfg(feature = "winit")]
+    pub(crate) fn space(&self) -> &Space<Window> {
+        &self.state.space
+    }
+
+    // Tell each mapped client it may draw its next frame. A static client shows
+    // its first buffer without this, but an animating one waits on the callback.
+    #[cfg(feature = "winit")]
+    pub(crate) fn send_frames(&self, time_ms: u32) {
+        let output = self.state.output.clone();
+        for window in self.state.space.elements() {
+            window.send_frame(
+                &output,
+                Duration::from_millis(time_ms as u64),
+                None,
+                |_, _| Some(output.clone()),
+            );
+        }
+    }
+
+    /// Open a nested window and present the scene on screen until it is closed,
+    /// driving the Wayland server between frames. Needs a real Wayland or X
+    /// session to nest in (and a GPU); this is the eye-verified, on-screen path.
+    #[cfg(feature = "winit")]
+    pub fn show(&mut self) -> Result<()> {
+        crate::winit::run(self)
     }
 }

@@ -16,6 +16,11 @@ pub enum Error {
     // The event loop dispatch failed.
     #[error("event loop: {0}")]
     Loop(String),
+    // Compositing a frame failed: a renderer would not start, a buffer would not
+    // bind, or the framebuffer could not be read back. Only the render/winit
+    // features reach this.
+    #[error("render: {0}")]
+    Render(String),
     // Not Linux: the compositor is a Linux Wayland server.
     #[error("compositor needs Linux (Wayland); this host has none")]
     Unsupported,

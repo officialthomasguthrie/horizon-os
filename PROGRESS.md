@@ -308,22 +308,67 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   gated like the cell commands; other hosts say the compositor is unavailable.
   Verified end to end through the binary: a real client opened a titled toplevel
   and the compositor logged it mapping and then unmapping.
+- Phase 3 compositor software rendering (`compositor` `render` feature, Linux):
+  the step that turns client buffers into pixels, kept on the same split as the
+  rest of the compositor, the part that can be proven without a display is built
+  and tested headlessly. A pixman renderer (a pure software rasterizer, no GPU)
+  imports each mapped surface's shm buffer (the commit handler now runs Smithay's
+  `on_commit_buffer_handler` under this feature) and composites the Space into an
+  offscreen Argb8888 framebuffer, which is then read back. The compositing lives
+  in one generic `paint_space` so the exact same code paints the offscreen pixman
+  buffer here and the on-screen GLES window the winit backend presents; only the
+  render target differs. The proof is a headless test, no display and no GPU: a
+  real in-process Wayland client attaches a 64x64 opaque-magenta shm buffer to a
+  toplevel, the compositor imports and composites it, and the read-back pixels are
+  asserted exactly, magenta where the window maps and the clear colour (opaque
+  black) everywhere else. So "windows become pixels" is proven the same way the
+  protocol is, automatically, in CI. The default build stays renderer-free; the
+  one system library this adds is libpixman. Green as root and as the unprivileged
+  dev user. `horizon compositor screenshot` (behind the CLI's `compositor-render`
+  feature) makes it visible: it composites one frame of whatever clients have
+  mapped and writes a PPM image, the headless way to actually see what the
+  compositor draws (the software renderer needs no display, so the image opens
+  anywhere). Verified through the binary: it writes a valid 1920x1080 PPM (the
+  clear colour when no client has connected); the headless test above is what
+  proves a connected client's window composites into those pixels exactly.
+- Phase 3 compositor on-screen winit backend (`compositor` `winit` feature,
+  Linux): present the composited scene in a real window nested inside an existing
+  Wayland or X session, the first time Horizon windows are visible on a screen.
+  It runs Smithay's winit backend with a GLES renderer; the render loop drives the
+  same `paint_space` the headless test asserts on, so the compositing is already
+  test-covered and only the windowing and the GL present are new (it is a viewer
+  for now: it shows every client window but does not yet forward input to them).
+  The Wayland, EGL, and GL it pulls are pure-Rust bindings loaded at runtime, so
+  it builds with no extra system libraries and is compile-checked in CI; running
+  it needs a display and a GPU, so it is verified by eye on a real Linux session,
+  the one part CI cannot prove, exactly the split the Constellation uses where its
+  whole networking core is tested on one host and only NAT traversal waits for
+  real machines. `horizon compositor show` (behind the CLI's `compositor-winit`
+  feature) runs it. Built and compile-checked from the Linux container on this
+  darwin host, which has no display; the on-screen result awaits a real Linux
+  session for eye-verification, and a real DRM/KMS backend for bare metal comes
+  after.
 
 ## Next
 
-- Phase 3: the experience layer. The compositor's headless core is done and
-  CI-tested (a real Wayland server: the core globals, the xdg-shell toplevel
-  lifecycle, the scene graph). The next step is making windows visible: a Smithay
-  winit backend running nested inside an existing Wayland/X session first, then a
-  real DRM/KMS backend, with a wgpu/GL renderer that imports client buffers and
-  composites the Space (this is the part that needs a display and a GPU, verified
-  by eye). After that, the shell proper, iced + wgpu with the Aura intent line as
-  launcher and command palette, and Glass as an L5 compositor surface over the
-  weave audit log. Confined cells can already host compositor surfaces (the cells
-  exec path is ready). Linux-only.
+- Phase 3: the experience layer. The compositor's headless core (a real Wayland
+  server: the core globals, the xdg-shell toplevel lifecycle, the scene graph) and
+  its software renderer (importing client shm buffers and compositing the Space
+  into an offscreen framebuffer, asserted on pixel by pixel) are done and CI-
+  tested; the on-screen winit backend is written and compile-checked. The next
+  step is the eye part: run `horizon compositor show` on a real Linux session and
+  watch a client's window appear in the nested compositor window (this host is a
+  display-less darwin Mac driving a headless Linux container, so this is the piece
+  that genuinely waits for hardware). Then forward input (keyboard and pointer
+  focus) to the client windows so the viewer becomes usable, then a real DRM/KMS +
+  libinput backend for bare metal. After that, the shell proper, iced + wgpu with
+  the Aura intent line as launcher and command palette, and Glass as an L5
+  compositor surface over the weave audit log. Confined cells can already host
+  compositor surfaces (the cells exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. It lands as a
-  compositor surface once there is a renderer to draw it on (see Phase 3 above);
-  `horizon weave audit/grants` is the headless stand-in until then.
+  compositor surface now there is a renderer to draw it on (the `render`/`winit`
+  features above); `horizon weave audit/grants` is the headless stand-in until the
+  surface is drawn.
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

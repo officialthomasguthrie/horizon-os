@@ -140,6 +140,22 @@ enum CellOp {
 enum CompositorOp {
     /// Start the headless Wayland server and log windows as they map and unmap
     Run,
+    /// Composite client windows once and write the result to a PPM image (no
+    /// display needed: the software renderer turns buffers into pixels you can
+    /// open anywhere). Waits briefly for a client to connect.
+    #[cfg(feature = "compositor-render")]
+    Screenshot {
+        /// File to write the PPM (P6) image to
+        #[arg(long, default_value = "horizon-compositor.ppm")]
+        out: PathBuf,
+        /// Seconds to wait for a client window before rendering
+        #[arg(long, default_value_t = 10)]
+        seconds: u64,
+    },
+    /// Open a nested window and show client windows on screen. Needs a Wayland
+    /// or X session to nest in and a GPU; verified by eye, not in CI.
+    #[cfg(feature = "compositor-winit")]
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -682,7 +698,30 @@ fn split_bind(spec: &str) -> (PathBuf, PathBuf) {
 fn compositor_cmd(op: CompositorOp) -> Result<()> {
     match op {
         CompositorOp::Run => compositor_run(),
+        #[cfg(feature = "compositor-render")]
+        CompositorOp::Screenshot { out, seconds } => compositor_screenshot(&out, seconds),
+        #[cfg(feature = "compositor-winit")]
+        CompositorOp::Show => compositor_show(),
     }
+}
+
+// The Wayland socket lives under XDG_RUNTIME_DIR. A real session always sets it;
+// for a bare dev shell, fall back to a private temp dir so the commands still
+// work. The library stays strict and binds wherever it points.
+#[cfg(target_os = "linux")]
+fn compositor_ensure_runtime_dir() -> Result<()> {
+    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
+        let dir = std::env::temp_dir().join(format!("horizon-compositor.{}", std::process::id()));
+        std::fs::create_dir_all(&dir).context("create runtime dir")?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::env::set_var("XDG_RUNTIME_DIR", &dir);
+        println!(
+            "compositor: XDG_RUNTIME_DIR was unset; using {}",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 // Run the compositor's headless core: a real Wayland server clients connect to,
@@ -697,20 +736,7 @@ fn compositor_run() -> Result<()> {
         return Ok(());
     }
 
-    // The Wayland socket lives under XDG_RUNTIME_DIR. A real session always sets
-    // it; for a bare dev shell, fall back to a private temp dir so the command
-    // still works. (The library stays strict and binds wherever it points.)
-    if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        let dir = std::env::temp_dir().join(format!("horizon-compositor.{}", std::process::id()));
-        std::fs::create_dir_all(&dir).context("create runtime dir")?;
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
-        std::env::set_var("XDG_RUNTIME_DIR", &dir);
-        println!(
-            "compositor: XDG_RUNTIME_DIR was unset; using {}",
-            dir.display()
-        );
-    }
+    compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
     let socket = comp.socket_name().to_string_lossy().into_owned();
@@ -744,6 +770,80 @@ fn compositor_run() -> Result<()> {
 fn compositor_run() -> Result<()> {
     println!("the compositor needs Linux (Wayland); this host has none");
     Ok(())
+}
+
+// Composite one frame of whatever clients have mapped and write it to a PPM
+// image. This is the headless way to actually see what the compositor draws: the
+// software (pixman) renderer turns client buffers into pixels with no display or
+// GPU, so the image opens anywhere. Waits up to `seconds` for a window to map.
+#[cfg(all(target_os = "linux", feature = "compositor-render"))]
+fn compositor_screenshot(out: &Path, seconds: u64) -> Result<()> {
+    compositor_ensure_runtime_dir()?;
+
+    let mut comp = compositor::Compositor::new().context("start compositor")?;
+    let socket = comp.socket_name().to_string_lossy().into_owned();
+    println!("compositor: software renderer (no display needed)");
+    println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+    println!("compositor: waiting up to {seconds}s for a client window, then rendering");
+    io::stdout().flush().ok();
+
+    let deadline = Duration::from_secs(seconds);
+    let start = std::time::Instant::now();
+    while comp.window_count() == 0 && start.elapsed() < deadline {
+        comp.dispatch(Some(Duration::from_millis(50)))
+            .context("dispatch")?;
+    }
+    // A couple more batches so a just-mapped window has its buffer committed.
+    for _ in 0..5 {
+        comp.dispatch(Some(Duration::from_millis(20))).ok();
+    }
+
+    let count = comp.window_count();
+    let frame = comp.render().context("render frame")?;
+    write_ppm(out, &frame).with_context(|| format!("write {}", out.display()))?;
+    println!(
+        "compositor: rendered {} window(s) into {}x{}; wrote {}",
+        count,
+        frame.width,
+        frame.height,
+        out.display()
+    );
+    if count == 0 {
+        println!("compositor: (no client connected, so the image is just the clear colour)");
+    }
+    Ok(())
+}
+
+// Write a RenderedFrame as a binary PPM (P6). The frame is Argb8888 little-endian
+// (bytes B, G, R, A); PPM is RGB, so reorder and drop alpha.
+#[cfg(all(target_os = "linux", feature = "compositor-render"))]
+fn write_ppm(path: &Path, frame: &compositor::RenderedFrame) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(15 + frame.pixels.len() / 4 * 3);
+    buf.extend_from_slice(format!("P6\n{} {}\n255\n", frame.width, frame.height).as_bytes());
+    for px in frame.pixels.chunks_exact(4) {
+        buf.push(px[2]); // R
+        buf.push(px[1]); // G
+        buf.push(px[0]); // B
+    }
+    std::fs::write(path, buf)
+}
+
+// Run the on-screen winit backend: a real window, nested in the current Wayland
+// or X session, showing the client windows the compositor manages. This is the
+// part that needs a display and a GPU, so it is verified by eye.
+#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+fn compositor_show() -> Result<()> {
+    compositor_ensure_runtime_dir()?;
+
+    let mut comp = compositor::Compositor::new().context("start compositor")?;
+    let socket = comp.socket_name().to_string_lossy().into_owned();
+    println!("compositor: on-screen (winit) backend, nested in the current session");
+    println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+    println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
+    println!("compositor: close the window to stop");
+    io::stdout().flush().ok();
+
+    comp.show().context("run winit backend")
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the
