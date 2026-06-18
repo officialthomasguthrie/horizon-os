@@ -19,9 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The compositor's seat keyboard compiles an xkb keymap, so the Wayland
       # stack links libxkbcommon (and pulls its keymap data). The software
-      # renderer (the `render` feature) links libpixman. The rest of the Wayland
-      # server, and the winit/EGL/GL bindings, are pure Rust (loaded at runtime).
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libpixman-1-dev
+      # renderer (the `render` feature) links libpixman. The winit/EGL/GL bindings
+      # are pure Rust (loaded at runtime), but the bare-metal DRM/KMS backend (the
+      # `udev` feature) links real system libraries: libdrm, libgbm, libinput,
+      # libseat, and libudev.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libpixman-1-dev libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy -p compositor --all-targets --features render -- -D warnings
@@ -38,3 +40,8 @@ jobs:
       # eye, not here), but it must keep compiling. The Wayland/EGL/GL it pulls
       # are runtime-loaded, so a build needs no extra system libraries.
       - run: cargo build -p compositor --features winit
+      # The bare-metal DRM/KMS + libinput backend needs a real GPU and a seat to
+      # run (verified by eye on hardware, not here), but it must keep compiling.
+      # It links the DRM system libraries installed above.
+      - run: cargo build -p compositor --features udev
+      - run: cargo clippy -p compositor --all-targets --features udev -- -D warnings

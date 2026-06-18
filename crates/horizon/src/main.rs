@@ -156,6 +156,11 @@ enum CompositorOp {
     /// or X session to nest in and a GPU; verified by eye, not in CI.
     #[cfg(feature = "compositor-winit")]
     Show,
+    /// Drive a real display directly off the GPU (DRM/KMS) with libinput input.
+    /// This is the bare-metal path: run it from a console, not nested. Needs a
+    /// GPU and a seat; verified by eye on hardware, not in CI.
+    #[cfg(feature = "compositor-udev")]
+    Drm,
 }
 
 #[derive(Subcommand)]
@@ -702,6 +707,8 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
         CompositorOp::Screenshot { out, seconds } => compositor_screenshot(&out, seconds),
         #[cfg(feature = "compositor-winit")]
         CompositorOp::Show => compositor_show(),
+        #[cfg(feature = "compositor-udev")]
+        CompositorOp::Drm => compositor_drm(),
     }
 }
 
@@ -846,6 +853,27 @@ fn compositor_show() -> Result<()> {
     io::stdout().flush().ok();
 
     comp.show().context("run winit backend")
+}
+
+// Run the bare-metal DRM/KMS backend: drive a real display directly off the GPU
+// with libinput input. Unlike `show`, this nests in nothing; it takes over a seat
+// and a console, so it is meant to be run from a TTY (e.g. under seatd or
+// logind), which is how Horizon boots into its shell on hardware. Needs a GPU and
+// a seat, so it is verified by eye on real hardware.
+#[cfg(all(target_os = "linux", feature = "compositor-udev"))]
+fn compositor_drm() -> Result<()> {
+    compositor_ensure_runtime_dir()?;
+
+    let mut comp = compositor::Compositor::new().context("start compositor")?;
+    let socket = comp.socket_name().to_string_lossy().into_owned();
+    println!("compositor: bare-metal DRM/KMS backend (driving the GPU directly)");
+    println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+    println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
+    println!("compositor: click a window to focus it; keyboard and pointer go to it");
+    println!("compositor: switch VT or kill the process to stop");
+    io::stdout().flush().ok();
+
+    comp.run_drm().context("run drm backend")
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the

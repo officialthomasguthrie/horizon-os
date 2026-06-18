@@ -16,7 +16,13 @@
 //!   verified by eye, not in CI, the same way the Constellation's networking
 //!   core is fully tested on one host while only NAT traversal waits for real
 //!   machines. The compositing it runs is the shared, tested path; only the
-//!   windowing and GL present are new. A real DRM/KMS backend comes after.
+//!   windowing and GL present are new.
+//! - `udev` (also building on `render`) adds the bare-metal backend: drive a real
+//!   display directly off the GPU via DRM/KMS and libinput, with no session to
+//!   nest in, through `Compositor::run_drm`. This is what Horizon boots into on
+//!   hardware. It reuses the same compositing and seat routing the other paths do,
+//!   so only the GPU/seat plumbing is new; like winit it is compile-checked in CI
+//!   and eye-verified on bare metal.
 //!
 //! Input is routed through the seat by [`Compositor::pointer_motion`] and the
 //! other input methods: pointer focus follows the cursor, a click focuses the
@@ -58,6 +64,14 @@ pub use render::RenderedFrame;
 
 #[cfg(all(target_os = "linux", feature = "winit"))]
 mod winit;
+
+// The bare-metal DRM/KMS + libinput backend (the `udev` feature): drive a real
+// display directly off the GPU, the path Horizon boots into on hardware. Like
+// winit it reuses the tested compositing and seat routing, so only the backend
+// plumbing is new, and that needs a real GPU and a seat, so it is compile-checked
+// in CI and eye-verified on bare metal.
+#[cfg(all(target_os = "linux", feature = "udev"))]
+mod drm;
 
 /// Whether a compositor can run on this host. Linux only; elsewhere there is no
 /// Wayland server to host and [`Compositor`] does not exist.

@@ -52,19 +52,17 @@ impl RenderedFrame {
     }
 }
 
-// Import every mapped surface's buffer and composite the scene into the bound
-// framebuffer: clear to `clear`, then draw each window at its scene location.
-// Generic over the renderer so the headless (pixman) and on-screen (GLES) paths
-// run the same compositing. `transform` is the output transform the backend
-// needs (none for a top-left offscreen buffer, a flip for a GL window).
-pub(crate) fn paint_space<'buffer, R>(
+// Build the scene's render elements: one surface tree per mapped toplevel, placed
+// at its location in the Space, in front-to-back order. Generic over the renderer
+// so every paint path shares it, the offscreen pixman buffer ([`paint_space`]),
+// the on-screen GLES window (also `paint_space`), and the DRM/KMS scanout (which
+// hands these straight to `DrmOutput::render_frame`). They all draw the same
+// scene; only the render target differs. The elements own their textures
+// (`TextureId: Clone + 'static`), so the renderer borrow is released on return.
+pub(crate) fn space_render_elements<R>(
     renderer: &mut R,
-    framebuffer: &mut R::Framebuffer<'buffer>,
     space: &Space<Window>,
-    size: Size<i32, Physical>,
-    transform: Transform,
-    clear: Color32F,
-) -> Result<()>
+) -> Vec<WaylandSurfaceRenderElement<R>>
 where
     R: Renderer + ImportAll,
     R::TextureId: Clone + 'static,
@@ -84,6 +82,29 @@ where
             Kind::Unspecified,
         ));
     }
+    elements
+}
+
+// Import every mapped surface's buffer and composite the scene into the bound
+// framebuffer: clear to `clear`, then draw each window at its scene location.
+// Generic over the renderer so the headless (pixman) and on-screen (GLES) paths
+// run the same compositing. `transform` is the output transform the backend
+// needs (none for a top-left offscreen buffer, a flip for a GL window). The
+// DRM/KMS backend does not call this: its `DrmOutput` clears and draws the
+// elements from [`space_render_elements`] itself.
+pub(crate) fn paint_space<'buffer, R>(
+    renderer: &mut R,
+    framebuffer: &mut R::Framebuffer<'buffer>,
+    space: &Space<Window>,
+    size: Size<i32, Physical>,
+    transform: Transform,
+    clear: Color32F,
+) -> Result<()>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let elements = space_render_elements(renderer, space);
 
     let full = Rectangle::from_size(size);
     let mut frame = renderer

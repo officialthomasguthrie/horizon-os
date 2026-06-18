@@ -372,6 +372,34 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   pointer focus did. The winit backend's input translation needs a display, so it
   is compile-checked in CI and eye-verified later, exactly like the on-screen
   present. Green as root and as the unprivileged dev user.
+- Phase 3 compositor bare-metal DRM/KMS + libinput backend (`compositor` `udev`
+  feature, Linux): drive a real display directly off the GPU, with no Wayland or X
+  session to nest in, the path Horizon boots into on hardware. It sits on the same
+  split as the rest of the compositor, so almost none of it is new logic: the
+  frame is the same `space_render_elements` the headless render test asserts on,
+  now extracted from `paint_space` and handed to a Smithay `DrmOutput`, and the
+  input is the same seat routing the headless input test drives, now fed by
+  libinput. What is new is only the plumbing a screen needs, and that is the part
+  that waits for hardware: taking the GPU and the input devices through a seat
+  (libseat) so it runs without real root, picking the primary GPU off udev,
+  scanning the first connected connector for its preferred mode and a CRTC that
+  can drive it, a GBM-backed GLES renderer through Smithay's multi-GPU manager (the
+  path that wires the EGL context, dmabuf import, and scanout formats even for one
+  card), and a page-flip-driven present loop (render the scene, queue the frame,
+  retire it on the vblank, repeat) that drives the Wayland server between frames
+  exactly as the winit loop does. libinput's relative pointer motion is accumulated
+  into a cursor clamped to the output, and its evdev keycodes (which Smithay lifts
+  to xkb codes, +8, the same convention winit reports) are mapped back down for the
+  seat. Single GPU, single output, no hotplug; multi-GPU, connector hotplug, and
+  VT-switch buffer recovery come later, but the seat routing and compositing they
+  would feed are already done and tested. Unlike winit (whose Wayland/EGL/GL are
+  pure-Rust runtime-loaded bindings), this links real system libraries: libdrm,
+  libgbm, libinput, libseat, and libudev, now installed in CI. Running it needs a
+  real GPU and a seat, so, exactly like the winit backend, it is compile-checked in
+  CI (a `cargo build` plus clippy of the `udev` feature) and eye-verified on bare
+  metal next. `horizon compositor drm` (behind the CLI's `compositor-udev` feature)
+  runs it from a console. Built and compile-checked from the Linux container on
+  this display-less darwin host.
 
 ## Next
 
@@ -380,17 +408,21 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   its software renderer (importing client shm buffers and compositing the Space
   into an offscreen framebuffer, asserted on pixel by pixel), and its input
   routing (pointer focus follows the cursor, click to focus, keys to the focused
-  client) are done and CI-tested; the on-screen winit backend, which presents the
-  scene and translates the window's input, is written and compile-checked. The
-  next step is the eye part: run `horizon compositor show` on a real Linux
-  session, watch a client's window appear in the nested compositor window, and
-  click and type into it (this host is a display-less darwin Mac driving a
-  headless Linux container, so this is the piece that genuinely waits for
-  hardware). Then a real DRM/KMS + libinput backend for bare metal. After that,
-  the shell proper, iced + wgpu with the Aura intent line as launcher and command
-  palette, and Glass as an L5 compositor surface over the weave audit log.
-  Confined cells can already host compositor surfaces (the cells exec path is
-  ready). Linux-only.
+  client) are done and CI-tested. Both display backends are now written and
+  compile-checked: the on-screen winit backend (presents the scene and translates
+  the window's input, nested in an existing session) and the bare-metal DRM/KMS +
+  libinput backend (drives a real display straight off the GPU, the path Horizon
+  boots into). Both reuse the same tested compositing and seat routing, so only
+  their device plumbing is new, and that is the piece that genuinely waits for
+  hardware (this host is a display-less darwin Mac driving a headless Linux
+  container). The next step is the eye part: run `horizon compositor show` on a
+  real Linux session to watch a client's window appear in the nested window and
+  click and type into it, and run `horizon compositor drm` from a console on bare
+  metal to do the same straight on the GPU. After that, multi-GPU / connector
+  hotplug / VT-switch buffer recovery on the DRM path, and then the shell proper,
+  iced + wgpu with the Aura intent line as launcher and command palette, and Glass
+  as an L5 compositor surface over the weave audit log. Confined cells can already
+  host compositor surfaces (the cells exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. It lands as a
   compositor surface now there is a renderer to draw it on (the `render`/`winit`
   features above); `horizon weave audit/grants` is the headless stand-in until the

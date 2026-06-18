@@ -20,6 +20,23 @@ render = ["smithay/renderer_pixman"]
 # session and present the composited Space on screen. This is the part that needs
 # a display and a GPU, verified by eye, not in CI. Pulls libwayland, EGL, and GL.
 winit = ["render", "smithay/backend_winit"]
+# Bare-metal DRM/KMS + libinput backend: drive a real display directly off a GPU,
+# with no nesting session, the path Horizon boots into on hardware. Same split as
+# winit: it reuses the already-tested compositing and seat routing, so only the
+# backend plumbing is new, and that needs a real GPU and a seat, so it is
+# compile-checked in CI and eye-verified on bare metal. Unlike winit (whose EGL/GL
+# are runtime-loaded), this links system libraries: libdrm, libgbm, libinput,
+# libseat, and libudev.
+udev = [
+    "render",
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_udev",
+    "smithay/backend_session_libseat",
+    "smithay/renderer_gl",
+    "smithay/renderer_multi",
+]
 
 [dependencies]
 thiserror.workspace = true

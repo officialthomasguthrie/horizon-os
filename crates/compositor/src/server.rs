@@ -533,16 +533,16 @@ impl Compositor {
             .unwrap_or((0, 0))
     }
 
-    // The scene the winit backend paints: the same `Space` the headless render
-    // path composites.
-    #[cfg(feature = "winit")]
+    // The scene an on-screen backend paints: the same `Space` the headless render
+    // path composites. Shared by the winit and DRM backends.
+    #[cfg(any(feature = "winit", feature = "udev"))]
     pub(crate) fn space(&self) -> &Space<Window> {
         &self.state.space
     }
 
     // Tell each mapped client it may draw its next frame. A static client shows
     // its first buffer without this, but an animating one waits on the callback.
-    #[cfg(feature = "winit")]
+    #[cfg(any(feature = "winit", feature = "udev"))]
     pub(crate) fn send_frames(&self, time_ms: u32) {
         let output = self.state.output.clone();
         for window in self.state.space.elements() {
@@ -561,5 +561,15 @@ impl Compositor {
     #[cfg(feature = "winit")]
     pub fn show(&mut self) -> Result<()> {
         crate::winit::run(self)
+    }
+
+    /// Drive a real display directly off the GPU (DRM/KMS) with libinput input,
+    /// running until the process is stopped and driving the Wayland server between
+    /// frames. This is the bare-metal path Horizon boots into; it takes over a
+    /// seat and a GPU, so it runs on a console (not nested), and is eye-verified
+    /// on hardware.
+    #[cfg(feature = "udev")]
+    pub fn run_drm(&mut self) -> Result<()> {
+        crate::drm::run(self)
     }
 }
