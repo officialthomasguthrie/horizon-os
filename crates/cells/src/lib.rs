@@ -28,7 +28,7 @@ mod seccomp;
 
 use std::ffi::OsString;
 use std::os::unix::io::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // A host path mounted into the cell's world. The default world has no files at
 // all; every path a principal can see is a Bind placed here on purpose.
@@ -86,6 +86,8 @@ pub struct Cell {
     pub(crate) keep_fds: Vec<RawFd>,
     pub(crate) seccomp: Seccomp,
     pub(crate) hostname: Option<String>,
+    pub(crate) mount_proc: bool,
+    pub(crate) mount_dev: bool,
 }
 
 impl Cell {
@@ -126,6 +128,40 @@ impl Cell {
     pub fn hostname(mut self, name: impl Into<String>) -> Cell {
         self.hostname = Some(name.into());
         self
+    }
+
+    // Mount a private /proc inside the cell. A real program usually needs it
+    // (/proc/self, the dynamic linker's introspection, libc), and it must be
+    // mounted by the cell's PID 1, which is why it lives on the exec path. The
+    // procfs is bound to the cell's own pid namespace, so it shows only the
+    // cell's processes, never the host's.
+    pub fn mount_proc(mut self) -> Cell {
+        self.mount_proc = true;
+        self
+    }
+
+    // Mount a minimal /dev inside the cell: null, zero, full, random, urandom,
+    // and tty, each bound from the host's node because an unprivileged user
+    // namespace cannot mknod its own, plus the usual /dev/fd and std-stream
+    // symlinks into /proc. No disk and no real hardware.
+    pub fn mount_dev(mut self) -> Cell {
+        self.mount_dev = true;
+        self
+    }
+
+    // Convenience for running an ordinary host program: bind the host's standard
+    // read-only system directories (those that exist) so a dynamically linked
+    // binary finds its interpreter, shared libraries, and ld.so cache, and mount
+    // /proc and /dev. This trades the empty-world default for the ability to run
+    // a real executable; the home directory, user data, and the network still
+    // stay out. `horizon cell run` uses this.
+    pub fn bind_host_system(mut self) -> Cell {
+        for dir in ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/etc"] {
+            if Path::new(dir).exists() {
+                self = self.bind_ro(dir, dir);
+            }
+        }
+        self.mount_proc().mount_dev()
     }
 
     // Spawn the payload confined and return without waiting, so the broker can

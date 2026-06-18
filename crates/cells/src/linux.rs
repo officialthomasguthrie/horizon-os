@@ -1,11 +1,16 @@
 // The Linux confinement core. The caller (the supervisor) forks an init child A,
-// which creates the namespaces, maps itself to root inside the new user
-// namespace, builds a tmpfs root with only the granted binds, and pivots into
-// it. A then forks the payload child B, which is PID 1 of the cell: it sets
-// no_new_privs, installs the seccomp filter, keeps only the granted fds, and
-// runs the payload.
+// which creates the namespaces and maps itself to root inside the new user
+// namespace. A then forks the payload child B, which is PID 1 of the cell's pid
+// namespace and builds the rest of the world: a tmpfs root holding only the
+// granted binds, an optional minimal /dev and a private /proc, then it pivots
+// into that root, sets no_new_privs, installs the seccomp filter, keeps only the
+// granted fds, and runs the payload. The world is built by B rather than A
+// because /proc must be mounted from inside the new pid namespace (A is not in
+// it, only its children are) and the host device nodes /dev binds need are only
+// reachable before the pivot detaches the host, so both belong to one process,
+// which is B.
 //
-// Two pipes carry the outcome. B writes an (step, errno) pair to an error pipe
+// Two pipes carry the outcome. B writes a (step, errno) pair to an error pipe
 // only if a setup or exec step fails; a clean start closes it (CLOEXEC on exec,
 // or an explicit close for a closure payload). A bridges that, plus B's wait
 // status, into a 12-byte report the supervisor reads, so every failure comes
@@ -14,11 +19,12 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use nix::sched::{unshare, CloneFlags};
+use nix::sys::statvfs::{statvfs, FsFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{chdir, execve, fork, pivot_root, sethostname, ForkResult};
 
@@ -48,6 +54,8 @@ const S_FORK: i32 = 9;
 const S_NOPRIV: i32 = 11;
 const S_SECCOMP: i32 = 12;
 const S_EXEC: i32 = 13;
+const S_DEV: i32 = 14;
+const S_PROC: i32 = 15;
 
 fn step_name(s: i32) -> &'static str {
     match s {
@@ -63,6 +71,8 @@ fn step_name(s: i32) -> &'static str {
         S_NOPRIV => "set no_new_privs",
         S_SECCOMP => "install seccomp filter",
         S_EXEC => "exec payload",
+        S_DEV => "set up /dev",
+        S_PROC => "mount /proc",
         _ => "unknown step",
     }
 }
@@ -123,8 +133,10 @@ pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {
     wait(spawn(cell, payload)?)
 }
 
-// Child A: build the cell, fork B, bridge its outcome into the report pipe.
-// Returns A's own exit code (the supervisor ignores it; it reads the pipe).
+// Child A: create the namespaces and the uid/gid map, then fork B (PID 1 of the
+// new pid namespace) to build the world and run the payload, and bridge B's
+// outcome into the report pipe. Returns A's own exit code (the supervisor
+// ignores it; it reads the pipe).
 fn cell_init(stage: &str, cell: Cell, payload: Payload, report: RawFd) -> i32 {
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
@@ -146,56 +158,20 @@ fn cell_init(stage: &str, cell: Cell, payload: Payload, report: RawFd) -> i32 {
         return fail(report, S_MAP, c);
     }
 
-    // Stop every mount change here from propagating back to the host.
-    if let Err(e) = mount(NONE, "/", NONE, MsFlags::MS_REC | MsFlags::MS_PRIVATE, NONE) {
-        return fail(report, S_PRIVATE, e as i32);
-    }
-
-    // A fresh tmpfs at a unique mountpoint becomes the cell's whole world.
-    if let Err(c) = mkdirs(stage) {
-        return fail(report, S_MKDIR, c);
-    }
-    if let Err(e) = mount(
-        Some("tmpfs"),
-        stage,
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        NONE,
-    ) {
-        return fail(report, S_TMPFS, e as i32);
-    }
-    if let Err(c) = mkdirs(&format!("{stage}/{PUT_OLD}")) {
-        return fail(report, S_MKDIR, c);
-    }
-
-    for b in &cell.binds {
-        if let Err((step, c)) = bind_into(stage, b) {
-            return fail(report, step, c);
-        }
-    }
-
-    if let Err(c) = pivot(stage, report) {
-        return c;
-    }
-
-    if let Some(name) = &cell.hostname {
-        if let Err(e) = sethostname(name) {
-            return fail(report, S_HOSTNAME, e as i32);
-        }
-    }
-
     // Error pipe B -> A: B writes (step, errno) only if a step fails.
     let (err_r, err_w) = match pipe_raw() {
         Ok(p) => p,
         Err(_) => return fail(report, S_FORK, 0),
     };
 
+    // This first fork after unshare(CLONE_NEWPID) lands B as PID 1 of the new
+    // pid namespace.
     match unsafe { fork() } {
         Err(e) => fail(report, S_FORK, e as i32),
         Ok(ForkResult::Child) => {
             close(err_r);
             close(report);
-            payload_child(cell, payload, err_w)
+            build_world_and_run(stage, cell, payload, err_w)
         }
         Ok(ForkResult::Parent { child }) => {
             close(err_w);
@@ -204,8 +180,67 @@ fn cell_init(stage: &str, cell: Cell, payload: Payload, report: RawFd) -> i32 {
     }
 }
 
-// Child B: PID 1 of the cell. Lock down, then run the payload.
-fn payload_child(cell: Cell, payload: Payload, err: RawFd) -> ! {
+// Child B: PID 1 of the cell. Build the world (tmpfs root, binds, optional /dev
+// and /proc), pivot into it, lock down, and run the payload. Any setup failure
+// is emitted as (step, errno) on the error pipe; a clean start closes it (an
+// explicit close for a closure, CLOEXEC on a successful exec).
+fn build_world_and_run(stage: &str, cell: Cell, payload: Payload, err: RawFd) -> ! {
+    // Stop every mount change here from propagating back to the host.
+    if let Err(e) = mount(NONE, "/", NONE, MsFlags::MS_REC | MsFlags::MS_PRIVATE, NONE) {
+        emit_exit(err, S_PRIVATE, e as i32);
+    }
+
+    // A fresh tmpfs at a unique mountpoint becomes the cell's whole world.
+    if let Err(c) = mkdirs(stage) {
+        emit_exit(err, S_MKDIR, c);
+    }
+    if let Err(e) = mount(
+        Some("tmpfs"),
+        stage,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        NONE,
+    ) {
+        emit_exit(err, S_TMPFS, e as i32);
+    }
+    if let Err(c) = mkdirs(&format!("{stage}/{PUT_OLD}")) {
+        emit_exit(err, S_MKDIR, c);
+    }
+
+    for b in &cell.binds {
+        if let Err((step, c)) = bind_into(stage, b) {
+            emit_exit(err, step, c);
+        }
+    }
+
+    // /dev nodes are binds of the host's, so they must be set up before the
+    // pivot detaches the host filesystem.
+    if cell.mount_dev {
+        if let Err((step, c)) = dev_into(stage) {
+            emit_exit(err, step, c);
+        }
+    }
+
+    // /proc is a virtual filesystem (no host source), so it can be mounted into
+    // the new root before the pivot. It must be mounted here, by PID 1 of the
+    // new pid namespace, so the procfs binds to that namespace and the cell sees
+    // only its own processes.
+    if cell.mount_proc {
+        if let Err((step, c)) = proc_into(stage) {
+            emit_exit(err, step, c);
+        }
+    }
+
+    if let Err(c) = pivot(stage) {
+        emit_exit(err, S_PIVOT, c);
+    }
+
+    if let Some(name) = &cell.hostname {
+        if let Err(e) = sethostname(name) {
+            emit_exit(err, S_HOSTNAME, e as i32);
+        }
+    }
+
     if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
         emit_exit(err, S_NOPRIV, errno());
     }
@@ -326,31 +361,99 @@ fn bind_into(stage: &str, b: &crate::Bind) -> std::result::Result<(), (i32, i32)
         io_errno(std::fs::write(&target, b"")).map_err(|c| (S_MKDIR, c))?;
     }
 
-    let mut flags = MsFlags::MS_BIND | MsFlags::MS_REC;
+    let flags = MsFlags::MS_BIND | MsFlags::MS_REC;
     mount(Some(b.src.as_path()), target.as_str(), NONE, flags, NONE)
         .map_err(|e| (S_BIND, e as i32))?;
     if !b.writable {
-        flags |= MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY;
-        mount(Some(b.src.as_path()), target.as_str(), NONE, flags, NONE)
-            .map_err(|e| (S_BIND, e as i32))?;
+        // A read-only remount in a user namespace cannot drop the flags the
+        // source mount already had locked on (nosuid, nodev, relatime, ...), so
+        // they must be carried over or the remount is refused with EPERM. This
+        // is the bubblewrap gotcha that bites binding host system dirs read-only.
+        let flags =
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | locked_flags(&target);
+        mount(NONE, target.as_str(), NONE, flags, NONE).map_err(|e| (S_BIND, e as i32))?;
     }
     Ok(())
 }
 
-fn pivot(stage: &str, report: RawFd) -> std::result::Result<(), i32> {
-    if let Err(e) = chdir(stage) {
-        return Err(fail(report, S_PIVOT, e as i32));
+// The mount flags the kernel will not let an unprivileged remount clear, read
+// back from the just-created bind so the read-only remount can re-assert them.
+fn locked_flags(target: &str) -> MsFlags {
+    let mut flags = MsFlags::empty();
+    let Ok(st) = statvfs(target) else {
+        return flags;
+    };
+    let f = st.flags();
+    if f.contains(FsFlags::ST_NOSUID) {
+        flags |= MsFlags::MS_NOSUID;
     }
-    if let Err(e) = pivot_root(".", PUT_OLD) {
-        return Err(fail(report, S_PIVOT, e as i32));
+    if f.contains(FsFlags::ST_NODEV) {
+        flags |= MsFlags::MS_NODEV;
     }
-    if let Err(e) = chdir("/") {
-        return Err(fail(report, S_PIVOT, e as i32));
+    if f.contains(FsFlags::ST_NOEXEC) {
+        flags |= MsFlags::MS_NOEXEC;
     }
+    if f.contains(FsFlags::ST_NOATIME) {
+        flags |= MsFlags::MS_NOATIME;
+    }
+    if f.contains(FsFlags::ST_NODIRATIME) {
+        flags |= MsFlags::MS_NODIRATIME;
+    }
+    if f.contains(FsFlags::ST_RELATIME) {
+        flags |= MsFlags::MS_RELATIME;
+    }
+    flags
+}
+
+// A minimal /dev: the standard character devices, each bound from the host's
+// node (an unprivileged user namespace cannot mknod its own), plus the usual
+// symlinks into /proc. Runs before the pivot, while the host's /dev is reachable.
+fn dev_into(stage: &str) -> std::result::Result<(), (i32, i32)> {
+    let devdir = format!("{stage}/dev");
+    mkdirs(&devdir).map_err(|c| (S_DEV, c))?;
+    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+        let node = crate::Bind {
+            src: PathBuf::from(format!("/dev/{name}")),
+            dst: PathBuf::from(format!("/dev/{name}")),
+            writable: true,
+        };
+        bind_into(stage, &node).map_err(|(_, c)| (S_DEV, c))?;
+    }
+    for (link, dst) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let _ = std::os::unix::fs::symlink(dst, format!("{devdir}/{link}"));
+    }
+    Ok(())
+}
+
+// A private /proc, mounted into the new root by PID 1 of the cell's pid
+// namespace, so the procfs reflects that namespace and shows only the cell.
+fn proc_into(stage: &str) -> std::result::Result<(), (i32, i32)> {
+    let target = format!("{stage}/proc");
+    mkdirs(&target).map_err(|c| (S_PROC, c))?;
+    mount(
+        Some("proc"),
+        target.as_str(),
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC | MsFlags::MS_NODEV,
+        NONE,
+    )
+    .map_err(|e| (S_PROC, e as i32))?;
+    Ok(())
+}
+
+// Make the staged tmpfs the root and detach the host. Errors come back as an
+// errno; the caller (B) names the step S_PIVOT and emits it.
+fn pivot(stage: &str) -> std::result::Result<(), i32> {
+    chdir(stage).map_err(|e| e as i32)?;
+    pivot_root(".", PUT_OLD).map_err(|e| e as i32)?;
+    chdir("/").map_err(|e| e as i32)?;
     let old = format!("/{PUT_OLD}");
-    if let Err(e) = umount2(old.as_str(), MntFlags::MNT_DETACH) {
-        return Err(fail(report, S_PIVOT, e as i32));
-    }
+    umount2(old.as_str(), MntFlags::MNT_DETACH).map_err(|e| e as i32)?;
     let _ = std::fs::remove_dir(&old);
     Ok(())
 }

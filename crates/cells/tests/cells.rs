@@ -5,7 +5,9 @@
 // CI runner that restricts them), so the suite stays green everywhere.
 #![cfg(target_os = "linux")]
 
+use std::ffi::OsString;
 use std::os::unix::io::RawFd;
+use std::path::PathBuf;
 
 use cells::{Cell, Payload, Seccomp};
 
@@ -199,4 +201,110 @@ fn the_payload_exit_code_comes_back() {
     let st = Cell::new().run(Payload::call(|| 42)).expect("run cell");
     assert_eq!(st.code, Some(42));
     assert!(!st.success());
+}
+
+// Find a host binary, or None so the test skips on a box that lacks it.
+fn host_program(name: &str) -> Option<PathBuf> {
+    for dir in ["/bin", "/usr/bin"] {
+        let p = std::path::Path::new(dir).join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn exec(path: PathBuf, args: &[&str]) -> Payload {
+    let mut argv = vec![OsString::from(path.file_name().unwrap())];
+    argv.extend(args.iter().map(OsString::from));
+    Payload::Exec {
+        path,
+        argv,
+        env: Vec::new(),
+    }
+}
+
+#[test]
+fn a_real_binary_runs_in_a_cell() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let Some(cp) = host_program("cp") else {
+        eprintln!("skipping: no cp on host");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("in");
+    let output = dir.path().join("out");
+    std::fs::write(&input, b"exec-works").unwrap();
+    std::fs::write(&output, b"").unwrap();
+
+    // cp is a dynamically linked host binary. It runs only if the cell's /usr,
+    // /lib and the ld.so cache are present, which bind_host_system supplies. It
+    // reads a read-only bind and writes a read-write bind, then exits 0.
+    let status = Cell::new()
+        .bind_host_system()
+        .bind_ro(&input, "/in")
+        .bind_rw(&output, "/out")
+        .run(exec(cp, &["/in", "/out"]))
+        .expect("run exec cell");
+    assert!(status.success(), "cp exited {:?}", status.code);
+    assert_eq!(std::fs::read(&output).unwrap(), b"exec-works");
+}
+
+#[test]
+fn the_exec_cell_has_a_private_proc() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let Some(cp) = host_program("cp") else {
+        eprintln!("skipping: no cp on host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out");
+    std::fs::write(&output, b"").unwrap();
+
+    // The kernel fills /proc/self/comm with this process's name. A mounted
+    // procfs bound to the cell's pid namespace is the only way to read it, and
+    // the process running is cp, so it reads back "cp".
+    let status = Cell::new()
+        .bind_host_system()
+        .bind_rw(&output, "/out")
+        .run(exec(cp, &["/proc/self/comm", "/out"]))
+        .expect("run proc cell");
+    assert!(status.success(), "reading /proc failed: {:?}", status.code);
+    assert_eq!(std::fs::read(&output).unwrap(), b"cp\n");
+}
+
+#[test]
+fn the_exec_cell_has_a_minimal_dev() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let Some(cp) = host_program("cp") else {
+        eprintln!("skipping: no cp on host");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("out");
+    std::fs::write(&output, b"not-empty").unwrap();
+
+    // Copying /dev/null yields an empty file and a clean exit, which proves the
+    // device node is present and readable inside the cell.
+    let status = Cell::new()
+        .bind_host_system()
+        .bind_rw(&output, "/out")
+        .run(exec(cp, &["/dev/null", "/out"]))
+        .expect("run dev cell");
+    assert!(
+        status.success(),
+        "reading /dev/null failed: {:?}",
+        status.code
+    );
+    assert!(
+        std::fs::read(&output).unwrap().is_empty(),
+        "/dev/null was not empty"
+    );
 }

@@ -242,17 +242,42 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Glass stand-in). cells is a cross-platform dependency of the horizon CLI but the
   demo is Linux-gated, so on other hosts it says confinement is unavailable rather
   than failing. Verified through the binary as both root and an unprivileged user.
+- Phase 2 Cells exec of real principals (`cells`, Linux): a real program, not just
+  an in-process closure, runs confined in a Cell, which closes Phase 2 userland. A
+  Cell's `Payload::Exec` execs a dynamically linked host binary inside the cage,
+  for which it needs a world richer than the empty tmpfs: a private /proc and a
+  minimal /dev. Both are now mounted by the cell's PID 1 (child B), which is why
+  the work waited for the exec path. The supervisor restructured so B builds the
+  whole world (tmpfs root, binds, /dev, /proc) and pivots last, with child A
+  reduced to creating the namespaces and the uid/gid map: /proc must be mounted
+  from inside the new pid namespace and A is not in it (only its children are), and
+  the /dev nodes are binds of the host's that only resolve before the pivot detaches
+  the host, so both belong to one process, B. /proc is a fresh procfs bound to the
+  cell's own pid namespace, so it shows only the cell's processes; /dev is null,
+  zero, full, random, urandom, and tty bound from the host (an unprivileged user
+  namespace cannot mknod its own nodes) plus the usual /dev/fd and std-stream
+  symlinks. Binding the host's read-only system directories needed the bubblewrap
+  read-only-remount fix: a remount in a user namespace cannot drop the flags the
+  source mount already locked (nosuid, nodev, relatime), so the ro remount now
+  reads them back with statvfs and re-asserts them, or it is refused with EPERM.
+  `Cell::bind_host_system` bundles the standard read-only system dirs that exist
+  plus /proc and /dev so an ordinary binary can find its interpreter, libraries,
+  and ld.so cache. Tests prove exec end to end: a real dynamic binary (cp) runs in
+  a cell, reading a read-only bind and writing a read-write bind; /proc is private
+  (cp copies /proc/self/comm and it reads back "cp"); /dev works (cp copies
+  /dev/null to an empty file). Green as root and as an unprivileged user.
+- horizon cell run (`horizon cell run [--ro SRC[:DST]] [--rw ...] -- <cmd>`): run
+  an ordinary command confined. It binds the host's read-only system, mounts a
+  private /proc and /dev, leaves an empty network namespace and no host data, hands
+  in any extra binds asked for, and propagates the command's exit code so the cell
+  is transparent to a caller. Linux-gated like the demo; other hosts say
+  confinement is unavailable. Verified end to end through the binary as both root
+  and an unprivileged user: the cell root holds only the bound system dirs, /proc,
+  and /dev (no /work, /root, or /home), the network namespace is empty, the
+  unprivileged caller is mapped to root inside, and a nonzero exit comes back.
 
 ## Next
 
-- Finish Phase 2 on a Linux host: the cells confinement primitive, the broker
-  fd-passing seam, and the `horizon cell demo` are done (above). What remains is
-  exec of real principals: a private /proc and a minimal /dev mounted from PID 1
-  inside the cell, so a brokered binary runs in a Cell, not just an in-process
-  closure (the closure path is enough for the broker seam and the demo, but a real
-  app is an executable). The /proc mount needs the mounter to be PID 1 of the
-  cell's pid namespace, which is why it is deferred to the exec path. Linux-only,
-  so build and test there, not on darwin.
 - Glass: the live transparency surface over the weave audit log. It lands with
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.

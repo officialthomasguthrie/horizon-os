@@ -117,6 +117,18 @@ enum ConstellationOp {
 enum CellOp {
     /// Scripted demo: a confined principal with no authority reaches a file only through the broker, audited
     Demo,
+    /// Run a command confined in a Cell: read-only host system, private /proc and /dev, no network, no host data
+    Run {
+        /// Extra read-only bind, SRC or SRC:DST (repeatable)
+        #[arg(long = "ro", value_name = "SRC[:DST]")]
+        ro: Vec<String>,
+        /// Extra read-write bind, SRC or SRC:DST (repeatable)
+        #[arg(long = "rw", value_name = "SRC[:DST]")]
+        rw: Vec<String>,
+        /// The command and its arguments, after --
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -434,6 +446,7 @@ fn weave_demo(store: &Path) -> Result<()> {
 fn cell_cmd(op: CellOp) -> Result<()> {
     match op {
         CellOp::Demo => cell_demo(),
+        CellOp::Run { ro, rw, cmd } => cell_run(ro, rw, cmd),
     }
 }
 
@@ -561,6 +574,97 @@ fn cell_demo() -> Result<()> {
 fn cell_demo() -> Result<()> {
     println!("Cells need Linux (namespaces + seccomp); this host has no confinement.");
     Ok(())
+}
+
+// Run a real command confined. bind_host_system makes the host's read-only
+// system directories, /proc and /dev available so an ordinary dynamically linked
+// binary can run; everything else (the home directory, host data, the network)
+// stays out. The command's exit code is propagated, so the cell is transparent
+// to a caller that only cares whether the command succeeded.
+#[cfg(target_os = "linux")]
+fn cell_run(ro: Vec<String>, rw: Vec<String>, cmd: Vec<String>) -> Result<()> {
+    use cells::{Cell, Payload};
+    use std::ffi::OsString;
+
+    if !cells::available() {
+        println!(
+            "this kernel will not create unprivileged user namespaces, so a Cell \
+             cannot be built here"
+        );
+        return Ok(());
+    }
+
+    let program = cmd.first().ok_or_else(|| anyhow!("no command given"))?;
+    let path =
+        resolve_program(program).ok_or_else(|| anyhow!("command not found on host: {program}"))?;
+
+    let mut cell = Cell::new().bind_host_system();
+    for spec in &ro {
+        let (src, dst) = split_bind(spec);
+        cell = cell.bind_ro(src, dst);
+    }
+    for spec in &rw {
+        let (src, dst) = split_bind(spec);
+        cell = cell.bind_rw(src, dst);
+    }
+
+    let argv: Vec<OsString> = cmd.iter().map(OsString::from).collect();
+    let env = vec![
+        (
+            OsString::from("PATH"),
+            OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"),
+        ),
+        (OsString::from("HOME"), OsString::from("/")),
+    ];
+
+    eprintln!("cell: read-only host system, private /proc and /dev, no network, no host data");
+    eprintln!("cell: exec {}", path.display());
+    eprintln!();
+    io::stderr().flush().ok();
+
+    let status = cell
+        .run(Payload::Exec { path, argv, env })
+        .context("run cell")?;
+    match status.code {
+        Some(0) => Ok(()),
+        Some(c) => std::process::exit(c),
+        None => Err(anyhow!(
+            "command was killed by signal {}",
+            status.signal.unwrap_or(0)
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cell_run(_ro: Vec<String>, _rw: Vec<String>, _cmd: Vec<String>) -> Result<()> {
+    println!("Cells need Linux (namespaces + seccomp); this host has no confinement.");
+    Ok(())
+}
+
+// Find a program for `cell run`: an explicit path as given, otherwise the first
+// match in the standard binary directories (which bind_host_system mounts).
+#[cfg(target_os = "linux")]
+fn resolve_program(name: &str) -> Option<PathBuf> {
+    if name.contains('/') {
+        let p = PathBuf::from(name);
+        return p.exists().then_some(p);
+    }
+    for dir in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        let p = Path::new(dir).join(name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// A bind spec is SRC or SRC:DST; with no colon the destination matches the source.
+#[cfg(target_os = "linux")]
+fn split_bind(spec: &str) -> (PathBuf, PathBuf) {
+    match spec.split_once(':') {
+        Some((src, dst)) => (PathBuf::from(src), PathBuf::from(dst)),
+        None => (PathBuf::from(spec), PathBuf::from(spec)),
+    }
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the
