@@ -8,7 +8,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+# Only the legacy 8x8 bitmap glyph tables are used (the raster surface stamps
+# them); the unicode lookup machinery and std are not, so keep it lean.
 [dependencies]
+font8x8 = { version = "0.3.1", default-features = false }
 weave = { path = "../weave" }
 
 [dev-dependencies]

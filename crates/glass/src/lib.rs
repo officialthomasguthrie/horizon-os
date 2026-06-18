@@ -6,20 +6,36 @@
 //! what was refused, with a one-tap kill switch (severing a capability) and a
 //! timeline over a window.
 //!
-//! This crate is the model layer, the part that can be built and proven without
-//! a display. [`build`] folds the broker's grant table and audit log into a
-//! [`Model`]; [`report::text`] renders that model as text (the headless stand-in
-//! for the drawn surface); [`Glass`] wraps a live [`Broker`] to read the model
-//! and pull a kill switch. The compositor surface that draws the same model
-//! comes when there is a screen to draw it on.
+//! This crate is the model layer plus its renderings, the part that can be built
+//! and proven without a display. [`build`] folds the broker's grant table and
+//! audit log into a [`Model`]; [`report::text`] renders that model as a terminal
+//! dashboard; [`surface::layout`] lays the same model out as a [`Scene`] of
+//! positioned rectangles and text with click targets, and [`raster::rasterize`]
+//! turns that scene into an RGBA [`Pixmap`]. Both are pure and tested without a
+//! display, so the drawn surface can be written to an image and looked at on a
+//! host with no screen; the compositor's only added job is uploading that pixmap
+//! as a texture and putting it on a GPU. [`Glass`] wraps a live [`Broker`] to
+//! read the model and pull a kill switch.
 
 mod model;
+pub mod raster;
 pub mod report;
+pub mod surface;
+
+#[cfg(test)]
+mod tests_support;
 
 pub use model::{
     build, Bucket, Channel, ChannelKind, ChannelStatus, Model, PrincipalView, Totals, Window,
     DAY_SECS, WEEK_SECS,
 };
+pub use raster::Pixmap;
+pub use surface::{layout, Action, Color, Hit, Primitive, Scene};
+
+// Lay the model out and rasterize it in one step: the model as a drawable image.
+pub fn render(model: &Model, width: u32, height: u32, scale: u32) -> Pixmap {
+    raster::rasterize(&surface::layout(model, width, height, scale))
+}
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

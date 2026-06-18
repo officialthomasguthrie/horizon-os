@@ -460,9 +460,36 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `horizon glass sever --grant <id>` is the kill switch; verified end to end through
   the binary on a scripted store (three principals, live network and data channels,
   a directory grant showing its touched files, an out-of-scope blocked attempt, then
-  a severed channel after the kill switch). The same Model drawn as an iced + wgpu
-  compositor surface comes when there is a screen to verify it on, the same split
-  the rest of Phase 3 uses.
+  a severed channel after the kill switch). The same Model drawn as a compositor
+  surface comes when there is a screen to verify it on, the same split the rest of
+  Phase 3 uses.
+- Phase 3 Glass raster surface (`glass` crate, cross-platform): the drawn
+  transparency view, the same Model the text report shows turned into pixels, on
+  the same headless split as the rest of Phase 3. `surface::layout` is a pure fold
+  of the Model into a `Scene` of positioned rectangles and text runs (a status-
+  colored tab and label per channel, the per-principal blocks with their touched
+  sub-resources, the timeline as bars, the colored totals header, and an Aura
+  intent line at the bottom as the launcher/command palette), and the scene also
+  carries hit targets, so a click on the drawn surface resolves back to an action
+  (severing a channel) the way the text view's grant id does. `raster::rasterize`
+  turns that scene into an RGBA `Pixmap` in pure software: alpha-blended rectangles
+  and the legacy 8x8 bitmap font (the one new dependency, font8x8, is pure glyph
+  data) stamped at an integer scale, the minimal developer/Linux look the rest of
+  the system uses. Both are pure and run on darwin, not only in the container, so
+  the surface is unit-tested without a display (rect fill and clipping, the known
+  lit pixels of a glyph, cell advance, alpha blend, and a live model rasterizing to
+  a green pixel) and, more usefully on a display-less host, can be written to an
+  image and looked at: `horizon glass render <store> [--days N] [--out f.ppm]
+  [--width --height --scale]` draws the view to a PPM. The choice was native
+  Smithay rasterization over an iced + wgpu client so the drawing stays on the
+  headless-testable, GPU-free split (the container has no GPU); the compositor's
+  only remaining job is to upload that Pixmap as a texture and put it on a screen,
+  the thin plumbing that waits for hardware, exactly as winit/DRM are thin plumbing
+  over the tested compositing. 12 new surface and raster unit tests (glass now 19
+  unit plus 2 end-to-end). Verified end to end through the binary on a scripted
+  four-principal store (live network, data, and device channels, a directory grant
+  showing its touched files, an out-of-scope blocked attempt, and a severed
+  channel), rendered to an image and eye-checked.
 
 ## Next
 
@@ -485,18 +512,24 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   (multi-GPU, connector and GPU hotplug, VT-switch buffer recovery), all written
   and compile-checked on the same split, so it too is waiting on that eye part;
   what is left on it is a display-only secondary GPU and a real multi-monitor
-  logical layout. Then the shell proper, iced + wgpu with the Aura intent line as
-  launcher and command palette, and Glass as an L5 compositor surface over the
-  weave audit log. Confined cells can already host compositor surfaces (the cells
+  logical layout. Then the shell proper: the compositor draws the Glass surface
+  (already a pure Model -> Scene -> Pixmap renderer in the `glass` crate) as the
+  L5 desktop over the weave audit log, with the Aura intent line as launcher and
+  command palette. Confined cells can already host compositor surfaces (the cells
   exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
-  is done (the `glass` crate: a pure fold of the broker's grant table and audit log
-  into a per-principal map of live/severed/blocked channels, a 7-day timeline, and
-  the sever kill switch, all headless-testable and CI-green on darwin), with a text
-  report as the headless stand-in (`horizon glass show` / `glass sever`). What is
-  left is drawing that same Model as an iced + wgpu compositor surface, which lands
-  once there is a renderer and a screen to verify it on (the `render`/`winit`
-  features above); a confined cell can host it (the cells exec path is ready).
+  and the drawn surface are both done (the `glass` crate: a pure fold of the
+  broker's grant table and audit log into a per-principal map of
+  live/severed/blocked channels, a 7-day timeline, and the sever kill switch, then
+  `surface::layout` + `raster::rasterize` turning that Model into an RGBA Pixmap
+  with hit targets, all headless-testable and CI-green on darwin), with a text
+  report (`horizon glass show`) and an image render (`horizon glass render`) as the
+  headless stand-ins and `horizon glass sever` as the kill switch. What is left is
+  the compositor blit: upload the Pixmap as a texture and draw it as the shell
+  background under client windows, then route a click on a `sever` hit target back
+  through `Glass::sever`. That lands with the `render`/`winit`/`udev` features and a
+  screen to verify it on; a confined cell can host it (the cells exec path is
+  ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

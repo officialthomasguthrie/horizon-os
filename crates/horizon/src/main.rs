@@ -275,6 +275,26 @@ enum GlassOp {
         #[arg(long)]
         grant: String,
     },
+    /// Draw the transparency view to an image (PPM): the same model the text view
+    /// shows, rasterized to pixels with no display needed, so it opens anywhere
+    Render {
+        store: PathBuf,
+        /// Length of the window to summarize, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+        /// File to write the PPM (P6) image to
+        #[arg(long, default_value = "horizon-glass.ppm")]
+        out: PathBuf,
+        /// Surface width in pixels
+        #[arg(long, default_value_t = 1280)]
+        width: u32,
+        /// Surface height in pixels
+        #[arg(long, default_value_t = 800)]
+        height: u32,
+        /// Integer text scale (1 = 8px glyphs, 2 = 16px, ...)
+        #[arg(long, default_value_t = 2)]
+        scale: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -467,8 +487,44 @@ fn glass_cmd(op: GlassOp) -> Result<()> {
             g.sever(gid)?;
             println!("severed {grant}");
         }
+        GlassOp::Render {
+            store,
+            days,
+            out,
+            width,
+            height,
+            scale,
+        } => {
+            let mut b = open_broker(&store)?;
+            let g = glass::Glass::new(&mut b);
+            let window = glass::Window::days(now_unix(), days);
+            let model = g.model_within(window, glass::DEFAULT_BUCKETS)?;
+            let pm = glass::render(&model, width, height, scale);
+            write_glass_ppm(&out, &pm).with_context(|| format!("write {}", out.display()))?;
+            println!(
+                "glass: rendered {}x{} surface for {} principal(s); wrote {}",
+                pm.width,
+                pm.height,
+                model.principals.len(),
+                out.display()
+            );
+        }
     }
     Ok(())
+}
+
+// Write a Glass Pixmap as a binary PPM (P6). The pixmap is RGBA; PPM is RGB, so
+// drop the (always opaque) alpha. The surface renders with no display, so the
+// image is the headless way to actually see what Glass draws.
+fn write_glass_ppm(path: &Path, pm: &glass::Pixmap) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(20 + (pm.width as usize * pm.height as usize * 3));
+    buf.extend_from_slice(format!("P6\n{} {}\n255\n", pm.width, pm.height).as_bytes());
+    for px in pm.rgba.chunks_exact(4) {
+        buf.push(px[0]); // R
+        buf.push(px[1]); // G
+        buf.push(px[2]); // B
+    }
+    std::fs::write(path, buf)
 }
 
 // A scripted run that shows the whole capability lifecycle landing in the log:
