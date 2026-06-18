@@ -51,6 +51,11 @@ enum Cmd {
         #[command(subcommand)]
         op: ConstellationOp,
     },
+    /// Confine a principal in a Cell and watch it reach a resource only through the broker
+    Cell {
+        #[command(subcommand)]
+        op: CellOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -106,6 +111,12 @@ enum ConstellationOp {
         #[arg(long, default_value = "0.0.0.0:7779")]
         listen: String,
     },
+}
+
+#[derive(Subcommand)]
+enum CellOp {
+    /// Scripted demo: a confined principal with no authority reaches a file only through the broker, audited
+    Demo,
 }
 
 #[derive(Subcommand)]
@@ -208,6 +219,7 @@ fn main() -> Result<()> {
         Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
         Cmd::Reconstitute { op } => recon_cmd(op),
         Cmd::Constellation { op } => constellation_cmd(op),
+        Cmd::Cell { op } => cell_cmd(op),
     }
 }
 
@@ -416,6 +428,138 @@ fn weave_demo(store: &Path) -> Result<()> {
     print_audit(&b)?;
     println!();
     println!("verify:  {} entries, chain intact", b.verify()?);
+    Ok(())
+}
+
+fn cell_cmd(op: CellOp) -> Result<()> {
+    match op {
+        CellOp::Demo => cell_demo(),
+    }
+}
+
+// A scripted run that shows confinement and the broker as the only path to a
+// resource. A Cell with no filesystem, no network, and no devices is handed one
+// socket to the broker; the principal inside fails to open a file by path, asks
+// the broker, receives an open fd it could never have made itself, reads through
+// it, and the access lands in the audit log (the Glass stand-in).
+#[cfg(target_os = "linux")]
+fn cell_demo() -> Result<()> {
+    use cells::{portal, Cell, Payload};
+    use std::ffi::CString;
+    use std::os::unix::io::{AsRawFd, RawFd};
+
+    if !cells::available() {
+        println!(
+            "this kernel will not create unprivileged user namespaces, so a Cell \
+             cannot be built here"
+        );
+        return Ok(());
+    }
+
+    // A throwaway identity store and a secret the principal must not reach alone.
+    let dir = std::env::temp_dir().join(format!("horizon-cell-demo.{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let secret = dir.join("secret.txt");
+    std::fs::write(&secret, b"the-only-way-in-is-the-broker")?;
+
+    let ls = Lifestream::init(dir.join("store"), &[0xC1u8; 32])?;
+    let mut broker = Broker::open(ls, weave::Policy::DenyAll)?;
+    let cap = broker.grant(
+        "app".into(),
+        Resource::file(secret.clone()),
+        Rights::READ,
+        Limits::none(),
+    )?;
+    println!("granted  app  read  {}", secret.display());
+    println!("spawning a confined principal: no filesystem, no network, one socket to the broker");
+    println!();
+    io::stdout().flush().ok();
+
+    let mut fds = [0 as RawFd; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+        return Err(anyhow!("socketpair: {}", io::Error::last_os_error()));
+    }
+    let (sv, cl) = (fds[0], fds[1]);
+
+    let secret_path = secret.to_string_lossy().into_owned();
+    let child = Cell::new()
+        .keep_fd(cl)
+        .spawn(Payload::call(move || {
+            let say = |s: &str| unsafe {
+                libc::write(1, s.as_ptr() as *const libc::c_void, s.len());
+            };
+            // No filesystem: the path does not resolve inside the cell.
+            if let Ok(c) = CString::new(secret_path.as_str()) {
+                let d = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY) };
+                if d >= 0 {
+                    unsafe { libc::close(d) };
+                    say("  [cell] opened the file directly; confinement is broken\n");
+                    return 1;
+                }
+            }
+            say("  [cell] cannot open the file by path: the cell has no filesystem\n");
+            // The only way in is to ask the broker.
+            let res = Resource::file(secret_path.clone());
+            let fd = match portal::request(cl, &res, Rights::READ) {
+                Ok(f) => f,
+                Err(_) => {
+                    say("  [cell] the broker refused\n");
+                    return 2;
+                }
+            };
+            say("  [cell] the broker passed a file descriptor; reading through it\n");
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                libc::read(
+                    fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n > 0 {
+                say("  [cell] read: ");
+                unsafe { libc::write(1, buf.as_ptr() as *const libc::c_void, n as usize) };
+                say("\n");
+                0
+            } else {
+                say("  [cell] read failed\n");
+                3
+            }
+        }))
+        .context("spawn cell")?;
+
+    // The broker side: drop our copy of the principal's socket, serve one request
+    // through weave's access check and materialize, then collect the principal.
+    unsafe { libc::close(cl) };
+    let served = portal::serve_once(sv, |res, rights| {
+        let lease = broker
+            .access(&cap, res, rights)
+            .map_err(|e| cells::Error::Confine(e.to_string()))?;
+        portal::materialize(&lease)
+    });
+    unsafe { libc::close(sv) };
+    if let Err(e) = served {
+        eprintln!("broker error: {e}");
+    }
+
+    let status = child.wait().context("wait for cell")?;
+    println!();
+    match status.code {
+        Some(0) => println!("principal exited cleanly"),
+        Some(c) => println!("principal exited with code {c}"),
+        None => println!("principal was killed by a signal"),
+    }
+    println!();
+    println!("# audit log (the Glass stand-in)");
+    print_audit(&broker)?;
+
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cell_demo() -> Result<()> {
+    println!("Cells need Linux (namespaces + seccomp); this host has no confinement.");
     Ok(())
 }
 

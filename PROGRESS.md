@@ -233,15 +233,26 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   access shows up as a use on the grant. Green as root and as an unprivileged
   user. weave is a Linux-only dependency of cells (the seam is Linux fd passing),
   so the workspace still builds on darwin.
+- horizon cell demo (`horizon cell demo`): a scripted walk, like `weave demo`,
+  that makes the whole Phase 2 story visible at the command line. It grants a
+  principal read on a file, spawns a Cell with no filesystem, no network, and no
+  devices, handed only one socket to the broker; the confined principal fails to
+  open the file by path, asks the broker, receives an fd it could not have made
+  itself, reads through it, and the grant and use show up in the audit log (the
+  Glass stand-in). cells is a cross-platform dependency of the horizon CLI but the
+  demo is Linux-gated, so on other hosts it says confinement is unavailable rather
+  than failing. Verified through the binary as both root and an unprivileged user.
 
 ## Next
 
-- Finish Phase 2 on a Linux host: the cells confinement primitive and the broker
-  fd-passing seam are done (above). What remains is exec of real principals (a
-  private /proc and a minimal /dev mounted from PID 1 inside the cell, so a
-  brokered binary runs, not just an in-process closure) and a `horizon cell` demo
-  that drives the broker and a confined principal over the audit log (the Glass
-  stand-in). Linux-only, so build and test there, not on darwin.
+- Finish Phase 2 on a Linux host: the cells confinement primitive, the broker
+  fd-passing seam, and the `horizon cell demo` are done (above). What remains is
+  exec of real principals: a private /proc and a minimal /dev mounted from PID 1
+  inside the cell, so a brokered binary runs in a Cell, not just an in-process
+  closure (the closure path is enough for the broker seam and the demo, but a real
+  app is an executable). The /proc mount needs the mounter to be PID 1 of the
+  cell's pid namespace, which is why it is deferred to the exec path. Linux-only,
+  so build and test there, not on darwin.
 - Glass: the live transparency surface over the weave audit log. It lands with
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.

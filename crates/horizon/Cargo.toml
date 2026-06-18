@@ -13,7 +13,12 @@ lifestream = { path = "../lifestream" }
 weave = { path = "../weave" }
 constellation = { path = "../constellation" }
 reconstitution = { path = "../reconstitution" }
+cells = { path = "../cells" }
 clap.workspace = true
 anyhow.workspace = true
 argon2.workspace = true
 rand.workspace = true
+
+# The cell demo drives a confined principal with raw syscalls on Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

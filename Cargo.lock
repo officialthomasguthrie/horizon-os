@@ -571,8 +571,10 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "argon2",
+ "cells",
  "clap",
  "constellation",
+ "libc",
  "lifestream",
  "rand 0.8.6",
  "reconstitution",
