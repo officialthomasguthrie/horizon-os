@@ -192,12 +192,42 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   to fail, pulled a full generation over a hole punch the rendezvous brokered. The
   punch only traverses a real NAT on real hosts; that is the one part loopback
   cannot prove. Slim builds turn `net` off.
+- Phase 2 Cells confinement primitive (`cells` crate, Linux): bubblewrap-class,
+  unprivileged process confinement, the cage that makes "no ambient authority"
+  real. A Cell places a payload in fresh user, mount, pid, net, ipc, uts, and
+  cgroup namespaces with an empty default world: a tmpfs root holding only the
+  binds granted into it, no network (an empty net namespace), no devices, plus
+  no_new_privs and a seccomp-bpf filter. It is unprivileged and no-SUID: a user
+  namespace maps the caller to root inside the cell, so no real root and no
+  setuid helper are needed (the bubblewrap design, chosen over Firejail). The
+  channel a broker uses to reach a confined principal is fd passing: `keep_fd`
+  keeps exactly the granted fds open in the payload and closes everything else,
+  which is how a brokered file or socket reaches a principal that has no other
+  authority, making weave's `Lease` real. The supervisor forks an init child
+  that builds the namespaces, writes its own uid/gid map, and pivots into the
+  tmpfs root, then forks the payload as PID 1; a two-pipe protocol turns any
+  setup or exec failure into a typed error instead of a bare nonzero exit.
+  Linux-gated deps (nix, libc, seccompiler) so the workspace still builds on
+  darwin; seccompiler assembles the filter for the host arch, so the same source
+  filters on x86-64 and aarch64. Tests prove the cage: a sealed cell sees no host
+  files (only a bind lets one in), a read-only bind cannot be written, the cell
+  cannot reach the network, seccomp refuses a blocked syscall, a handed-in fd
+  works inside, and the exit code propagates; all pass both as root and as an
+  unprivileged user (uid mapped to root inside). The suite skips gracefully where
+  the kernel forbids unprivileged user namespaces (a hardened host or a
+  restricted CI runner), so it stays green everywhere. Built and tested on a
+  Linux container driven from the darwin host.
 
 ## Next
 
-- Finish Phase 2 on a Linux host: Cells, process confinement via namespaces +
-  seccomp (bubblewrap-class), so the broker hands real fds/sockets to confined
-  principals. Linux-only, so build and test there, not on darwin.
+- Finish Phase 2 on a Linux host: the cells confinement primitive is done
+  (above). Next is the broker seam, where the weave broker hands a confined
+  principal a brokered fd over a Unix socket: materialize a Lease into an open
+  file (rights-mapped flags) or a connected/bound socket, then pass it with
+  SCM_RIGHTS to a principal that has no other authority, and confirm the use
+  lands in the audit log. Then exec of real principals (a private /proc and a
+  minimal /dev mounted from PID 1 inside the cell) and a `horizon cell` demo over
+  the audit log. Linux-only, so build and test there, not on darwin.
 - Glass: the live transparency surface over the weave audit log. It lands with
   the shell in Phase 3 (it is an L5 compositor surface); `horizon weave
   audit/grants` is the headless stand-in until then.

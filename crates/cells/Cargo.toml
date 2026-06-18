@@ -1,0 +1,26 @@
+[package]
+name = "cells"
+description = "Bubblewrap-class confinement (namespaces + seccomp) for Horizon principals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+# Confinement is a Linux kernel feature. On other hosts the crate still compiles
+# (so the workspace builds on darwin) but every Cell reports Unsupported.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["sched", "mount", "process", "hostname", "user", "fs", "signal"] }
+libc = "0.2"
+seccompiler = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The confinement tests poke the cell with raw syscalls, so they need libc too.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
