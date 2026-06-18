@@ -19,4 +19,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Let the cells confinement tests actually run unprivileged user
+      # namespaces; Ubuntu restricts these by default. Harmless where the knob
+      # is absent, and the tests skip themselves if it stays off.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo test --all

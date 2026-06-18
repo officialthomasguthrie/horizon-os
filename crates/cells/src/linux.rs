@@ -73,16 +73,14 @@ const R_SIGNALED: i32 = 1;
 const R_SETUP_ERR: i32 = 2;
 
 pub(crate) fn available() -> bool {
-    match unsafe { fork() } {
-        Ok(ForkResult::Child) => {
-            let ok = unshare(CloneFlags::CLONE_NEWUSER).is_ok();
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
-        }
-        Ok(ForkResult::Parent { child }) => {
-            matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
-        }
-        Err(_) => false,
-    }
+    // The only honest probe is the real thing: build a throwaway empty cell and
+    // see if it runs end to end. A host can allow unshare(CLONE_NEWUSER) yet
+    // still refuse to write the uid map (Ubuntu's
+    // apparmor_restrict_unprivileged_userns does exactly this), so any lighter
+    // check would lie and make the tests run where they cannot.
+    run(Cell::default(), Payload::Call(Box::new(|| 0)))
+        .map(|s| s.code == Some(0))
+        .unwrap_or(false)
 }
 
 pub(crate) fn run(cell: Cell, payload: Payload) -> Result<Status> {
