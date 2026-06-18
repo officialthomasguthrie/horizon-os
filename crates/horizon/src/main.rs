@@ -31,6 +31,11 @@ enum Cmd {
         #[command(subcommand)]
         op: WeaveOp,
     },
+    /// Live transparency surface over the audit log: who reached what, and a kill switch
+    Glass {
+        #[command(subcommand)]
+        op: GlassOp,
+    },
     /// Replicate Lifestream objects to another store of the same identity
     Sync {
         /// Source store
@@ -255,11 +260,29 @@ enum WeaveOp {
     Demo { store: PathBuf },
 }
 
+#[derive(Subcommand)]
+enum GlassOp {
+    /// Render the live transparency view: per-principal channels and a timeline
+    Show {
+        store: PathBuf,
+        /// Length of the window to summarize, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+    },
+    /// Pull the kill switch: sever a live capability by its grant id
+    Sever {
+        store: PathBuf,
+        #[arg(long)]
+        grant: String,
+    },
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Lifestream { op } => lifestream_cmd(op),
         Cmd::Weave { op } => weave_cmd(op),
+        Cmd::Glass { op } => glass_cmd(op),
         Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
         Cmd::Reconstitute { op } => recon_cmd(op),
         Cmd::Constellation { op } => constellation_cmd(op),
@@ -420,6 +443,30 @@ fn weave_cmd(op: WeaveOp) -> Result<()> {
             println!("audit log ok, {} entries", b.verify()?);
         }
         WeaveOp::Demo { store } => weave_demo(&store)?,
+    }
+    Ok(())
+}
+
+// Glass: the same audit log weave prints flat, folded into a live per-principal
+// view. `show` renders it; `sever` is the kill switch, the same revoke weave
+// does but spoken in Glass's voice. The text is the headless stand-in for the
+// drawn compositor surface.
+fn glass_cmd(op: GlassOp) -> Result<()> {
+    match op {
+        GlassOp::Show { store, days } => {
+            let mut b = open_broker(&store)?;
+            let g = glass::Glass::new(&mut b);
+            let window = glass::Window::days(now_unix(), days);
+            let model = g.model_within(window, glass::DEFAULT_BUCKETS)?;
+            print!("{}", glass::report::text(&model));
+        }
+        GlassOp::Sever { store, grant } => {
+            let mut b = open_broker(&store)?;
+            let gid = parse_grant(&grant)?;
+            let mut g = glass::Glass::new(&mut b);
+            g.sever(gid)?;
+            println!("severed {grant}");
+        }
     }
     Ok(())
 }

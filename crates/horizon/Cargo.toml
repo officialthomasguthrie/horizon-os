@@ -24,6 +24,7 @@ compositor-udev = ["compositor/udev", "compositor-render"]
 [dependencies]
 lifestream = { path = "../lifestream" }
 weave = { path = "../weave" }
+glass = { path = "../glass" }
 constellation = { path = "../constellation" }
 reconstitution = { path = "../reconstitution" }
 cells = { path = "../cells" }

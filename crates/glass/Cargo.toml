@@ -1,0 +1,16 @@
+[package]
+name = "glass"
+description = "The live transparency surface over the Weave audit log for Horizon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+weave = { path = "../weave" }
+
+[dev-dependencies]
+lifestream = { path = "../lifestream" }
+tempfile.workspace = true

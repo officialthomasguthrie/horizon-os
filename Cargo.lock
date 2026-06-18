@@ -921,6 +921,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "glass"
+version = "0.0.0"
+dependencies = [
+ "lifestream",
+ "tempfile",
+ "weave",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -969,6 +978,7 @@ dependencies = [
  "clap",
  "compositor",
  "constellation",
+ "glass",
  "libc",
  "lifestream",
  "rand 0.8.6",

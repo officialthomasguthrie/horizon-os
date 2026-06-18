@@ -424,6 +424,45 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   shm sidesteps) and a real multi-monitor logical layout (outputs mirror the single
   scene for now). Built and compile-checked from the Linux container on this
   display-less darwin host.
+- Phase 3 Glass model layer (`glass` crate): the live transparency surface over
+  the Weave audit log, the pane that makes "no ambient authority" something you can
+  watch. The broker hands out two flat things, the live grant table and the
+  hash-chained audit log, and neither is what a human reads; Glass folds them into
+  a per-principal map of channels, one row per thing a principal can reach (a
+  network host, a file, a device, a service), each carrying its status, how often
+  it was used, the sub-resources actually touched, and the grant behind it, which
+  is the kill switch. `build` is a pure fold over those two inputs plus a clock
+  reading, so the whole model is reproducible and tested without a display: the
+  grant table is authoritative for rights, status, and the use count, and the log
+  supplies activity times, the touched sub-resources, denials, and the timeline. A
+  channel is grant-backed (live, severed, or expired, and it carries the grant id
+  to sever) or blocked (a denial with no live grant, the "something tried and was
+  refused" signal). A denial that a grant covers folds into that grant's row
+  (`covers` is the same predicate the broker used to decide, so the attribution
+  matches the authorization that was refused), while an out-of-scope denial is its
+  own blocked row, so a use after revoke shows as the severed channel with a
+  blocked attempt on it but a reach for /etc/shadow shows as its own blocked line.
+  Live authority is always shown; dead history (severed, expired, blocked) is
+  bounded to the window, and a 7-day timeline buckets activity by day. The kill
+  switch is `Glass::sever`, which revokes the grant: idempotent, logged like every
+  other broker action, and it survives a reopen because the revocation is in the
+  log. `report::text` renders the model as a dashboard (totals, an activity
+  sparkline, then each principal and its channels), the headless stand-in for the
+  drawn surface the same way `horizon weave audit` stands in for the log. Because
+  weave is cross-platform, glass is too, so unlike the compositor it builds and is
+  tested on darwin directly, not only in the container: 7 unit tests (empty inputs,
+  a grant-plus-use becomes a live network channel, a denial with no grant is
+  blocked, a use after revoke folds into the severed channel, an out-of-scope
+  denial is its own row, dead history outside the window is dropped while live
+  stays, timeline bucketing) and 2 end-to-end against a real broker (grant, use,
+  deny, revoke, then build the model and pull the kill switch; and severing
+  survives a store reopen). `horizon glass show [--days N]` renders the view and
+  `horizon glass sever --grant <id>` is the kill switch; verified end to end through
+  the binary on a scripted store (three principals, live network and data channels,
+  a directory grant showing its touched files, an out-of-scope blocked attempt, then
+  a severed channel after the kill switch). The same Model drawn as an iced + wgpu
+  compositor surface comes when there is a screen to verify it on, the same split
+  the rest of Phase 3 uses.
 
 ## Next
 
@@ -450,10 +489,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   launcher and command palette, and Glass as an L5 compositor surface over the
   weave audit log. Confined cells can already host compositor surfaces (the cells
   exec path is ready). Linux-only.
-- Glass: the live transparency surface over the weave audit log. It lands as a
-  compositor surface now there is a renderer to draw it on (the `render`/`winit`
-  features above); `horizon weave audit/grants` is the headless stand-in until the
-  surface is drawn.
+- Glass: the live transparency surface over the weave audit log. The model layer
+  is done (the `glass` crate: a pure fold of the broker's grant table and audit log
+  into a per-principal map of live/severed/blocked channels, a 7-day timeline, and
+  the sever kill switch, all headless-testable and CI-green on darwin), with a text
+  report as the headless stand-in (`horizon glass show` / `glass sever`). What is
+  left is drawing that same Model as an iced + wgpu compositor surface, which lands
+  once there is a renderer and a screen to verify it on (the `render`/`winit`
+  features above); a confined cell can host it (the cells exec path is ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,
