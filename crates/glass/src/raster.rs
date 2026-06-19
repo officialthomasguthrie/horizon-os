@@ -258,7 +258,7 @@ mod tests {
         // End to end: a model with one live channel must paint at least one pixel
         // in the live color, proving layout and raster meet.
         let m = crate::tests_support::one_live_model();
-        let scene = surface::layout(&m, 800, 400, 2);
+        let scene = surface::layout(&m, &crate::aura::Palette::new(), 800, 400, 2);
         let pm = rasterize(&scene);
         assert_eq!(pm.width, 800);
         assert_eq!(pm.height, 400);

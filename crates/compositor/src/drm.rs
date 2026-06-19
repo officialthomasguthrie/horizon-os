@@ -205,6 +205,15 @@ pub(crate) fn run(
             }
         }
 
+        // Keystrokes that arrived while no client held focus belong to the shell
+        // (its command palette); the next frame uploads any redraw they cause.
+        for key in comp.take_shell_keys() {
+            if let Some(rgba) = on_shell(ShellEvent::Key(key)) {
+                let (ow, oh) = comp.output_size();
+                comp.set_shell_background(&rgba, ow, oh);
+            }
+        }
+
         // Offer a tick so the owner can poll for changes made outside the shell
         // (e.g. the audit log grew) and refresh the background; the next frame
         // uploads it. The owner rate-limits this, so an idle desktop pays only a

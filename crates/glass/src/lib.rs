@@ -17,6 +17,7 @@
 //! as a texture and putting it on a GPU. [`Glass`] wraps a live [`Broker`] to
 //! read the model and pull a kill switch.
 
+pub mod aura;
 mod model;
 pub mod raster;
 pub mod report;
@@ -25,6 +26,7 @@ pub mod surface;
 #[cfg(test)]
 mod tests_support;
 
+pub use aura::{interpret, parse, resolve, Command, Palette, PaletteAction, Resolved};
 pub use model::{
     build, Bucket, Channel, ChannelKind, ChannelStatus, Model, PrincipalView, Totals, Window,
     DAY_SECS, WEEK_SECS,
@@ -33,8 +35,17 @@ pub use raster::Pixmap;
 pub use surface::{layout, Action, Color, Hit, Primitive, Scene};
 
 // Lay the model out and rasterize it in one step: the model as a drawable image.
+// The palette is idle here (this is the static, non-interactive render that
+// `horizon glass render` and the screenshot path use); an interactive shell lays
+// out its own live palette.
 pub fn render(model: &Model, width: u32, height: u32, scale: u32) -> Pixmap {
-    raster::rasterize(&surface::layout(model, width, height, scale))
+    raster::rasterize(&surface::layout(
+        model,
+        &aura::Palette::new(),
+        width,
+        height,
+        scale,
+    ))
 }
 
 use std::time::{SystemTime, UNIX_EPOCH};

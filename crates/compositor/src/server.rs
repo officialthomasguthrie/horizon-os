@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::desktop::{Space, Window, WindowSurfaceType};
-use smithay::input::keyboard::{FilterResult, Keycode};
+use smithay::input::keyboard::{FilterResult, Keycode, Keysym};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -40,22 +40,69 @@ use smithay::{
 
 use crate::{Error, Result};
 
-/// What an on-screen backend is asking the shell owner to handle. Both arms may
+/// A keystroke the compositor routes to the shell when no client holds keyboard
+/// focus, i.e. the desktop itself is focused (a press on the background clears any
+/// client focus, so typing then lands here). It is already translated from the
+/// xkb keysym, so the owner edits text without touching keycodes; Horizon feeds
+/// these into the Glass command palette. Only presses are reported, and only keys
+/// with a text meaning: modifiers, function keys, and chords with Ctrl/Alt/Super
+/// are dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellKey {
+    /// A printable character to insert at the cursor.
+    Char(char),
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Commit the line (run the command).
+    Enter,
+    /// Cancel: clear the line.
+    Escape,
+}
+
+/// What an on-screen backend is asking the shell owner to handle. Every arm may
 /// return new full-screen RGBA (output-sized, the bytes `glass::Pixmap` yields)
 /// to redraw the background, or `None` to leave it unchanged. This is the one
 /// callback [`Compositor::show`] and [`Compositor::run_drm`] take, so the owner
-/// holds the shell across clicks and ticks behind a single mutable borrow.
+/// holds the shell across clicks, keys, and ticks behind a single mutable borrow.
 #[cfg(any(feature = "winit", feature = "udev"))]
 pub enum ShellEvent {
     /// A pointer press landed on the shell background at this output-logical
     /// position (no client window was over it), e.g. a click on a Glass `sever`
     /// button.
     Click(i32, i32),
+    /// A keystroke arrived while no client held keyboard focus, so the shell owns
+    /// it: text for the Glass command palette (a launcher and command line).
+    Key(ShellKey),
     /// A periodic tick, offered each loop iteration, so the owner can poll for
     /// changes made from outside (the audit log grew because another process
     /// granted, used, or revoked a capability) and refresh a live desktop without
     /// a click. The owner sets its own poll cadence; returning `None` is cheap.
     Tick,
+}
+
+// Translate an xkb keysym (already modified by shift, caps, etc.) into a shell
+// key. Named editing keys are matched first because xkb maps several of them
+// (Backspace, Return, Escape, Delete) to ASCII control characters, which are not
+// text; anything else becomes a Char only if it is a printable character.
+fn shell_key(sym: Keysym) -> Option<ShellKey> {
+    match sym {
+        Keysym::BackSpace => Some(ShellKey::Backspace),
+        Keysym::Delete => Some(ShellKey::Delete),
+        Keysym::Return | Keysym::KP_Enter => Some(ShellKey::Enter),
+        Keysym::Escape => Some(ShellKey::Escape),
+        Keysym::Left => Some(ShellKey::Left),
+        Keysym::Right => Some(ShellKey::Right),
+        Keysym::Home => Some(ShellKey::Home),
+        Keysym::End => Some(ShellKey::End),
+        other => other
+            .key_char()
+            .filter(|c| !c.is_control())
+            .map(ShellKey::Char),
+    }
 }
 
 // Everything the protocol handlers touch. The `Compositor` keeps this next to
@@ -97,6 +144,10 @@ struct State {
     // whatever it drew there (Horizon maps it to a Glass action). Taken and
     // cleared by `take_shell_click`. Not render-gated: this is input, not drawing.
     pending_shell_click: Option<(i32, i32)>,
+    // Keystrokes that arrived while no client held keyboard focus, so the shell
+    // owns the keyboard (its command palette). Already translated to `ShellKey`,
+    // drained by `take_shell_keys`. Input, not drawing, so not render-gated.
+    pending_shell_keys: Vec<ShellKey>,
     // Monotonic base for input event timestamps.
     start: Instant,
 }
@@ -243,6 +294,10 @@ impl State {
         } else {
             KeyState::Released
         };
+        // With a client focused, keys go to it. With nothing focused, the desktop
+        // is focused: the shell owns the keyboard and the keystroke is recorded
+        // for the owner (the Glass command palette) instead of forwarded.
+        let to_shell = keyboard.current_focus().is_none();
         // Evdev keycodes sit 8 below the X keymap codes xkb compiles to; the
         // wire event is mapped back down by the seat.
         keyboard.input::<(), _>(
@@ -251,7 +306,20 @@ impl State {
             state,
             serial,
             time,
-            |_, _, _| FilterResult::Forward,
+            |data, mods, handle| {
+                if !to_shell {
+                    return FilterResult::Forward;
+                }
+                // Translate to a shell key on press only, skipping chords with a
+                // command modifier so a shortcut never types text. Swallow it
+                // either way: no client should see a key meant for the shell.
+                if pressed && !mods.ctrl && !mods.alt && !mods.logo {
+                    if let Some(k) = shell_key(handle.modified_sym()) {
+                        data.pending_shell_keys.push(k);
+                    }
+                }
+                FilterResult::Intercept(())
+            },
         );
     }
 }
@@ -446,6 +514,7 @@ impl Compositor {
             next_x: 0,
             pointer_loc: (0.0, 0.0).into(),
             pending_shell_click: None,
+            pending_shell_keys: Vec::new(),
             start: Instant::now(),
         };
 
@@ -565,6 +634,17 @@ impl Compositor {
     /// the shell background's own pixels, so they index its scene directly.
     pub fn take_shell_click(&mut self) -> Option<(i32, i32)> {
         self.state.pending_shell_click.take()
+    }
+
+    /// Take the keystrokes that arrived while no client held keyboard focus, in
+    /// arrival order, clearing the queue. These are the keys the shell owns (the
+    /// desktop is focused), already translated from xkb to [`ShellKey`]; Horizon
+    /// feeds them into the Glass command palette. Empty when nothing is pending.
+    /// A backend drains this each loop iteration alongside [`take_shell_click`].
+    ///
+    /// [`take_shell_click`]: Compositor::take_shell_click
+    pub fn take_shell_keys(&mut self) -> Vec<ShellKey> {
+        std::mem::take(&mut self.state.pending_shell_keys)
     }
 
     /// Composite the current scene into an offscreen framebuffer the size of the

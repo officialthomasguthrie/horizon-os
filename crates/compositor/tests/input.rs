@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use compositor::Compositor;
+use compositor::{Compositor, ShellKey};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_compositor::{self, WlCompositor};
@@ -41,9 +41,11 @@ use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 const WIN: i32 = 64;
 // Opaque magenta as a 0xAARRGGBB word, so the window has an opaque area to hit.
 const MAGENTA: u32 = 0xFFFF_00FF;
-// Linux evdev codes the test injects: a left mouse button and the "A" key.
+// Linux evdev codes the test injects: a left mouse button and a few keys.
 const BTN_LEFT: u32 = 0x110;
 const KEY_A: u32 = 30;
+const KEY_BACKSPACE: u32 = 14;
+const KEY_ENTER: u32 = 28;
 
 fn runtime_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -179,6 +181,11 @@ fn forwards_pointer_and_keyboard_to_client() {
     );
     comp.keyboard_key(KEY_A, true);
     comp.keyboard_key(KEY_A, false);
+    // The client holds keyboard focus, so its keys went to it, not the shell.
+    assert!(
+        comp.take_shell_keys().is_empty(),
+        "a focused client's keys are not shell keys"
+    );
     comp.pointer_button(BTN_LEFT, false);
     comp.pointer_motion((ow + 100) as f64, (oh + 100) as f64);
 
@@ -234,6 +241,34 @@ fn shell_background_clicks_are_reported_and_cleared() {
     // Releasing the button is not a new click (only presses record one).
     comp.pointer_button(BTN_LEFT, false);
     assert!(comp.take_shell_click().is_none(), "release is not a click");
+}
+
+// With no client focused, the desktop is focused: keystrokes are translated from
+// xkb and reported to the shell (Horizon's command palette) instead of forwarded
+// to a client. Only presses count, and named editing keys map to their ShellKey.
+// Gated on the seat having a keyboard (xkb data), like the keyboard checks above.
+#[test]
+fn shell_keys_are_reported_when_no_client_is_focused() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    if !comp.has_keyboard() {
+        eprintln!("input test: seat has no keyboard (no xkb data); skipped shell-key test");
+        return;
+    }
+    assert!(comp.take_shell_keys().is_empty(), "nothing typed yet");
+
+    // Type "a", then Backspace, then Enter; key releases report nothing.
+    comp.keyboard_key(KEY_A, true);
+    comp.keyboard_key(KEY_A, false);
+    comp.keyboard_key(KEY_BACKSPACE, true);
+    comp.keyboard_key(KEY_ENTER, true);
+
+    assert_eq!(
+        comp.take_shell_keys(),
+        vec![ShellKey::Char('a'), ShellKey::Backspace, ShellKey::Enter],
+        "the desktop's keystrokes are reported to the shell, translated"
+    );
+    assert!(comp.take_shell_keys().is_empty(), "the keys were consumed");
 }
 
 #[derive(Default)]

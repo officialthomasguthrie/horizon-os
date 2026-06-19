@@ -149,7 +149,7 @@ fn a_click_on_the_sever_button_severs_the_channel() {
 
     // Lay the model out and find the sever button for mail's live channel: it is
     // the only severable one, so the scene carries exactly one hit target.
-    let scene = glass::layout(&model, 1200, 800, 2);
+    let scene = glass::layout(&model, &glass::Palette::new(), 1200, 800, 2);
     let hit = scene
         .hits
         .iter()
@@ -180,6 +180,69 @@ fn a_click_on_the_sever_button_severs_the_channel() {
         .unwrap();
     assert_eq!(mail.channels[0].status, ChannelStatus::Severed);
     assert!(!mail.channels[0].can_sever());
+}
+
+// A line typed into the Aura command palette resolves, against the live model, to
+// the same kill switch, and running it severs the channel. This is the other seam
+// the compositor routes input through: keystrokes build a line, glass::parse and
+// glass::resolve turn it into a PaletteAction, and Glass::sever applies it. Proven
+// here without a display, the way the click path above is.
+#[test]
+fn a_palette_sever_command_severs_the_matching_channel() {
+    let d = tempdir().unwrap();
+    let mut b = Broker::open(Lifestream::init(d.path(), &KEY).unwrap(), Policy::DenyAll).unwrap();
+
+    // Two live capabilities for "mail": both should fall to one `sever mail`.
+    for res in [
+        Resource::net("api.mail.example", 443),
+        Resource::file("/home/user/mail"),
+    ] {
+        b.grant("mail".into(), res, Rights::READ, weave::Limits::none())
+            .unwrap();
+    }
+    // A second principal whose channel must be left untouched.
+    b.grant(
+        "music".into(),
+        Resource::net("api.music.example", 443),
+        Rights::READ,
+        weave::Limits::none(),
+    )
+    .unwrap();
+
+    let win = Window::week(now());
+    let mut g = Glass::new(&mut b);
+    let model = g.model_within(win, glass::DEFAULT_BUCKETS).unwrap();
+    assert_eq!(model.totals.live, 3);
+
+    // Type "sever mail": it resolves to severing both of mail's live channels and
+    // previews the view filtered to "mail". A bare query just filters, no action.
+    assert_eq!(
+        glass::resolve(&glass::parse("mail"), &model).action,
+        glass::PaletteAction::None
+    );
+    let resolved = glass::resolve(&glass::parse("sever mail"), &model);
+    assert_eq!(resolved.filter.as_deref(), Some("mail"));
+    let grants = match resolved.action {
+        glass::PaletteAction::Sever(grants) => grants,
+        other => panic!("expected a sever action, got {other:?}"),
+    };
+    assert_eq!(grants.len(), 2);
+
+    // Run it the way the shell does on Enter.
+    for grant in grants {
+        g.sever(grant).unwrap();
+    }
+
+    // Both of mail's channels are severed; music's stays live.
+    let after = g.model_within(win, glass::DEFAULT_BUCKETS).unwrap();
+    assert_eq!(after.totals.severed, 2);
+    assert_eq!(after.totals.live, 1);
+    let music = after
+        .principals
+        .iter()
+        .find(|p| p.principal.0 == "music")
+        .unwrap();
+    assert!(music.channels[0].can_sever(), "music was left untouched");
 }
 
 // A long-lived Glass holds one broker open, so its model does not reflect appends

@@ -53,8 +53,13 @@ pub use error::{Error, Result};
 mod server;
 #[cfg(target_os = "linux")]
 pub use server::Compositor;
+// ShellEvent (the backend callback) is gated to the on-screen backends. ShellKey,
+// the keystrokes the shell owns when no client is focused, is plain input, so it
+// is available to the headless core and its tests too, not just those backends.
 #[cfg(all(target_os = "linux", any(feature = "winit", feature = "udev")))]
 pub use server::ShellEvent;
+#[cfg(target_os = "linux")]
+pub use server::ShellKey;
 
 // Offscreen software compositing (the `render` feature) and the on-screen winit
 // backend (the `winit` feature, which builds on it) live behind features so the

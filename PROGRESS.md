@@ -592,6 +592,39 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   screen later, the same bar as the rest of the backend. `horizon compositor show
   --background` and `drm --background` now say the desktop refreshes live. Built and
   compile-checked from the Linux container on this display-less darwin host.
+- Phase 3 Aura command palette (`glass` + `compositor` + `horizon`): the Glass intent
+  line at the bottom of the desktop is now a real launcher and command palette, the way
+  you act on the desktop with no client window in front. Three layers, each on the usual
+  headless split. (1) `glass::aura` parses a typed line into a `Command` (launch an app,
+  sever channels by name, filter the view, help) and resolves that command against the
+  live Model into a `PaletteAction` plus a view filter and a one-line hint, both pure; a
+  `Palette` holds the editable input buffer and the text cursor (insert, backspace,
+  delete, cursor moves, UTF-8 safe), also pure. (2) `surface::layout` now takes the
+  palette: it draws a two-row band (the prompt, the typed line, and a caret at the
+  cursor, then a feedback row showing the resolved hint) and narrows the principal list
+  to the palette's filter, so typing previews what a command will hit; the sever-button
+  hit targets still resolve clicks as before. (3) the compositor routes keystrokes to
+  the shell when no client holds keyboard focus (the desktop itself is focused, which a
+  background click already selects by clearing client focus): `keyboard_key` translates
+  the xkb keysym to a `ShellKey` (a character or a named editing key) and records it
+  instead of forwarding, `take_shell_keys` drains them, and a new `ShellEvent::Key` arm
+  carries each to the owner through the same one closure `show` and `run_drm` already
+  take for clicks and ticks. The horizon `Shell` ties it together: it caches the Model so
+  a typed line resolves without a store read per keystroke, edits the palette on each key
+  and re-previews, and on Enter runs the command, launching a Wayland client (a plain
+  spawn connected to this compositor's WAYLAND_DISPLAY, with Cell confinement the next
+  step since the cells exec path is ready) or severing every matching live channel
+  through `Glass::sever`, then redraws; launched apps are reaped on the poll tick. The
+  testable core is proven headlessly: glass unit tests for parse, resolve, and the
+  palette buffer (including multibyte edits), surface tests that the typed line, the
+  hint, and the filtered list render, a glass end-to-end test that a typed `sever <name>`
+  resolves against a real broker to the right grants and severs them (the sibling of the
+  click-to-sever test), and a compositor headless test that with no client focused the
+  keystrokes are reported to the shell, translated, while a focused client still gets its
+  keys (gated on the seat having xkb data, like the existing keyboard test). The key
+  routing and the actual app spawn are the only parts that need a screen, eye-verified
+  next, exactly as the rest of the backend is. Built and tested on darwin and in the
+  Linux container.
 
 ## Next
 
@@ -628,9 +661,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the same shell closure, behind `horizon compositor drm --background`. The desktop now
   also refreshes live as the audit log changes from outside (the compositor offers a
   periodic `Tick` through the same `ShellEvent` closure as the click, and the shell polls
-  `Broker::reload` and redraws only on a change), proven headlessly. What is left on the
-  shell: the Aura intent line becoming a real launcher/command palette. Confined cells can
-  already host compositor surfaces (the cells exec path is ready). Linux-only.
+  `Broker::reload` and redraws only on a change), proven headlessly. The Aura intent line
+  is now a real launcher and command palette: `glass::aura` parses and resolves a typed
+  line (launch an app, sever channels by name, filter the view), `surface::layout` draws
+  the input, caret, and feedback and filters the list, the compositor routes keystrokes to
+  the shell when no client is focused (the new `ShellEvent::Key`), and the horizon `Shell`
+  runs a command on Enter, all headless-tested. What is left on the shell: confining a
+  launched client in a Cell (the exec path is ready; today it is a plain spawn), and the
+  eye-verify of the key routing and the spawn on a real screen. Confined cells can already
+  host compositor surfaces (the cells exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
   and the drawn surface are both done (the `glass` crate: a pure fold of the
   broker's grant table and audit log into a per-principal map of
@@ -651,7 +690,12 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   outside the shell: `Broker::reload` re-reads the audit log only when its head moved,
   and the compositor offers the shell a periodic `Tick` (the same `ShellEvent` closure
   as the click) so the desktop redraws when another process grants, uses, or revokes.
-  Eye-verify on a screen; a confined cell can host it (the cells exec path is ready).
+  The intent line at the bottom is now the Aura command palette (`glass::aura`): a typed
+  line parses and resolves to launch an app, sever channels by name, or filter the view,
+  drawn with a live caret and the resolved hint, fed by the compositor's `ShellEvent::Key`
+  when no client is focused; parser, resolver, palette buffer, and rendering are all
+  headless-tested. Eye-verify on a screen; a confined cell can host it (the cells exec
+  path is ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

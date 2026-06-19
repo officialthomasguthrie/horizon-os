@@ -1014,11 +1014,12 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
+            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32, &socket)?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
-                 capability; refreshes live as the audit log changes)",
+                 capability; with no window focused, type a command: launch <app>, sever \
+                 <name>, or any text to filter; refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -1032,8 +1033,9 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     comp.show(|event| {
         let s = shell.as_mut()?;
         match event {
-            compositor::ShellEvent::Click(x, y) => s.click(x, y, ow as u32, oh as u32),
-            compositor::ShellEvent::Tick => s.refresh(ow as u32, oh as u32),
+            compositor::ShellEvent::Click(x, y) => s.click(x, y),
+            compositor::ShellEvent::Key(k) => s.key(k),
+            compositor::ShellEvent::Tick => s.refresh(),
         }
     })
     .context("run winit backend")
@@ -1051,12 +1053,16 @@ fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
 const SHELL_POLL: Duration = Duration::from_millis(500);
 
 // The interactive Glass shell behind an on-screen backend. It holds the broker,
-// the window it summarizes, and the last scene it drew, so a pointer click can be
-// resolved against the scene's hit targets, applied through Glass, and the surface
-// redrawn. It also refreshes on a periodic tick (`refresh`): the broker is opened
-// once and would not otherwise see appends another process makes to the store, so
-// each poll re-reads the audit log and redraws when it changed. Shared by the
-// winit (`show`) and bare-metal (`drm`) backends.
+// the window it summarizes, the cached model, the Aura command palette, and the
+// last scene it drew. A pointer click resolves against the scene's hit targets and
+// severs through Glass; keystrokes (which the compositor routes here when no client
+// holds focus) edit the palette, and Enter runs an Aura command: launch a client,
+// sever the channels matching a name, or filter the view. It also refreshes on a
+// periodic tick: the broker is opened once and would not otherwise see appends
+// another process makes to the store, so each poll re-reads the audit log and
+// redraws when it changed. Shared by the winit (`show`) and bare-metal (`drm`)
+// backends. The model is cached so a typed line resolves against it without a store
+// read per keystroke; it is rebuilt whenever the broker state changes.
 #[cfg(all(
     target_os = "linux",
     any(feature = "compositor-winit", feature = "compositor-udev")
@@ -1064,7 +1070,15 @@ const SHELL_POLL: Duration = Duration::from_millis(500);
 struct Shell {
     broker: Broker,
     window: glass::Window,
+    model: glass::Model,
+    palette: glass::Palette,
     scene: glass::Scene,
+    width: u32,
+    height: u32,
+    // WAYLAND_DISPLAY a launched client connects back to (this compositor).
+    wayland_display: String,
+    // Apps launched from the palette, kept so the tick can reap the exited ones.
+    children: Vec<std::process::Child>,
     // When the store was last polled, so the render loop's per-frame Tick costs a
     // clock check until SHELL_POLL elapses.
     last_poll: std::time::Instant,
@@ -1076,22 +1090,58 @@ struct Shell {
 ))]
 impl Shell {
     // Open a store's Glass shell at a surface size, rendering the first frame.
-    // Returns the shell and the RGBA to set as the background.
-    fn open(store: &Path, days: u64, width: u32, height: u32) -> Result<(Shell, Vec<u8>)> {
+    // `wayland_display` is the socket a launched client connects back to. Returns
+    // the shell and the RGBA to set as the background.
+    fn open(
+        store: &Path,
+        days: u64,
+        width: u32,
+        height: u32,
+        wayland_display: &str,
+    ) -> Result<(Shell, Vec<u8>)> {
         let mut broker = open_broker(store)?;
         let window = glass::Window::days(now_unix(), days);
         let model = glass::Glass::new(&mut broker).model_within(window, glass::DEFAULT_BUCKETS)?;
-        let scene = glass::layout(&model, width, height, 2);
+        let palette = glass::Palette::new();
+        let scene = glass::layout(&model, &palette, width, height, 2);
         let rgba = glass::raster::rasterize(&scene).rgba;
         Ok((
             Shell {
                 broker,
                 window,
+                model,
+                palette,
                 scene,
+                width,
+                height,
+                wayland_display: wayland_display.to_string(),
+                children: Vec::new(),
                 last_poll: std::time::Instant::now(),
             },
             rgba,
         ))
+    }
+
+    // Lay the current model and palette out, keep the scene for hit-testing, and
+    // return its pixels.
+    fn relayout(&mut self) -> Vec<u8> {
+        self.scene = glass::layout(&self.model, &self.palette, self.width, self.height, 2);
+        glass::raster::rasterize(&self.scene).rgba
+    }
+
+    // Re-summarize the broker into the cached model, after a change to it.
+    fn reload_model(&mut self) -> Result<()> {
+        self.model = glass::Glass::new(&mut self.broker)
+            .model_within(self.window, glass::DEFAULT_BUCKETS)?;
+        Ok(())
+    }
+
+    // Recompute the palette's live preview (the view filter and the hint line)
+    // from the current input against the cached model, committing nothing.
+    fn preview(&mut self) {
+        let r = glass::resolve(&glass::parse(&self.palette.input), &self.model);
+        self.palette.filter = r.filter;
+        self.palette.message = r.hint;
     }
 
     // Resolve a click at output-logical (x, y) against the current scene. If it
@@ -1099,7 +1149,7 @@ impl Shell {
     // the new RGBA to redraw; otherwise return None (nothing changed). At output
     // scale 1 the click coordinates are the surface's own pixels, so they index
     // the scene directly.
-    fn click(&mut self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
+    fn click(&mut self, x: i32, y: i32) -> Option<Vec<u8>> {
         let grant = match self.scene.action_at(x, y).cloned() {
             Some(glass::Action::Sever(grant)) => grant,
             None => return None,
@@ -1108,45 +1158,136 @@ impl Shell {
             eprintln!("compositor: sever failed: {e}");
             return None;
         }
-        match self.rerender(width, height) {
-            Ok(rgba) => {
-                println!("compositor: severed {}", grant.to_hex());
-                Some(rgba)
+        println!("compositor: severed {}", grant.to_hex());
+        if let Err(e) = self.reload_model() {
+            eprintln!("compositor: store reload failed: {e}");
+            return None;
+        }
+        self.preview();
+        Some(self.relayout())
+    }
+
+    // A keystroke the compositor routed here because no client holds focus. Edit
+    // the palette (or, on Enter, run the command) and redraw; the caret alone
+    // moving is a visible change, so every key returns a fresh frame.
+    fn key(&mut self, key: compositor::ShellKey) -> Option<Vec<u8>> {
+        use compositor::ShellKey;
+        match key {
+            ShellKey::Char(c) => {
+                self.palette.insert(c);
+                self.preview();
             }
-            Err(e) => {
-                eprintln!("compositor: redraw failed: {e}");
-                None
+            ShellKey::Backspace => {
+                self.palette.backspace();
+                self.preview();
+            }
+            ShellKey::Delete => {
+                self.palette.delete();
+                self.preview();
+            }
+            ShellKey::Escape => {
+                self.palette.clear();
+                self.preview();
+            }
+            ShellKey::Left => self.palette.left(),
+            ShellKey::Right => self.palette.right(),
+            ShellKey::Home => self.palette.home(),
+            ShellKey::End => self.palette.end(),
+            ShellKey::Enter => self.execute(),
+        }
+        Some(self.relayout())
+    }
+
+    // Run the command on the current line (Enter): resolve it against the cached
+    // model and carry it out. Launch spawns a client; sever revokes every matching
+    // channel through Glass; everything else (empty, help, a bare filter) leaves
+    // the view as the preview already set it.
+    fn execute(&mut self) {
+        let r = glass::resolve(&glass::parse(&self.palette.input), &self.model);
+        match r.action {
+            glass::PaletteAction::None => {}
+            glass::PaletteAction::Launch(cmd) => {
+                match self.launch(&cmd) {
+                    Ok(()) => {
+                        println!("compositor: launching {cmd}");
+                        self.palette.message = format!("launching {cmd}");
+                    }
+                    Err(e) => {
+                        eprintln!("compositor: launch failed: {e}");
+                        self.palette.message = format!("launch failed: {e}");
+                    }
+                }
+                self.palette.clear();
+                self.palette.filter = None;
+            }
+            glass::PaletteAction::Sever(grants) => {
+                let mut severed = 0;
+                for g in &grants {
+                    match glass::Glass::new(&mut self.broker).sever(*g) {
+                        Ok(()) => severed += 1,
+                        Err(e) => eprintln!("compositor: sever {} failed: {e}", g.to_hex()),
+                    }
+                }
+                if let Err(e) = self.reload_model() {
+                    eprintln!("compositor: store reload failed: {e}");
+                }
+                println!("compositor: severed {severed} channel(s)");
+                self.palette.message = format!("severed {severed} channel(s)");
+                self.palette.clear();
+                self.palette.filter = None;
             }
         }
     }
 
-    // Re-summarize the broker and relayout the surface, keeping the new scene.
-    fn rerender(&mut self, width: u32, height: u32) -> Result<Vec<u8>> {
-        let model = glass::Glass::new(&mut self.broker)
-            .model_within(self.window, glass::DEFAULT_BUCKETS)?;
-        self.scene = glass::layout(&model, width, height, 2);
-        Ok(glass::raster::rasterize(&self.scene).rgba)
+    // Spawn a Wayland client connected to this compositor. It inherits the
+    // environment (so XDG_RUNTIME_DIR is set) plus WAYLAND_DISPLAY pointing at our
+    // socket, so its window maps into this scene. The child is kept so the tick can
+    // reap it. Confining the client in a Cell is the next step (the cells exec path
+    // is ready); a plain spawn is the first cut.
+    fn launch(&mut self, cmd: &str) -> Result<()> {
+        let mut parts = cmd.split_whitespace();
+        let program = parts.next().ok_or_else(|| anyhow!("no program named"))?;
+        let args: Vec<&str> = parts.collect();
+        let child = std::process::Command::new(program)
+            .args(&args)
+            .env("WAYLAND_DISPLAY", &self.wayland_display)
+            .spawn()
+            .with_context(|| format!("spawn {program}"))?;
+        self.children.push(child);
+        Ok(())
     }
 
-    // A periodic tick from the render loop. The Shell holds one broker opened
-    // once, so it does not see appends another process makes to the store; this
-    // re-reads the audit log and, only if it changed, relayouts the surface and
-    // returns the new RGBA to redraw, so the live desktop reflects a grant, use,
-    // or revoke made from outside (e.g. a `horizon weave grant` in another shell).
-    // Rate-limited to SHELL_POLL so a 60fps loop does not stat the store every
-    // frame; cheap when nothing changed (`Broker::reload` reads only the audit ref
-    // and walks no chain, so there is no relayout and no re-upload).
-    fn refresh(&mut self, width: u32, height: u32) -> Option<Vec<u8>> {
+    // Reap launched apps that have exited, so they do not linger as zombies. Keep
+    // the ones still running (try_wait yields Ok(None)).
+    fn reap(&mut self) {
+        self.children
+            .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+
+    // A periodic tick from the render loop. The Shell holds one broker opened once,
+    // so it does not see appends another process makes to the store; this re-reads
+    // the audit log and, only if it changed, rebuilds the model, refreshes the
+    // palette preview, and returns the new RGBA to redraw, so the live desktop
+    // reflects a grant, use, or revoke made from outside (e.g. a `horizon weave
+    // grant` in another shell). Rate-limited to SHELL_POLL so a 60fps loop does not
+    // stat the store every frame; cheap when nothing changed (`Broker::reload` reads
+    // only the audit ref and walks no chain, so there is no relayout and no
+    // re-upload). It also reaps any apps launched from the palette.
+    fn refresh(&mut self) -> Option<Vec<u8>> {
         if self.last_poll.elapsed() < SHELL_POLL {
             return None;
         }
         self.last_poll = std::time::Instant::now();
+        self.reap();
         match self.broker.reload() {
             Ok(false) => None,
-            Ok(true) => match self.rerender(width, height) {
-                Ok(rgba) => Some(rgba),
+            Ok(true) => match self.reload_model() {
+                Ok(()) => {
+                    self.preview();
+                    Some(self.relayout())
+                }
                 Err(e) => {
-                    eprintln!("compositor: redraw failed: {e}");
+                    eprintln!("compositor: store reload failed: {e}");
                     None
                 }
             },
@@ -1186,11 +1327,12 @@ fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
+            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32, &socket)?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
-                 capability; refreshes live as the audit log changes)",
+                 capability; with no window focused, type a command: launch <app>, sever \
+                 <name>, or any text to filter; refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -1204,8 +1346,9 @@ fn compositor_drm(background: Option<&Path>, days: u64) -> Result<()> {
     comp.run_drm(|event| {
         let s = shell.as_mut()?;
         match event {
-            compositor::ShellEvent::Click(x, y) => s.click(x, y, ow as u32, oh as u32),
-            compositor::ShellEvent::Tick => s.refresh(ow as u32, oh as u32),
+            compositor::ShellEvent::Click(x, y) => s.click(x, y),
+            compositor::ShellEvent::Key(k) => s.key(k),
+            compositor::ShellEvent::Tick => s.refresh(),
         }
     })
     .context("run drm backend")

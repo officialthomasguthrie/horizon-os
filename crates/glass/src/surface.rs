@@ -14,6 +14,7 @@
 
 use weave::GrantId;
 
+use crate::aura::{self, Palette};
 use crate::model::{Channel, ChannelStatus, Model, PrincipalView};
 
 // One bitmap glyph is 8x8; everything sizes off this.
@@ -194,14 +195,17 @@ impl Surface {
 }
 
 // Lay the model out into a scene `width` x `height`, text at `scale` (1, 2, ...).
-pub fn layout(model: &Model, width: u32, height: u32, scale: u32) -> Scene {
+// `palette` is the Aura command line: its filter narrows the principal list, and
+// it is drawn in the band at the bottom (the launcher and command palette).
+pub fn layout(model: &Model, palette: &Palette, width: u32, height: u32, scale: u32) -> Scene {
     let scale = scale.max(1) as i32;
     let mut s = Surface::new(width as i32, height as i32, scale);
 
-    // Reserve the intent line at the very bottom and lay out above it.
+    // Reserve the palette band at the very bottom (two rows: the input line and a
+    // feedback line under it) and lay the rest out above it.
     let pad = 3 * scale;
-    let intent_h = s.line + 2 * pad;
-    let intent_y = s.height - s.margin / 2 - intent_h;
+    let band_h = 2 * s.line + 2 * pad;
+    let band_y = s.height - s.margin / 2 - band_h;
 
     let mut y = s.margin;
     y = header(&mut s, model, y);
@@ -211,17 +215,30 @@ pub fn layout(model: &Model, width: u32, height: u32, scale: u32) -> Scene {
     s.rule(y);
     y += s.line;
 
-    // The principal list, clipped to the room above the intent line. Relative
-    // times are measured against the window end.
+    // The principal list, narrowed to the palette's filter and clipped to the
+    // room above the band. Relative times are measured against the window end.
     let now = model.window.end_unix;
-    let list_bottom = intent_y - s.line;
-    if model.is_empty() {
-        s.text(s.margin, y, DIM, "no activity");
+    let list_bottom = band_y - s.line;
+    let filter = palette.filter.as_deref().filter(|q| !q.trim().is_empty());
+    let shown: Vec<&PrincipalView> = match filter {
+        Some(q) => model
+            .principals
+            .iter()
+            .filter(|p| aura::principal_matches(p, q))
+            .collect(),
+        None => model.principals.iter().collect(),
+    };
+    if shown.is_empty() {
+        let msg = match filter {
+            Some(q) => format!("no match for '{q}'"),
+            None => "no activity".to_string(),
+        };
+        s.text(s.margin, y, DIM, msg);
     } else {
-        for (shown, p) in model.principals.iter().enumerate() {
-            // Stop before the intent line; a principal block is at least 2 rows.
+        for (i, p) in shown.iter().enumerate() {
+            // Stop before the band; a principal block is at least 2 rows.
             if y + 2 * s.line > list_bottom {
-                let left = model.principals.len() - shown;
+                let left = shown.len() - i;
                 if left > 0 {
                     s.text(s.margin, y, DIM, format!("+{left} more"));
                 }
@@ -232,7 +249,7 @@ pub fn layout(model: &Model, width: u32, height: u32, scale: u32) -> Scene {
         }
     }
 
-    intent_line(&mut s, intent_y, intent_h);
+    palette_band(&mut s, palette, band_y, band_h);
 
     Scene {
         width: s.width,
@@ -418,16 +435,36 @@ fn channel(s: &mut Surface, c: &Channel, y: i32) -> i32 {
     y
 }
 
-fn intent_line(s: &mut Surface, y: i32, h: i32) {
+// The Aura command palette at the bottom: an input row (prompt, the typed line,
+// and a caret at the cursor) and a feedback row under it (the palette's message,
+// or the idle hint when it has none). The text is fixed width, so the caret sits
+// at the cursor's character column.
+fn palette_band(s: &mut Surface, palette: &Palette, y: i32, h: i32) {
     s.rect(0, y, s.width, h, PANEL);
     s.rect(0, y, s.width, s.scale, RULE);
     let pad = 3 * s.scale;
     let ty = y + pad;
-    let mut x = s.text(s.margin, ty, ACCENT, ">");
-    x += s.cell;
-    x = s.text(x, ty, DIM, "ask Aura or type a command");
-    // A caret block after the prompt text.
-    s.rect(x + s.scale * 2, ty, s.scale * 2, s.cell, ACCENT);
+
+    let prompt_end = s.text(s.margin, ty, ACCENT, ">");
+    let text_x = prompt_end + s.cell;
+    if !palette.input.is_empty() {
+        s.text(text_x, ty, FG, palette.input.clone());
+    }
+    let caret_x = text_x + palette.cursor as i32 * s.cell;
+    s.rect(
+        caret_x,
+        ty - s.scale,
+        s.scale * 2,
+        s.cell + 2 * s.scale,
+        ACCENT,
+    );
+
+    let msg = if palette.message.trim().is_empty() {
+        aura::HINT_IDLE
+    } else {
+        palette.message.as_str()
+    };
+    s.text(s.margin, ty + s.line, DIM, msg);
 }
 
 // Right-pad the cursor to a column (in cells) from the row's left edge, so the
@@ -505,9 +542,14 @@ mod tests {
         texts(scene).iter().any(|t| t.contains(needle))
     }
 
+    // An idle palette: nothing typed, no filter, the layout most tests want.
+    fn idle() -> Palette {
+        Palette::new()
+    }
+
     #[test]
     fn scene_matches_requested_size() {
-        let scene = layout(&demo_model(), 1024, 600, 2);
+        let scene = layout(&demo_model(), &idle(), 1024, 600, 2);
         assert_eq!(scene.width, 1024);
         assert_eq!(scene.height, 600);
         assert_eq!(scene.bg, BG);
@@ -516,30 +558,68 @@ mod tests {
     #[test]
     fn empty_model_says_no_activity() {
         let empty = build(&[], &[], Window::week(NOW), DEFAULT_BUCKETS);
-        let scene = layout(&empty, 800, 400, 2);
+        let scene = layout(&empty, &idle(), 800, 400, 2);
         assert!(has_text(&scene, "no activity"));
     }
 
     #[test]
-    fn header_and_intent_line_are_drawn() {
-        let scene = layout(&demo_model(), 1000, 700, 2);
+    fn header_and_palette_band_are_drawn() {
+        let scene = layout(&demo_model(), &idle(), 1000, 700, 2);
         assert!(has_text(&scene, "glass"));
         assert!(has_text(&scene, "principals"));
-        assert!(has_text(&scene, "ask Aura"));
+        // The idle palette shows the prompt and the verb hint.
+        assert!(has_text(&scene, ">"));
+        assert!(has_text(&scene, "launch"));
+        assert!(has_text(&scene, "sever"));
     }
 
     #[test]
     fn principal_names_appear() {
-        let scene = layout(&demo_model(), 1200, 800, 2);
+        let scene = layout(&demo_model(), &idle(), 1200, 800, 2);
         for name in ["mail", "aura", "sync"] {
             assert!(has_text(&scene, name), "missing principal {name}");
         }
     }
 
     #[test]
+    fn the_typed_line_and_its_message_are_drawn() {
+        let palette = Palette {
+            input: "sever mail".to_string(),
+            cursor: 10,
+            message: "Enter to sever 1 channel".to_string(),
+            filter: Some("mail".to_string()),
+        };
+        let scene = layout(&demo_model(), &palette, 1200, 800, 2);
+        assert!(has_text(&scene, "sever mail"));
+        assert!(has_text(&scene, "Enter to sever 1 channel"));
+    }
+
+    #[test]
+    fn a_filter_narrows_the_principal_list() {
+        let palette = Palette {
+            filter: Some("mail".to_string()),
+            ..Palette::new()
+        };
+        let scene = layout(&demo_model(), &palette, 1200, 800, 2);
+        // Only the matching principal shows; the others drop out of the list.
+        assert!(has_text(&scene, "mail"));
+        assert!(!has_text(&scene, "sync"), "sync should be filtered out");
+    }
+
+    #[test]
+    fn a_filter_with_no_match_says_so() {
+        let palette = Palette {
+            filter: Some("zzz".to_string()),
+            ..Palette::new()
+        };
+        let scene = layout(&demo_model(), &palette, 1200, 800, 2);
+        assert!(has_text(&scene, "no match for 'zzz'"));
+    }
+
+    #[test]
     fn severable_channels_get_a_hit_and_dead_ones_do_not() {
         let m = demo_model();
-        let scene = layout(&m, 1200, 800, 2);
+        let scene = layout(&m, &idle(), 1200, 800, 2);
         for p in &m.principals {
             for c in &p.channels {
                 let Some(g) = c.grant else { continue };
@@ -557,7 +637,7 @@ mod tests {
     #[test]
     fn a_sever_hit_resolves_back_from_its_own_rect() {
         let m = demo_model();
-        let scene = layout(&m, 1200, 800, 2);
+        let scene = layout(&m, &idle(), 1200, 800, 2);
         let hit = scene.hits.first().expect("a severable channel exists");
         let action = scene.action_at(hit.x + 1, hit.y + 1);
         assert_eq!(action, Some(&hit.action));
