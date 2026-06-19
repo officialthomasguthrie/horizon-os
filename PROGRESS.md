@@ -511,6 +511,30 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   PPM, the headless way to see the Horizon desktop; verified by rendering a scripted
   four-principal store's Glass desktop at 1920x1080 through the compositor and eye-
   checking the image.
+- Phase 3 Glass shell click-to-sever (`compositor` + `glass` + `horizon`): the drawn
+  Glass desktop is now interactive, the kill switch you can click. The compositor
+  reports a pointer press that lands on no client window as a shell-background click
+  in output-logical pixels (`Compositor::take_shell_click`); it stays a generic
+  substrate, knowing nothing of Glass or Weave, only that the shell was clicked
+  there. Horizon, which already draws the Glass surface as that background, keeps the
+  `Scene` it laid out and resolves the click through the already-tested
+  `Scene::action_at` to an `Action::Sever(grant)`, severs it through `Glass::sever`
+  (the same revoke `glass sever` does), then re-summarizes the broker, relays the
+  surface out, and hands the new pixels back so the desktop redraws with that channel
+  now severed. Layering holds: the click primitive is pure input (not render-gated),
+  the Glass mapping lives in the binary where both crates meet, and the on-screen
+  winit loop carries it through a closure (`Compositor::show` now takes an
+  on-shell-click handler returning the refreshed background). On the usual split, the
+  compositor primitive is proven headlessly (a press on empty space reports its
+  coordinates and clears when taken, a press over a client window does not, the
+  window wins) and the whole resolve-and-sever chain is proven headlessly against a
+  real broker in glass (lay the model out, click the `sever` button's rect, it
+  resolves to that grant, sever it, and the rebuilt model shows the channel severed);
+  the winit wiring is compile-checked under the feature and eye-verified on a screen
+  later, the same bar as the rest of the backend. `horizon compositor show
+  --background <store>` draws the clickable Glass desktop. The coordinates line up
+  because the shell renders at output scale 1, so a logical click indexes the
+  surface's own pixels directly.
 
 ## Next
 
@@ -537,13 +561,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   full-screen background (the Glass L5 desktop, a pure Model -> Scene -> Pixmap
   renderer in the `glass` crate) behind client windows, proven on the headless
   pixman path and wired into the winit backend, with `horizon compositor
-  screenshot --background <store>` showing the composited desktop. What is left on
-  the shell: painting that background on the DRM backend (its element-list present
-  loop needs the Send-able multi-GPU texture path), refreshing it live as the audit
-  log changes, routing a click on a Glass `sever` hit target back through
-  `Glass::sever`, and the Aura intent line becoming a real launcher/command
-  palette. Confined cells can already host compositor surfaces (the cells exec path
-  is ready). Linux-only.
+  screenshot --background <store>` showing the composited desktop, and a click on a
+  Glass `sever` button is now routed back through `Glass::sever`: the compositor
+  reports a press that hit no client window, Horizon resolves it through the scene
+  and severs, then redraws the surface, wired into `horizon compositor show
+  --background`. What is left on the shell: painting that background (and so this
+  click loop) on the DRM backend (its element-list present loop needs the Send-able
+  multi-GPU texture path), refreshing it live as the audit log changes from outside,
+  and the Aura intent line becoming a real launcher/command palette. Confined cells
+  can already host compositor surfaces (the cells exec path is ready). Linux-only.
 - Glass: the live transparency surface over the weave audit log. The model layer
   and the drawn surface are both done (the `glass` crate: a pure fold of the
   broker's grant table and audit log into a per-principal map of
@@ -555,9 +581,11 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   blit has landed too: `Compositor::set_shell_background` uploads the Pixmap as a
   texture and `paint_space` draws it behind client windows, proven on the headless
   pixman path and wired into the winit backend (`horizon compositor screenshot
-  --background <store>` shows it). What is left: painting it on the DRM backend,
-  refreshing it live as the log changes, and routing a click on a `sever` hit
-  target back through `Glass::sever`. Eye-verify on a screen; a confined cell can
+  --background <store>` shows it), and a click on a `sever` hit target is now routed
+  back through `Glass::sever` (the compositor reports the press, Horizon resolves it
+  through `Scene::action_at` and severs, then redraws), behind `horizon compositor
+  show --background`. What is left: painting it on the DRM backend and refreshing it
+  live as the log changes from outside. Eye-verify on a screen; a confined cell can
   host it (the cells exec path is ready).
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise

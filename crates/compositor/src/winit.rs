@@ -33,7 +33,10 @@ use crate::{Compositor, Error, Result};
 /// window is closed. Drives the Wayland server (`comp`) between frames, so
 /// clients connect and map exactly as in the headless core; their windows are
 /// then painted into this window.
-pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
+pub(crate) fn run(
+    comp: &mut Compositor,
+    mut on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>,
+) -> Result<()> {
     let (mut backend, mut winit) =
         winit::init::<GlesRenderer>().map_err(|e| Error::Render(format!("winit init: {e}")))?;
     backend.window().set_title("Horizon compositor");
@@ -62,6 +65,15 @@ pub(crate) fn run(comp: &mut Compositor) -> Result<()> {
         let output = Size::<i32, Logical>::from((ow, oh));
         for event in inputs {
             apply_input(comp, event, output);
+        }
+
+        // A press on the shell background (no client window over it) is offered to
+        // the owner; if it redraws the surface (e.g. a Glass `sever` button was
+        // clicked), upload the new background for this frame.
+        if let Some((x, y)) = comp.take_shell_click() {
+            if let Some(rgba) = on_shell_click(x, y) {
+                comp.set_shell_background(&rgba, ow, oh);
+            }
         }
 
         // Service Wayland clients (accept, dispatch, flush) between frames.

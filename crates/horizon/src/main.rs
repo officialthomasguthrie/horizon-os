@@ -164,10 +164,19 @@ enum CompositorOp {
         #[arg(long, default_value_t = 7)]
         days: u64,
     },
-    /// Open a nested window and show client windows on screen. Needs a Wayland
-    /// or X session to nest in and a GPU; verified by eye, not in CI.
+    /// Open a nested window and show client windows on screen, optionally over a
+    /// clickable Glass shell background. Needs a Wayland or X session to nest in
+    /// and a GPU; verified by eye, not in CI.
     #[cfg(feature = "compositor-winit")]
-    Show,
+    Show {
+        /// Draw the Glass surface of this store as the shell background (the L5
+        /// home screen); clicking a `sever` button revokes that capability live
+        #[arg(long)]
+        background: Option<PathBuf>,
+        /// Window to summarize for the background Glass surface, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+    },
     /// Drive a real display directly off the GPU (DRM/KMS) with libinput input.
     /// This is the bare-metal path: run it from a console, not nested. Needs a
     /// GPU and a seat; verified by eye on hardware, not in CI.
@@ -821,7 +830,7 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
             days,
         } => compositor_screenshot(&out, seconds, background.as_deref(), days),
         #[cfg(feature = "compositor-winit")]
-        CompositorOp::Show => compositor_show(),
+        CompositorOp::Show { background, days } => compositor_show(background.as_deref(), days),
         #[cfg(feature = "compositor-udev")]
         CompositorOp::Drm => compositor_drm(),
     }
@@ -976,8 +985,14 @@ fn write_ppm(path: &Path, frame: &compositor::RenderedFrame) -> io::Result<()> {
 // or X session, showing the client windows the compositor manages and forwarding
 // keyboard and pointer input to them. This is the part that needs a display and a
 // GPU, so it is verified by eye.
+//
+// With --background it also draws a Glass shell behind the windows and routes a
+// click on a `sever` button back through Glass to revoke that capability, then
+// redraws the surface. The compositor reports a press that landed on no client
+// window (`take_shell_click`); the Shell maps it through the scene's hit targets
+// (Scene::action_at) to the grant and severs it, exactly as `glass sever` does.
 #[cfg(all(target_os = "linux", feature = "compositor-winit"))]
-fn compositor_show() -> Result<()> {
+fn compositor_show(background: Option<&Path>, days: u64) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -986,10 +1001,97 @@ fn compositor_show() -> Result<()> {
     println!("compositor: listening on WAYLAND_DISPLAY={socket}");
     println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
     println!("compositor: click a window to focus it; keyboard and pointer go to it");
+
+    // Optional clickable Glass shell, rendered at the output size.
+    let (ow, oh) = comp.output_size();
+    let mut shell = match background {
+        Some(store) => {
+            let (shell, rgba) = Shell::open(store, days, ow as u32, oh as u32)?;
+            comp.set_shell_background(&rgba, ow, oh);
+            println!(
+                "compositor: Glass shell background from {} (click `sever` to revoke a capability)",
+                store.display()
+            );
+            Some(shell)
+        }
+        None => None,
+    };
+
     println!("compositor: close the window to stop");
     io::stdout().flush().ok();
 
-    comp.show().context("run winit backend")
+    comp.show(|x, y| {
+        shell
+            .as_mut()
+            .and_then(|s| s.click(x, y, ow as u32, oh as u32))
+    })
+    .context("run winit backend")
+}
+
+// The interactive Glass shell behind the winit backend. It holds the broker, the
+// window it summarizes, and the last scene it drew, so a pointer click can be
+// resolved against the scene's hit targets, applied through Glass, and the
+// surface redrawn. Lives only where the on-screen backend does.
+#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+struct Shell {
+    broker: Broker,
+    window: glass::Window,
+    scene: glass::Scene,
+}
+
+#[cfg(all(target_os = "linux", feature = "compositor-winit"))]
+impl Shell {
+    // Open a store's Glass shell at a surface size, rendering the first frame.
+    // Returns the shell and the RGBA to set as the background.
+    fn open(store: &Path, days: u64, width: u32, height: u32) -> Result<(Shell, Vec<u8>)> {
+        let mut broker = open_broker(store)?;
+        let window = glass::Window::days(now_unix(), days);
+        let model = glass::Glass::new(&mut broker).model_within(window, glass::DEFAULT_BUCKETS)?;
+        let scene = glass::layout(&model, width, height, 2);
+        let rgba = glass::raster::rasterize(&scene).rgba;
+        Ok((
+            Shell {
+                broker,
+                window,
+                scene,
+            },
+            rgba,
+        ))
+    }
+
+    // Resolve a click at output-logical (x, y) against the current scene. If it
+    // hits a `sever` button, revoke that grant, re-summarize, relayout, and return
+    // the new RGBA to redraw; otherwise return None (nothing changed). At output
+    // scale 1 the click coordinates are the surface's own pixels, so they index
+    // the scene directly.
+    fn click(&mut self, x: i32, y: i32, width: u32, height: u32) -> Option<Vec<u8>> {
+        let grant = match self.scene.action_at(x, y).cloned() {
+            Some(glass::Action::Sever(grant)) => grant,
+            None => return None,
+        };
+        if let Err(e) = glass::Glass::new(&mut self.broker).sever(grant) {
+            eprintln!("compositor: sever failed: {e}");
+            return None;
+        }
+        match self.rerender(width, height) {
+            Ok(rgba) => {
+                println!("compositor: severed {}", grant.to_hex());
+                Some(rgba)
+            }
+            Err(e) => {
+                eprintln!("compositor: redraw failed: {e}");
+                None
+            }
+        }
+    }
+
+    // Re-summarize the broker and relayout the surface, keeping the new scene.
+    fn rerender(&mut self, width: u32, height: u32) -> Result<Vec<u8>> {
+        let model = glass::Glass::new(&mut self.broker)
+            .model_within(self.window, glass::DEFAULT_BUCKETS)?;
+        self.scene = glass::layout(&model, width, height, 2);
+        Ok(glass::raster::rasterize(&self.scene).rgba)
+    }
 }
 
 // Run the bare-metal DRM/KMS backend: drive a real display directly off the GPU

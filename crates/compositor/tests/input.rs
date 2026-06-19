@@ -171,6 +171,12 @@ fn forwards_pointer_and_keyboard_to_client() {
     comp.pointer_motion(10.0, 10.0);
     comp.pointer_motion(20.0, 20.0);
     comp.pointer_button(BTN_LEFT, true);
+    // The press landed on the client window, so it is the window's click, not a
+    // shell-background one: nothing should be reported to the shell.
+    assert!(
+        comp.take_shell_click().is_none(),
+        "a click on a client window is not a shell click"
+    );
     comp.keyboard_key(KEY_A, true);
     comp.keyboard_key(KEY_A, false);
     comp.pointer_button(BTN_LEFT, false);
@@ -198,6 +204,36 @@ fn forwards_pointer_and_keyboard_to_client() {
     } else {
         eprintln!("input test: seat has no keyboard (no xkb data); skipped keyboard checks");
     }
+}
+
+// A press on empty space (no client window under the cursor) is reported as a
+// shell-background click in output-logical pixels and cleared when taken. No
+// display or client is needed: this is pure input routing, the seam Horizon
+// resolves through the Glass scene to a `sever`. The "a window click is not a
+// shell click" half is asserted in the test above, where a window is mapped.
+#[test]
+fn shell_background_clicks_are_reported_and_cleared() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    assert!(comp.take_shell_click().is_none(), "nothing clicked yet");
+
+    // Move onto empty space and press: the press is recorded at the cursor.
+    comp.pointer_motion(300.0, 220.0);
+    comp.pointer_button(BTN_LEFT, true);
+    assert_eq!(
+        comp.take_shell_click(),
+        Some((300, 220)),
+        "an empty-space press is a shell click at the cursor"
+    );
+    // Taking it clears it.
+    assert!(
+        comp.take_shell_click().is_none(),
+        "the shell click was consumed"
+    );
+
+    // Releasing the button is not a new click (only presses record one).
+    comp.pointer_button(BTN_LEFT, false);
+    assert!(comp.take_shell_click().is_none(), "release is not a click");
 }
 
 #[derive(Default)]

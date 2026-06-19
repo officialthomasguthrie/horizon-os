@@ -68,6 +68,11 @@ struct State {
     // Last pointer position in output-logical pixels, so a click can pick the
     // window under the cursor for keyboard focus.
     pointer_loc: Point<f64, Logical>,
+    // A press that landed on no client window (the shell background) records its
+    // position here, in output-logical pixels, for the owner to resolve against
+    // whatever it drew there (Horizon maps it to a Glass action). Taken and
+    // cleared by `take_shell_click`. Not render-gated: this is input, not drawing.
+    pending_shell_click: Option<(i32, i32)>,
     // Monotonic base for input event timestamps.
     start: Instant,
 }
@@ -166,9 +171,14 @@ impl State {
         } else {
             ButtonState::Released
         };
-        // A press picks the keyboard focus from the window under the cursor.
+        // A press picks the keyboard focus from the window under the cursor; a
+        // press on no window at all is a click on the shell background, recorded
+        // for the owner to resolve (Horizon maps it through the Glass scene).
         if pressed {
             let loc = self.pointer_loc;
+            if self.space.element_under(loc).is_none() {
+                self.pending_shell_click = Some((loc.x as i32, loc.y as i32));
+            }
             self.focus_at(loc, serial);
         }
         pointer.button(
@@ -409,6 +419,7 @@ impl Compositor {
             background: None,
             next_x: 0,
             pointer_loc: (0.0, 0.0).into(),
+            pending_shell_click: None,
             start: Instant::now(),
         };
 
@@ -520,6 +531,16 @@ impl Compositor {
         self.state.seat.get_keyboard().is_some()
     }
 
+    /// Take the position of the most recent pointer press that landed on the
+    /// shell background (no client window under the cursor), in output-logical
+    /// pixels, clearing it. The owner resolves it against whatever it drew there:
+    /// Horizon maps it through the Glass `Scene` to a `sever` action. Returns
+    /// `None` if no such click is pending. At output scale 1 these coordinates are
+    /// the shell background's own pixels, so they index its scene directly.
+    pub fn take_shell_click(&mut self) -> Option<(i32, i32)> {
+        self.state.pending_shell_click.take()
+    }
+
     /// Composite the current scene into an offscreen framebuffer the size of the
     /// output and read the pixels back. This is the headless render path: it
     /// imports each window's shm buffer and paints the `Space` with a software
@@ -586,9 +607,17 @@ impl Compositor {
     /// Open a nested window and present the scene on screen until it is closed,
     /// driving the Wayland server between frames. Needs a real Wayland or X
     /// session to nest in (and a GPU); this is the eye-verified, on-screen path.
+    ///
+    /// `on_shell_click` is called with the output-logical position of each pointer
+    /// press that lands on the shell background (no client window over it).
+    /// Returning new full-screen RGBA (output-sized, the bytes `glass::Pixmap`
+    /// produces) redraws the background; that is how a click on a Glass `sever`
+    /// button severs the capability and refreshes the desktop. Return `None` to
+    /// leave the background unchanged, or pass a closure that always returns `None`
+    /// when there is no interactive shell.
     #[cfg(feature = "winit")]
-    pub fn show(&mut self) -> Result<()> {
-        crate::winit::run(self)
+    pub fn show(&mut self, on_shell_click: impl FnMut(i32, i32) -> Option<Vec<u8>>) -> Result<()> {
+        crate::winit::run(self, on_shell_click)
     }
 
     /// Drive a real display directly off the GPU (DRM/KMS) with libinput input,

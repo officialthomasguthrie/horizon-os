@@ -119,3 +119,65 @@ fn severing_survives_a_reopen() {
     assert_eq!(m.totals.severed, 1);
     assert_eq!(m.totals.live, 0);
 }
+
+// A click on the drawn `sever` button resolves, through the scene's hit targets,
+// to the same kill switch the text view exposes as a grant id, and pulling it
+// severs the channel. This is the seam the compositor routes a pointer press
+// through: it hands the click position to the owner, Scene::action_at maps it to
+// an Action, and Glass::sever applies it. Proven here without a display.
+#[test]
+fn a_click_on_the_sever_button_severs_the_channel() {
+    let d = tempdir().unwrap();
+    let mut b = Broker::open(Lifestream::init(d.path(), &KEY).unwrap(), Policy::DenyAll).unwrap();
+
+    // mail gets a live, severable network capability and uses it once.
+    let cap = b
+        .grant(
+            "mail".into(),
+            Resource::net("api.mail.example", 443),
+            Rights::READ | Rights::WRITE,
+            weave::Limits::none(),
+        )
+        .unwrap();
+    b.access(&cap, &Resource::net("api.mail.example", 443), Rights::WRITE)
+        .unwrap();
+    let gid = cap.grant_id();
+
+    let win = Window::week(now());
+    let mut g = Glass::new(&mut b);
+    let model = g.model_within(win, glass::DEFAULT_BUCKETS).unwrap();
+
+    // Lay the model out and find the sever button for mail's live channel: it is
+    // the only severable one, so the scene carries exactly one hit target.
+    let scene = glass::layout(&model, 1200, 800, 2);
+    let hit = scene
+        .hits
+        .iter()
+        .find(|h| h.action == glass::Action::Sever(gid))
+        .expect("the live channel offers a sever button");
+
+    // A click at the button's center resolves back to the sever action; a click
+    // off any target (the top-left corner) resolves to nothing, which is what the
+    // compositor would hand over for empty chrome.
+    let (cx, cy) = (hit.x + hit.w / 2, hit.y + hit.h / 2);
+    assert_eq!(scene.action_at(cx, cy), Some(&glass::Action::Sever(gid)));
+    assert_eq!(scene.action_at(0, 0), None);
+
+    // Resolve the click the way the shell does, then pull the switch.
+    match scene.action_at(cx, cy).cloned() {
+        Some(glass::Action::Sever(grant)) => g.sever(grant).unwrap(),
+        other => panic!("expected a sever action at the button, got {other:?}"),
+    }
+
+    // The channel is now severed, exactly as `glass sever --grant` would leave it.
+    let after = g.model_within(win, glass::DEFAULT_BUCKETS).unwrap();
+    assert_eq!(after.totals.live, 0);
+    assert_eq!(after.totals.severed, 1);
+    let mail = after
+        .principals
+        .iter()
+        .find(|p| p.principal.0 == "mail")
+        .unwrap();
+    assert_eq!(mail.channels[0].status, ChannelStatus::Severed);
+    assert!(!mail.channels[0].can_sever());
+}
