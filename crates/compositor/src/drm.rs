@@ -24,10 +24,13 @@
 //! Every output is placed in one shared logical space (a left-to-right
 //! [`layout`](crate::layout)) and scans out its own region of the scene, so a real
 //! multi-monitor desktop spans the screens instead of mirroring one onto all of
-//! them, and the cursor roams the whole span. The window scene is shared; the
-//! shell background is still drawn per output at its own origin (each monitor
-//! shows the Glass desktop). Advertising each output to clients as its own
-//! `wl_output` global, and per-output scale, are the remaining gaps.
+//! them, and the cursor roams the whole span. Each lit connector is advertised to
+//! clients as its own `wl_output` global at its layout position and mode (created
+//! when the connector is lit, withdrawn when it is unplugged or its GPU goes, the
+//! placeholder retired while any real monitor exists), so a client enumerates the
+//! real screens and learns where each one is. The window scene is shared; the shell
+//! background is still drawn per output at its own origin (each monitor shows the
+//! Glass desktop). Per-output scale is the remaining gap.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -64,6 +67,8 @@ use smithay::reexports::drm::control::{
 };
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_server::backend::GlobalId;
+use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::utils::{DeviceFd, Logical, Point, Size, Transform};
 
 use crate::render::output_render_elements;
@@ -116,6 +121,9 @@ struct OutputSurface {
     // Also mapped into the compositor's shared `Space` (at its logical layout
     // position) so this surface scans out its own region of the scene.
     output: Output,
+    // This monitor's `wl_output` global, so a client enumerates it at its layout
+    // position and mode. Withdrawn when the connector is unplugged or its GPU goes.
+    global: GlobalId,
     // True between queue_frame and the vblank that retires it: do not draw the
     // next frame on this output until the page flip completes.
     pending: bool,
@@ -142,6 +150,10 @@ struct Device {
 // exactly as the winit loop drives it; that is why the seat routing and scene here
 // are the already-tested ones.
 struct DrmBackend {
+    // The Wayland display handle, to create and withdraw a `wl_output` global per
+    // connector as monitors come and go (the connector scan has no compositor in
+    // hand, only this).
+    dh: DisplayHandle,
     // Held so the seat stays ours and to open the GPUs and input devices through.
     session: LibSeatSession,
     // The GPU clients are assumed to render on; its outputs set the cursor clamp.
@@ -191,7 +203,7 @@ pub(crate) fn run(
 ) -> Result<()> {
     let mut event_loop: EventLoop<'static, DrmBackend> =
         EventLoop::try_new().map_err(|e| Error::Init(format!("event loop: {e}")))?;
-    let mut backend = setup(event_loop.handle())?;
+    let mut backend = setup(event_loop.handle(), comp.display_handle())?;
 
     let start = Instant::now();
     loop {
@@ -320,7 +332,7 @@ fn render_all(comp: &mut Compositor, backend: &mut DrmBackend) {
 // session and udev sources, then bring up whatever GPUs are already present. Each
 // GPU's connectors are scanned as it comes up; hotplug after that is driven by the
 // udev source.
-fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
+fn setup(loop_handle: LoopHandle<'static, DrmBackend>, dh: DisplayHandle) -> Result<DrmBackend> {
     // Become the session's DRM master via libseat, so opening the GPUs and the
     // input devices works without real root.
     let (session, notifier) =
@@ -419,6 +431,7 @@ fn setup(loop_handle: LoopHandle<'static, DrmBackend>) -> Result<DrmBackend> {
         .map_err(|e| Error::Init(format!("insert udev source: {e}")))?;
 
     let mut backend = DrmBackend {
+        dh,
         session,
         primary_gpu,
         gpus,
@@ -602,6 +615,11 @@ impl DrmBackend {
         let Some(device) = self.devices.remove(&node) else {
             return;
         };
+        // Withdraw the wl_output global of every monitor this GPU drove, so clients
+        // stop enumerating them; the surfaces drop with the device.
+        for surface in device.surfaces.values() {
+            crate::server::remove_output_global(&self.dh, surface.global.clone());
+        }
         self.gpus.as_mut().remove_node(&device.render_node);
         self.loop_handle.remove(device.drm_token);
         if self.primary_gpu == Some(node) {
@@ -626,6 +644,9 @@ impl DrmBackend {
     // when the GPU comes up and whenever udev signals it changed.
     fn scan_connectors(&mut self, node: DrmNode) {
         let mut changed = false;
+        // Cloned up front so the global create/withdraw below borrow the handle,
+        // not `self`, while `device` holds a mutable borrow of `self.devices`.
+        let dh = self.dh.clone();
 
         {
             let Some(device) = self.devices.get_mut(&node) else {
@@ -701,7 +722,11 @@ impl DrmBackend {
                 .collect();
             for conn in removed {
                 if let Some(crtc) = device.connectors.remove(&conn) {
-                    device.surfaces.remove(&crtc); // drops the DrmOut, frees the CRTC
+                    // Dropping the surface drops the DrmOut (freeing the CRTC); first
+                    // withdraw the monitor's wl_output global so clients stop seeing it.
+                    if let Some(surface) = device.surfaces.remove(&crtc) {
+                        crate::server::remove_output_global(&dh, surface.global);
+                    }
                     changed = true;
                     println!("compositor: display on {conn:?} unplugged");
                 }
@@ -728,11 +753,15 @@ impl DrmBackend {
                 ) {
                     Ok(drm) => {
                         let (w, h) = mode.size();
+                        // Advertise this monitor to clients as its own wl_output. Its
+                        // layout position is set when relayout maps it into the space.
+                        let global = crate::server::create_output_global(&dh, &output);
                         device.surfaces.insert(
                             crtc,
                             OutputSurface {
                                 drm,
                                 output,
+                                global,
                                 pending: false,
                             },
                         );
@@ -794,13 +823,18 @@ impl DrmBackend {
         // The cursor roams the whole desktop; never let the clamp box collapse.
         let (w, h) = layout::span(&sizes);
         self.output_size = Size::from((w.max(1), h.max(1)));
+
+        // Each real monitor is now advertised on its own, so retire the placeholder
+        // global; if every monitor went dark, restore it so a client still sees one.
+        comp.set_placeholder_global(outputs.is_empty());
         self.outputs_dirty = false;
     }
 }
 
 // Describe a connected connector and its mode as a smithay Output, used as a
-// surface's mode source. No global is created: the compositor already advertises
-// its output to clients; this one only carries the geometry the surface scans out.
+// surface's mode source. The caller advertises its wl_output global once the
+// surface initializes (in scan_connectors); this just carries the geometry the
+// surface scans out and the global reports.
 fn make_output(conn: &connector::Info, mode: &DrmMode) -> Output {
     let name = format!("{:?}-{}", conn.interface(), conn.interface_id());
     let (phys_w, phys_h) = conn.size().unwrap_or((0, 0));

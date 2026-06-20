@@ -830,13 +830,36 @@ impl Compositor {
     /// [`add_output`]: Compositor::add_output
     #[cfg(feature = "udev")]
     pub(crate) fn map_output(&mut self, output: &Output, x: i32, y: i32) {
+        // Keep the advertised location (what this output's `wl_output` global reports
+        // to clients) and the Space mapping (the region it scans out) in step, so a
+        // client sees the monitor exactly where the layout placed it.
+        output.change_current_state(None, None, None, Some((x, y).into()));
         self.state.space.map_output(output, (x, y));
     }
 
-    /// Remove a real output from the shared space (its connector was unplugged).
+    /// Remove a real output from the shared space (its connector was unplugged). Its
+    /// `wl_output` global is withdrawn separately by the backend, which owns the id.
     #[cfg(feature = "udev")]
     pub(crate) fn unmap_output(&mut self, output: &Output) {
         self.state.space.unmap_output(output);
+    }
+
+    /// A clone of the Wayland display handle, for the DRM backend to create and
+    /// withdraw a `wl_output` global per connector as monitors come and go (through
+    /// [`create_output_global`] / [`remove_output_global`], which name the private
+    /// server `State` this handle is typed against).
+    #[cfg(feature = "udev")]
+    pub(crate) fn display_handle(&self) -> DisplayHandle {
+        self.state.dh.clone()
+    }
+
+    /// Advertise or withdraw the placeholder output's global. The DRM backend
+    /// withdraws it once it lights its first real connector (so clients enumerate
+    /// the actual monitors, not the phantom) and restores it if every monitor goes
+    /// dark, so a client still sees one screen.
+    #[cfg(feature = "udev")]
+    pub(crate) fn set_placeholder_global(&mut self, advertised: bool) {
+        self.state.set_placeholder_global(advertised);
     }
 
     /// Set the shell background: the full-screen image drawn behind every client
@@ -936,4 +959,22 @@ impl Compositor {
     pub fn run_drm(&mut self, on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>) -> Result<()> {
         crate::drm::run(self, on_shell)
     }
+}
+
+/// Advertise `output` to clients as its own `wl_output` global, returning the id
+/// that withdraws it. The DRM backend calls this for each connector it lights (it
+/// holds the `Output` already, as the `DrmOutput`'s mode source), so a client
+/// enumerates every real monitor at its layout position and mode. These live here,
+/// not on the backend, because creating a global names the private server `State`
+/// the display handle is typed against.
+#[cfg(feature = "udev")]
+pub(crate) fn create_output_global(dh: &DisplayHandle, output: &Output) -> GlobalId {
+    output.create_global::<State>(dh)
+}
+
+/// Withdraw a `wl_output` global created by [`create_output_global`] (its connector
+/// was unplugged or its GPU went away).
+#[cfg(feature = "udev")]
+pub(crate) fn remove_output_global(dh: &DisplayHandle, id: GlobalId) {
+    dh.remove_global::<State>(id);
 }
