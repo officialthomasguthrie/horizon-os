@@ -25,12 +25,16 @@
 //! [`layout`](crate::layout)) and scans out its own region of the scene, so a real
 //! multi-monitor desktop spans the screens instead of mirroring one onto all of
 //! them, and the cursor roams the whole span. Each lit connector is advertised to
-//! clients as its own `wl_output` global at its layout position and mode (created
-//! when the connector is lit, withdrawn when it is unplugged or its GPU goes, the
-//! placeholder retired while any real monitor exists), so a client enumerates the
-//! real screens and learns where each one is. The window scene is shared; the shell
-//! background is still drawn per output at its own origin (each monitor shows the
-//! Glass desktop). Per-output scale is the remaining gap.
+//! clients as its own `wl_output` global at its layout position, mode, and scale
+//! (created when the connector is lit, withdrawn when it is unplugged or its GPU
+//! goes, the placeholder retired while any real monitor exists), so a client
+//! enumerates the real screens and learns where each one is and how dense it is.
+//! The scale is derived per connector from the panel's pixel density
+//! ([`layout::scale_for`](crate::layout::scale_for)): a HiDPI monitor is advertised
+//! at 2x, renders its region at 2x, and occupies half its pixel size in the logical
+//! layout. The window scene is shared; the shell background is still drawn per
+//! output at its own origin and native pixel size (each monitor shows the Glass
+//! desktop, not yet itself scaled per output).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -801,14 +805,11 @@ impl DrmBackend {
             .collect();
         entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let outputs: Vec<Output> = entries.into_iter().map(|(_, _, output)| output).collect();
-        let sizes: Vec<(i32, i32)> = outputs
-            .iter()
-            .map(|o| {
-                o.current_mode()
-                    .map(|m| (m.size.w, m.size.h))
-                    .unwrap_or((0, 0))
-            })
-            .collect();
+        // Lay outputs out by their logical size (mode divided by scale), since the
+        // shared space, the windows, and the cursor are all in logical units; a
+        // HiDPI output takes half its pixel width, so the next monitor abuts its
+        // logical edge with no gap.
+        let sizes: Vec<(i32, i32)> = outputs.iter().map(logical_size).collect();
         let positions = layout::arrange(&sizes);
 
         // Drop the previous arrangement, then install the new one.
@@ -834,7 +835,10 @@ impl DrmBackend {
 // Describe a connected connector and its mode as a smithay Output, used as a
 // surface's mode source. The caller advertises its wl_output global once the
 // surface initializes (in scan_connectors); this just carries the geometry the
-// surface scans out and the global reports.
+// surface scans out and the global reports. The output's scale is derived from
+// the panel's pixel density (`layout::scale_for`), so a HiDPI monitor is
+// advertised at 2x and renders its region at 2x, while occupying half its pixel
+// size in the shared logical layout.
 fn make_output(conn: &connector::Info, mode: &DrmMode) -> Output {
     let name = format!("{:?}-{}", conn.interface(), conn.interface_id());
     let (phys_w, phys_h) = conn.size().unwrap_or((0, 0));
@@ -853,14 +857,31 @@ fn make_output(conn: &connector::Info, mode: &DrmMode) -> Output {
         // drm reports the refresh in Hz; smithay's mode is in mHz.
         refresh: mode.vrefresh() as i32 * 1000,
     };
+    let scale = layout::scale_for((w as i32, h as i32), (phys_w as i32, phys_h as i32));
     output.change_current_state(
         Some(wl_mode),
         Some(Transform::Normal),
-        Some(Scale::Integer(1)),
+        Some(Scale::Integer(scale)),
         Some((0, 0).into()),
     );
     output.set_preferred(wl_mode);
     output
+}
+
+// An output's logical size: its physical mode divided by its scale, rounded the
+// same way smithay's `Space::output_geometry` does (ceil), so the layout advances
+// by exactly the region each output renders. A 3840x2160 panel at scale 2 is
+// 1920x1080 of logical space; the windows and the cursor live in these units, so
+// the left-to-right arrangement must stack outputs by logical width, not pixels.
+fn logical_size(output: &Output) -> (i32, i32) {
+    match output.current_mode() {
+        Some(mode) => {
+            let scale = output.current_scale().fractional_scale();
+            let size = mode.size.to_f64().to_logical(scale).to_i32_ceil();
+            (size.w, size.h)
+        }
+        None => (0, 0),
+    }
 }
 
 // Translate one libinput event into a seat action on the compositor, the same
