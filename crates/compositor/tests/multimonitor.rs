@@ -133,8 +133,8 @@ fn window_shows_only_on_the_output_that_covers_it() {
     let path = runtime_dir().join(comp.socket_name());
 
     // Left at the origin, right immediately to its logical right.
-    let left = comp.add_output("LEFT", OW, OH, 0, 0);
-    let right = comp.add_output("RIGHT", OW, OH, OW, 0);
+    let left = comp.add_output("LEFT", OW, OH, 1, 0, 0);
+    let right = comp.add_output("RIGHT", OW, OH, 1, OW, 0);
 
     let (ready_rx, quit_tx, client) = spawn_window(path);
     pump_until(&mut comp, &ready_rx, "buffer commit");
@@ -186,7 +186,7 @@ fn moving_an_output_shifts_the_region_it_renders() {
     let mut comp = Compositor::new().expect("start compositor");
     let path = runtime_dir().join(comp.socket_name());
 
-    let out = comp.add_output("SOLO", OW, OH, 0, 0);
+    let out = comp.add_output("SOLO", OW, OH, 1, 0, 0);
 
     let (ready_rx, quit_tx, client) = spawn_window(path);
     pump_until(&mut comp, &ready_rx, "buffer commit");
@@ -242,8 +242,8 @@ fn clients_enumerate_one_wl_output_per_monitor() {
     let mut comp = Compositor::new().expect("start compositor");
     let path = runtime_dir().join(comp.socket_name());
 
-    comp.add_output("LEFT", OW, OH, 0, 0);
-    comp.add_output("RIGHT", OW, OH, OW, 0);
+    comp.add_output("LEFT", OW, OH, 1, 0, 0);
+    comp.add_output("RIGHT", OW, OH, 1, OW, 0);
 
     let (tx, rx) = mpsc::channel::<Summary>();
     let client = thread::spawn(move || tx.send(probe(path)).unwrap());
@@ -255,12 +255,14 @@ fn clients_enumerate_one_wl_output_per_monitor() {
         y: 0,
         w: OW,
         h: OH,
+        scale: 1,
     };
     let right = OutInfo {
         x: OW,
         y: 0,
         w: OW,
         h: OH,
+        scale: 1,
     };
 
     // Exactly one wl_output per monitor, each at its layout position and mode, and
@@ -289,6 +291,99 @@ fn clients_enumerate_one_wl_output_per_monitor() {
         "surface should enter only the left output: {:?}",
         summary.entered
     );
+}
+
+// An ordinary monitor and a HiDPI one side by side, each advertised with its own
+// scale. A client reads scale 1 off the first and scale 2 off the second, and
+// both still report their full pixel mode, so the client derives the logical size
+// itself (mode / scale). This is the last multi-monitor gap: a client now learns
+// not just where each screen is but how dense it is.
+#[test]
+fn a_hidpi_output_advertises_its_scale_to_clients() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    let path = runtime_dir().join(comp.socket_name());
+
+    // Ordinary monitor at the origin (scale 1, so OW wide in logical space), then
+    // a HiDPI one at logical x=OW with the same pixel mode but scale 2.
+    comp.add_output("ORDINARY", OW, OH, 1, 0, 0);
+    comp.add_output("HIDPI", OW, OH, 2, OW, 0);
+
+    let (tx, rx) = mpsc::channel::<Summary>();
+    let client = thread::spawn(move || tx.send(probe(path)).unwrap());
+    let summary = pump_until(&mut comp, &rx, "probe results");
+    client.join().unwrap();
+
+    // Sorted by logical x: the ordinary monitor first, the HiDPI one to its right.
+    assert_eq!(
+        summary.outputs.len(),
+        2,
+        "one wl_output per monitor: {:?}",
+        summary.outputs
+    );
+    let ordinary = summary.outputs[0];
+    let hidpi = summary.outputs[1];
+    assert_eq!(ordinary.scale, 1, "the ordinary monitor is scale 1");
+    assert_eq!(
+        hidpi.scale, 2,
+        "the HiDPI monitor is advertised at scale 2: {:?}",
+        hidpi
+    );
+    // The mode stays the full pixel size on both; the client divides by the scale.
+    assert_eq!(
+        (hidpi.w, hidpi.h),
+        (OW, OH),
+        "the HiDPI monitor advertises its physical pixel mode, not the logical size"
+    );
+    assert_eq!(
+        hidpi.x, OW,
+        "the HiDPI monitor sits to the right of the first"
+    );
+}
+
+// A single HiDPI output renders its region at its scale: a 64-logical window is
+// composited to 128 physical pixels. The discriminating pixel is at 100,100,
+// inside the window only because it draws at 2x (it would be the clear colour at
+// 1x, where the window ends at 64). This proves the scale flows all the way
+// through to the pixels, not just the wl_output advertisement, the same headless
+// readback the single-scale region tests use.
+#[test]
+fn a_hidpi_output_renders_its_region_at_scale() {
+    let _ = runtime_dir();
+    let mut comp = Compositor::new().expect("start compositor");
+    let path = runtime_dir().join(comp.socket_name());
+
+    // One scale-2 monitor at the origin; its mode is OW x OH physical pixels.
+    let out = comp.add_output("HIDPI", OW, OH, 2, 0, 0);
+
+    let (ready_rx, quit_tx, client) = spawn_window(path);
+    pump_until(&mut comp, &ready_rx, "buffer commit");
+    for _ in 0..3 {
+        comp.dispatch(Some(Duration::from_millis(20))).unwrap();
+    }
+
+    let f = comp.render_output(out).expect("render hidpi");
+    // The readback is the full physical mode of the output.
+    assert_eq!(f.width as i32, OW);
+    assert_eq!(f.height as i32, OH);
+    assert_eq!(
+        f.argb(10, 10),
+        MAGENTA,
+        "the window is present at the top-left"
+    );
+    assert_eq!(
+        f.argb(100, 100),
+        MAGENTA,
+        "the window is drawn at 2x: 100,100 falls inside its 128px extent (clear at 1x)"
+    );
+    assert_eq!(
+        f.argb(160, 160),
+        BLACK,
+        "past the 2x-scaled window is the clear colour"
+    );
+
+    quit_tx.send(()).unwrap();
+    client.join().unwrap();
 }
 
 // Connect a client, bind every wl_output, map a WIN x WIN window at the scene
@@ -343,8 +438,8 @@ fn probe(path: PathBuf) -> Summary {
     // both have landed, bounded so a missing event fails the assertion, not hangs.
     for _ in 0..30 {
         queue.roundtrip(&mut app).unwrap();
-        let outputs_ready =
-            app.info.len() == app.bound.len() && app.info.values().all(|i| i.w > 0 && i.h > 0);
+        let outputs_ready = app.info.len() == app.bound.len()
+            && app.info.values().all(|i| i.w > 0 && i.h > 0 && i.scale > 0);
         if outputs_ready && !app.entered.is_empty() {
             break;
         }
@@ -365,13 +460,16 @@ fn probe(path: PathBuf) -> Summary {
 }
 
 // One advertised monitor as a client sees it: its logical position (the
-// `wl_output.geometry` x/y) and its current mode size (the `wl_output.mode` w/h).
+// `wl_output.geometry` x/y), its current mode size in physical pixels (the
+// `wl_output.mode` w/h), and its integer scale (the `wl_output.scale` factor),
+// from which a client derives the logical size mode/scale.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct OutInfo {
     x: i32,
     y: i32,
     w: i32,
     h: i32,
+    scale: i32,
 }
 
 // The client's view after probing: every `wl_output` it enumerated, and the
@@ -468,6 +566,11 @@ impl Dispatch<WlOutput, u32> for App {
                     info.w = width;
                     info.h = height;
                 }
+            }
+            // The integer scale the compositor derived for this monitor; a HiDPI
+            // output reports 2, an ordinary one 1.
+            wl_output::Event::Scale { factor } => {
+                info.scale = factor;
             }
             _ => {}
         }

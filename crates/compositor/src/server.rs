@@ -729,17 +729,31 @@ impl Compositor {
         )
     }
 
-    /// Place an output of the given mode at logical position `(x, y)` in the one
-    /// shared desktop space and return a handle to it. This is the headless way to
-    /// build a multi-monitor arrangement: each added output owns its region, so a
-    /// window at a logical position shows on whichever output covers it and each
-    /// reads back only its own slice (the same per-output rendering the DRM backend
-    /// scans out from real connectors). The output advertises its own `wl_output`
-    /// global at this logical position and mode, so a client enumerates it as a
-    /// distinct monitor; the first added output retires the default placeholder
-    /// global so clients see the real monitors, not a phantom.
+    /// Place an output of the given mode and integer `scale` at logical position
+    /// `(x, y)` in the one shared desktop space and return a handle to it. This is
+    /// the headless way to build a multi-monitor arrangement: each added output
+    /// owns its region, so a window at a logical position shows on whichever output
+    /// covers it and each reads back only its own slice (the same per-output
+    /// rendering the DRM backend scans out from real connectors). The output
+    /// advertises its own `wl_output` global at this logical position, mode, and
+    /// scale, so a client enumerates it as a distinct monitor and reads its scale;
+    /// the first added output retires the default placeholder global so clients see
+    /// the real monitors, not a phantom.
+    ///
+    /// `width` and `height` are the mode in physical pixels; at `scale` 2 the
+    /// monitor occupies half that in the logical space the windows live in, so a
+    /// HiDPI output renders its region at 2x (the test mirror of what the DRM
+    /// backend derives per connector). A `scale` below 1 is clamped to 1.
     #[cfg(feature = "render")]
-    pub fn add_output(&mut self, name: &str, width: i32, height: i32, x: i32, y: i32) -> OutputId {
+    pub fn add_output(
+        &mut self,
+        name: &str,
+        width: i32,
+        height: i32,
+        scale: i32,
+        x: i32,
+        y: i32,
+    ) -> OutputId {
         let output = Output::new(
             name.to_string(),
             PhysicalProperties {
@@ -756,7 +770,7 @@ impl Compositor {
         output.change_current_state(
             Some(mode),
             Some(Transform::Normal),
-            Some(Scale::Integer(1)),
+            Some(Scale::Integer(scale.max(1))),
             Some((x, y).into()),
         );
         output.set_preferred(mode);

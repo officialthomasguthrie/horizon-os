@@ -160,22 +160,35 @@ where
     }
 }
 
-// Composite a precomputed element list into the bound framebuffer: clear to
-// `clear`, draw the shell background behind everything, then the windows over it.
-// Generic over the renderer so the headless (pixman) and on-screen (GLES) paths
-// run the same compositing. `transform` is the output transform the backend needs
-// (none for a top-left offscreen buffer, a flip for a GL window). The elements are
-// passed in so the caller chooses the scene: the whole space from the origin
-// ([`space_render_elements`], the single-output paths) or one output's region
-// ([`output_render_elements`], multi-monitor). The DRM/KMS backend does not call
-// this: its `DrmOutput` clears and draws its own element list.
+// How to paint one frame, distinct from its content (the elements and the
+// background): the target's physical size, the output scale the elements were
+// built at, the output transform, and the clear colour. `scale` matters because a
+// surface element is sized by the scale it is drawn with, so it must match the
+// scale the collector built the elements at, else a HiDPI window would size wrong;
+// it is 1 for the single-output paths and the output's own scale for the
+// per-output one.
+struct FrameTarget {
+    size: Size<i32, Physical>,
+    scale: f64,
+    transform: Transform,
+    clear: Color32F,
+}
+
+// Composite a precomputed element list into the bound framebuffer: clear to the
+// target's colour, draw the shell background behind everything, then the windows
+// over it. Generic over the renderer so the headless (pixman) and on-screen (GLES)
+// paths run the same compositing. The target's transform is the output transform
+// the backend needs (none for a top-left offscreen buffer, a flip for a GL
+// window). The elements are passed in so the caller chooses the scene: the whole
+// space from the origin ([`space_render_elements`], the single-output paths) or
+// one output's region ([`output_render_elements`], multi-monitor). The DRM/KMS
+// backend does not call this: its `DrmOutput` clears and draws its own element
+// list.
 fn composite<'buffer, R>(
     renderer: &mut R,
     framebuffer: &mut R::Framebuffer<'buffer>,
     elements: &[WaylandSurfaceRenderElement<R>],
-    size: Size<i32, Physical>,
-    transform: Transform,
-    clear: Color32F,
+    target: &FrameTarget,
     background: Option<&ShellBackground>,
 ) -> Result<()>
 where
@@ -198,12 +211,12 @@ where
         None => None,
     };
 
-    let full = Rectangle::from_size(size);
+    let full = Rectangle::from_size(target.size);
     let mut frame = renderer
-        .render(framebuffer, size, transform)
+        .render(framebuffer, target.size, target.transform)
         .map_err(|e| Error::Render(e.to_string()))?;
     frame
-        .clear(clear, &[full])
+        .clear(target.clear, &[full])
         .map_err(|e| Error::Render(e.to_string()))?;
     // The background sits behind the windows: drawn first, into the cleared
     // frame, with the buffer in its natural (top-left) orientation; the frame's
@@ -222,7 +235,7 @@ where
             )
             .map_err(|e| Error::Render(e.to_string()))?;
     }
-    draw_render_elements(&mut frame, 1.0, elements, &[full])
+    draw_render_elements(&mut frame, target.scale, elements, &[full])
         .map_err(|e| Error::Render(e.to_string()))?;
     // The returned sync point is awaited by the caller's present (winit) or is
     // already signalled for synchronous software rendering (pixman).
@@ -249,15 +262,15 @@ where
     R::TextureId: Clone + 'static,
 {
     let elements = space_render_elements(renderer, space);
-    composite(
-        renderer,
-        framebuffer,
-        &elements,
+    // The nested window presents the default output at scale 1, matching the scale
+    // the whole-space elements are built at.
+    let target = FrameTarget {
         size,
+        scale: 1.0,
         transform,
         clear,
-        background,
-    )
+    };
+    composite(renderer, framebuffer, &elements, &target, background)
 }
 
 // Composite an offscreen Argb8888 buffer of `size` and read it back, the headless
@@ -265,10 +278,13 @@ where
 // buffer import is a memcpy, cheap enough for the offscreen path); the on-screen
 // backend holds its renderer across frames instead. The caller supplies the scene
 // as a closure over the renderer, so the same readback serves the whole-space and
-// per-output element collectors. Pixels come back top-left origin (no GL flip), so
-// a readback pixel maps straight to its scene coordinate.
+// per-output element collectors, and `scale` (the output scale the closure built
+// the elements at) is forwarded to the draw so a HiDPI output's window is sized to
+// match. Pixels come back top-left origin (no GL flip), so a readback pixel maps
+// straight to its scene coordinate.
 fn read_back<F>(
     size: Size<i32, Physical>,
+    scale: f64,
     background: Option<&ShellBackground>,
     scene: F,
 ) -> Result<RenderedFrame>
@@ -293,13 +309,17 @@ where
     let mut framebuffer = renderer
         .bind(&mut target)
         .map_err(|e| Error::Render(e.to_string()))?;
+    let target = FrameTarget {
+        size,
+        scale,
+        transform: Transform::Normal,
+        clear: Color32F::new(0.0, 0.0, 0.0, 1.0),
+    };
     composite(
         &mut renderer,
         &mut framebuffer,
         &elements,
-        size,
-        Transform::Normal,
-        Color32F::new(0.0, 0.0, 0.0, 1.0),
+        &target,
         background,
     )?;
 
@@ -333,7 +353,9 @@ pub(crate) fn render_space(
     output: &Output,
     background: Option<&ShellBackground>,
 ) -> Result<RenderedFrame> {
-    read_back(output_size(output)?, background, |renderer| {
+    // The whole-space collector builds elements at scale 1, so draw at 1 too; this
+    // path serves the default output, which is always scale 1.
+    read_back(output_size(output)?, 1.0, background, |renderer| {
         space_render_elements(renderer, space)
     })
 }
@@ -350,7 +372,10 @@ pub(crate) fn render_output(
     output: &Output,
     background: Option<&ShellBackground>,
 ) -> Result<RenderedFrame> {
-    read_back(output_size(output)?, background, |renderer| {
+    // The per-output collector builds elements at this output's scale, so the draw
+    // must use the same scale or a HiDPI window would be sized wrong.
+    let scale = output.current_scale().fractional_scale();
+    read_back(output_size(output)?, scale, background, |renderer| {
         output_render_elements(renderer, space, output)
     })
 }

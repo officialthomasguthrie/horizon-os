@@ -41,6 +41,42 @@ pub fn span(sizes: &[(i32, i32)]) -> (i32, i32) {
     (width, height)
 }
 
+// The pixel density at or above which a monitor is treated as HiDPI and given an
+// integer scale of 2. Roughly double the classic 96 DPI desktop baseline, the
+// same line mutter has used to auto-pick 2x.
+const HIDPI_DPI: f64 = 192.0;
+
+/// The integer output scale to advertise for a monitor whose current mode is
+/// `mode` pixels on a panel measuring `physical_mm`, a simple density heuristic:
+/// 2 for a high-density panel, 1 otherwise. The scale divides the physical mode
+/// into the logical size the desktop lays out in (a 3840x2160 panel at scale 2
+/// occupies 1920x1080 of logical space) and is what a client reads from
+/// `wl_output.scale` to render crisply.
+///
+/// A non-positive mode or an unknown physical size (a monitor that reports no
+/// EDID dimensions, common enough) cannot be reasoned about, so it stays at 1
+/// rather than guess. Only integer scales are derived: the 150-190 DPI middle
+/// ground (a 27-inch 4K, say) really wants fractional scaling, which needs the
+/// fractional-scale protocol and is a later refinement. Pure integer-and-float
+/// math, no Wayland types, so the DRM backend's per-connector choice is
+/// unit-tested with no display, like the rest of this module.
+pub fn scale_for(mode: (i32, i32), physical_mm: (i32, i32)) -> i32 {
+    let (w, h) = mode;
+    let (mm_w, mm_h) = physical_mm;
+    if w <= 0 || h <= 0 || mm_w <= 0 || mm_h <= 0 {
+        return 1;
+    }
+    // Density along the diagonal, so the ratio is independent of aspect.
+    let px_diag = ((w as f64).powi(2) + (h as f64).powi(2)).sqrt();
+    let in_diag = ((mm_w as f64).powi(2) + (mm_h as f64).powi(2)).sqrt() / 25.4;
+    let dpi = px_diag / in_diag;
+    if dpi >= HIDPI_DPI {
+        2
+    } else {
+        1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,5 +117,35 @@ mod tests {
         let sizes = [(0, 0), (1024, 768)];
         assert_eq!(arrange(&sizes), vec![(0, 0), (0, 0)]);
         assert_eq!(span(&sizes), (1024, 768));
+    }
+
+    #[test]
+    fn ordinary_desktop_monitors_stay_at_scale_1() {
+        // 1080p on a 24-inch panel (~92 DPI) and 1440p on a 27-inch (~109 DPI):
+        // both well under the HiDPI line.
+        assert_eq!(scale_for((1920, 1080), (531, 299)), 1);
+        assert_eq!(scale_for((2560, 1440), (597, 336)), 1);
+    }
+
+    #[test]
+    fn high_density_panels_get_scale_2() {
+        // A 4K 15.6-inch laptop panel (~283 DPI) and a 5K 27-inch (~218 DPI).
+        assert_eq!(scale_for((3840, 2160), (344, 194)), 2);
+        assert_eq!(scale_for((5120, 2880), (597, 336)), 2);
+    }
+
+    #[test]
+    fn a_27_inch_4k_stays_integer_1_until_fractional_scaling() {
+        // ~163 DPI sits in the middle ground that wants 1.5x; with only integer
+        // scales derived it stays 1 rather than jumping to a too-large 2.
+        assert_eq!(scale_for((3840, 2160), (597, 336)), 1);
+    }
+
+    #[test]
+    fn an_unknown_physical_size_stays_at_scale_1() {
+        // A monitor that reports no EDID dimensions cannot have its density
+        // computed, so it is left at 1 rather than guessed.
+        assert_eq!(scale_for((3840, 2160), (0, 0)), 1);
+        assert_eq!(scale_for((0, 0), (340, 190)), 1);
     }
 }
