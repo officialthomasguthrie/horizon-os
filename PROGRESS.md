@@ -718,6 +718,39 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   secondary GPU, are the remaining multi-monitor and DRM gaps. The headless client
   test runs in the Linux container under `render`; the DRM half is compile-checked
   under `udev`.
+- Phase 3 compositor per-output scale (`compositor`, Linux): each output carries
+  its own integer scale, the last multi-monitor gap after the logical layout and
+  the per-monitor `wl_output` globals. A HiDPI monitor is advertised to clients at
+  scale 2 on its `wl_output`, renders its region at 2x, and occupies half its pixel
+  size in the shared logical space, instead of every output being pinned to scale
+  1. The DRM backend derives a scale per connector from the panel's pixel density
+  (`layout::scale_for`, a pure DPI heuristic: 2x at or above ~192 DPI, double the
+  classic 96 DPI baseline, and 1x for an unknown EDID size or the 150-190 DPI middle
+  ground a 27-inch 4K sits in, which wants the fractional-scale protocol still to
+  come), advertises it on that connector's `wl_output`, and lays outputs out by
+  their logical size (mode / scale) so a 4K-at-2x monitor takes 1920 not 3840 of
+  layout width and the next monitor abuts it with no gap; the cursor span is logical
+  too. Rendering already read `output.current_scale()` to crop each output's region;
+  the missing half was the draw scale: a surface element is sized by the scale it is
+  drawn with, so the offscreen `composite` had to draw at the output scale, not a
+  hardcoded 1, or a HiDPI window composited at 1x into a 2x framebuffer. The frame's
+  size, scale, transform, and clear are now one `FrameTarget`, the per-output
+  readback passing the output scale and the single-output winit/`render_space` paths
+  passing 1 (the default output is always scale 1). On the usual headless split the
+  whole client-visible behavior is proven without a display: a new test places an
+  ordinary and a HiDPI output and a client reads scale 1 off the first and 2 off the
+  second (each still advertising its full pixel mode, the client deriving the
+  logical size mode/scale), and a second test renders a scale-2 output's region and
+  asserts the 64-logical window composited to 128 physical pixels (magenta at
+  100,100, which would be the clear colour at 1x), so the scale flows all the way to
+  the pixels, not just the advertisement. The `scale_for` heuristic is pure
+  integer-and-float math, unit-tested on darwin (ordinary desktop monitors stay 1,
+  high-density panels get 2, a 27-inch 4K stays 1 until fractional scaling, an
+  unknown physical size stays 1). The DRM half (deriving the scale, advertising it,
+  the logical layout) is compile-checked and clippy-clean under `udev` and
+  eye-verified on hardware next. This closes the multi-monitor work; the one
+  remaining DRM gap is a display-only secondary GPU (cross-GPU scanout). The
+  headless client and render tests run in the Linux container under `render`.
 
 ## Next
 
@@ -744,14 +777,20 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   region instead of mirroring the whole scene, hotplug-aware, with the cursor
   spanning all screens, proven headlessly (a pure layout plus per-output region
   rendering, read back through the software renderer with an id-based output API) and
-  eye-verified on hardware next; what is left on the backend is the display-only
+  eye-verified on hardware next; the one gap left on the backend is the display-only
   secondary GPU (render on one card, scan out on another, the one cross-GPU case shm
-  sidesteps) and per-output scale. Advertising each output to clients as its own
-  `wl_output` global is now done: every output placed in the shared space (a headless
-  `add_output` monitor or a real DRM connector) carries its own global at its logical
-  position and mode, the phantom placeholder retired while any real monitor exists,
-  proven headlessly by a client that enumerates one `wl_output` per monitor and a
-  window that enters only the output it covers. The shell proper has started: the
+  sidesteps). Advertising each output to clients as its own `wl_output` global is now
+  done: every output placed in the shared space (a headless `add_output` monitor or a
+  real DRM connector) carries its own global at its logical position, mode, and scale,
+  the phantom placeholder retired while any real monitor exists, proven headlessly by
+  a client that enumerates one `wl_output` per monitor and a window that enters only
+  the output it covers. Per-output scale, the last multi-monitor gap, is now done too:
+  each output carries its own integer scale (the DRM backend derives it per connector
+  from the panel's pixel density via `layout::scale_for`), advertised on its
+  `wl_output`, applied in rendering (a HiDPI output renders its region at 2x), and
+  used to lay outputs out by their logical size mode/scale so the screens abut with no
+  gap; proven headlessly by a client reading scale 1 and 2 off two monitors and a
+  scale-2 output compositing a window at 2x. The shell proper has started: the
   compositor now draws a full-screen background (the Glass L5 desktop, a pure Model
   -> Scene -> Pixmap renderer in the `glass` crate) behind client windows, proven on
   the headless pixman path and wired into the winit backend, with `horizon compositor
