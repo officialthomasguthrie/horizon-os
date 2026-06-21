@@ -751,6 +751,34 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   eye-verified on hardware next. This closes the multi-monitor work; the one
   remaining DRM gap is a display-only secondary GPU (cross-GPU scanout). The
   headless client and render tests run in the Linux container under `render`.
+- Phase 3 compositor cross-GPU scanout (`compositor` `udev` feature, Linux): a
+  display-only secondary GPU, render on one card and scan out on another, the last
+  remaining DRM gap after the multi-monitor work. Until now each output composited
+  on whichever GPU drove it, which works only while that GPU can render; a card
+  wired to a monitor but not rendered on (a hybrid laptop's iGPU, a second GPU, a
+  USB display) had no path to the screen. Now every output is composited on the
+  primary GPU: one whose own GPU is the primary scans out straight from it
+  (`GpuManager::single_renderer`, no copy, so the single-GPU and primary-monitor
+  case is unchanged), while one driven by any other GPU is rendered on the primary
+  and its finished frame copied across to that GPU for scanout
+  (`GpuManager::renderer(primary, target, copy_format)`, the `MultiRenderer` doing
+  the dma-or-CPU copy) in the surface's own scanout format (`DrmOutput::format`). The
+  renderer is chosen per surface because the copy target and the format are per
+  output. Because client buffers are shm (CPU), only the one composited frame ever
+  crosses the GPU boundary, never per-window buffers, so the cross-GPU path stays a
+  single copy and needs no per-surface early-import. The frame is the same
+  `output_render_elements` (one output's region of the shared logical space) the
+  headless render test asserts on, so only the renderer selection is new logic. A
+  card that exposes a usable render node (the hybrid-graphics and second-GPU cases)
+  is covered; one with no GL/EGL at all cannot be a copy target and is the remaining
+  edge, rare in practice. Same split as the rest of the DRM backend: compile-checked
+  and clippy-clean under `udev` in CI, eye-verified on real two-GPU hardware next (a
+  single host with two GPUs is the one thing CI and the container lack, the part
+  headless cannot prove), while the compositing it reuses is already headless-tested.
+  This closes the multi-monitor and DRM-backend gaps; the Phase 3 compositor backend
+  is now feature-complete on the headless-buildable split, with only the on-hardware
+  eye-verify left. Built and compile-checked from the Linux container on this
+  display-less darwin host.
 
 ## Next
 
@@ -777,9 +805,7 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   region instead of mirroring the whole scene, hotplug-aware, with the cursor
   spanning all screens, proven headlessly (a pure layout plus per-output region
   rendering, read back through the software renderer with an id-based output API) and
-  eye-verified on hardware next; the one gap left on the backend is the display-only
-  secondary GPU (render on one card, scan out on another, the one cross-GPU case shm
-  sidesteps). Advertising each output to clients as its own `wl_output` global is now
+  eye-verified on hardware next. Advertising each output to clients as its own `wl_output` global is now
   done: every output placed in the shared space (a headless `add_output` monitor or a
   real DRM connector) carries its own global at its logical position, mode, and scale,
   the phantom placeholder retired while any real monitor exists, proven headlessly by
@@ -790,7 +816,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `wl_output`, applied in rendering (a HiDPI output renders its region at 2x), and
   used to lay outputs out by their logical size mode/scale so the screens abut with no
   gap; proven headlessly by a client reading scale 1 and 2 off two monitors and a
-  scale-2 output compositing a window at 2x. The shell proper has started: the
+  scale-2 output compositing a window at 2x. Cross-GPU scanout, the last DRM-backend
+  gap, is now done too: every output is composited on the primary GPU and one driven
+  by any other GPU has its finished frame copied across to that GPU for scanout
+  (`single_renderer` for the primary's own outputs, `GpuManager::renderer(primary,
+  target, format)` for the rest), so a display-only secondary GPU (a hybrid laptop's
+  iGPU, a second card) now lights its monitor; shm client buffers mean only the one
+  composited frame crosses the GPU boundary. This makes the Phase 3 compositor backend
+  feature-complete on the headless-buildable split, leaving only the on-hardware
+  eye-verify. The shell proper has started: the
   compositor now draws a full-screen background (the Glass L5 desktop, a pure Model
   -> Scene -> Pixmap renderer in the `glass` crate) behind client windows, proven on
   the headless pixman path and wired into the winit backend, with `horizon compositor
