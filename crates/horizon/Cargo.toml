@@ -20,6 +20,11 @@ compositor-winit = ["compositor/winit", "compositor-render"]
 # display directly off the GPU. Off by default so the standard binary does not
 # link libdrm/libgbm/libinput/libseat/libudev.
 compositor-udev = ["compositor/udev", "compositor-render"]
+# Build the real USB-HID FIDO2 authenticator into the identity commands, so
+# `horizon identity ... --fido2` unlocks with a security key. Off by default so the
+# standard binary stays free of the FIDO2/HID stack; the software-token path always
+# works. Linux.
+identity-fido2 = ["identity/fido2"]
 
 [dependencies]
 lifestream = { path = "../lifestream" }
@@ -27,6 +32,7 @@ weave = { path = "../weave" }
 glass = { path = "../glass" }
 constellation = { path = "../constellation" }
 reconstitution = { path = "../reconstitution" }
+identity = { path = "../identity" }
 cells = { path = "../cells" }
 compositor = { path = "../compositor" }
 clap.workspace = true
@@ -38,6 +44,7 @@ rand.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
-# The confined-client cell tests bind a throwaway socket and connect to it.
-[target.'cfg(target_os = "linux")'.dev-dependencies]
+# tempfile backs the confined-client cell tests (a throwaway socket) and the
+# identity tests (a throwaway store).
+[dev-dependencies]
 tempfile.workspace = true

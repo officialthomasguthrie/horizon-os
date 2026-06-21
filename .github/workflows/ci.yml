@@ -54,3 +54,11 @@ jobs:
       # despite the empty network namespace. Needs the userns knob set above.
       - run: cargo clippy -p horizon --all-targets --features compositor-winit -- -D warnings
       - run: cargo test -p horizon --features compositor-winit
+      # The identity crate's real FIDO2 authenticator (the `fido2` feature) talks to
+      # a USB security key, verified on real hardware, not here, but it must keep
+      # compiling. It statically builds hidapi's hidraw backend, which links libudev
+      # (installed above); no new system package. clippy compiles, so this also
+      # build-checks the crate and the `horizon identity ... --fido2` path. The
+      # portable keyslot core (the default build) is tested by `cargo test --all`.
+      - run: cargo clippy -p identity --all-targets --features fido2 -- -D warnings
+      - run: cargo clippy -p horizon --all-targets --features identity-fido2 -- -D warnings

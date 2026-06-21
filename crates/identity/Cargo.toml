@@ -1,0 +1,28 @@
+[package]
+name = "identity"
+description = "Horizon identity: FIDO2 keyslots that unlock the master key, k-of-n recovery re-enrollment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[features]
+# The real USB-HID FIDO2 authenticator (CTAP2 hmac-secret). Linux only and off by
+# default, so the portable core builds and tests everywhere with no device and no
+# extra system libraries, the same split the compositor's display backends use.
+# ctap-hid-fido2 statically builds hidapi's hidraw backend, which links libudev
+# (already present for the compositor's udev feature); no new system package.
+fido2 = ["dep:ctap-hid-fido2"]
+
+[dependencies]
+blake3.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+# Optional and only compiled under the `fido2` feature (enabled on Linux). Declared
+# unconditionally so the feature's `dep:` link resolves on every host; the default
+# build never compiles it.
+ctap-hid-fido2 = { version = "3.5", optional = true }

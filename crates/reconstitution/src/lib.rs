@@ -16,7 +16,8 @@
 //! without a passphrase wrap.
 //!
 //! This crate is the portable core. Wiring shares to FIDO2 re-enrollment and the
-//! boot-time unlock path is Linux work and lives elsewhere.
+//! unlock path lives in the `identity` crate, which seals the same master a
+//! recovered set rebuilds into a security-key keyslot.
 
 mod error;
 mod gf;

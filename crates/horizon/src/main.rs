@@ -51,6 +51,11 @@ enum Cmd {
         #[command(subcommand)]
         op: ReconOp,
     },
+    /// Unlock a store with a FIDO2 security key (or software token) instead of the passphrase
+    Identity {
+        #[command(subcommand)]
+        op: IdentityOp,
+    },
     /// Replicate over the network to another device of the same identity
     Constellation {
         #[command(subcommand)]
@@ -212,6 +217,42 @@ enum ReconOp {
 }
 
 #[derive(Subcommand)]
+enum IdentityOp {
+    /// Enroll a security key (or software token) that can unlock this store
+    Enroll {
+        store: PathBuf,
+        /// Path to a 32-byte software token file (created if absent). The token is
+        /// "something you have"; keep it safe, it unlocks the store.
+        #[arg(long)]
+        token: Option<PathBuf>,
+        /// Use a connected USB FIDO2 security key instead of a software token
+        #[arg(long)]
+        fido2: bool,
+    },
+    /// Unlock this store with an enrolled key, falling back to the passphrase
+    Unlock {
+        store: PathBuf,
+        #[arg(long)]
+        token: Option<PathBuf>,
+        #[arg(long)]
+        fido2: bool,
+    },
+    /// Recover from k recovery shares and enroll a fresh key, for a lost device
+    Reenroll {
+        store: PathBuf,
+        /// A recovery share in hex; pass --share once per share
+        #[arg(long = "share", required = true)]
+        shares: Vec<String>,
+        #[arg(long)]
+        token: Option<PathBuf>,
+        #[arg(long)]
+        fido2: bool,
+    },
+    /// List the keyslots enrolled for this store
+    List { store: PathBuf },
+}
+
+#[derive(Subcommand)]
 enum LsOp {
     /// Create a new store
     Init { store: PathBuf },
@@ -329,6 +370,7 @@ fn main() -> Result<()> {
         Cmd::Glass { op } => glass_cmd(op),
         Cmd::Sync { from, to, both } => sync_cmd(from, to, both),
         Cmd::Reconstitute { op } => recon_cmd(op),
+        Cmd::Identity { op } => identity_cmd(op),
         Cmd::Constellation { op } => constellation_cmd(op),
         Cmd::Cell { op } => cell_cmd(op),
         Cmd::Compositor { op } => compositor_cmd(op),
@@ -1834,6 +1876,214 @@ fn recon_cmd(op: ReconOp) -> Result<()> {
     Ok(())
 }
 
+// Identity. A store's master key (Argon2id from the passphrase, the same key
+// `reconstitute` splits) can also be unlocked by a FIDO2 security key or a software
+// token: `enroll` seals the master in a keyslot the device can reopen, `unlock`
+// reopens it (the boot path, the passphrase as fallback), and `reenroll` rebuilds
+// the master from recovery shares and seals it for a fresh device, the way back in
+// when a key is lost. Keyslots live in the store's `keyslots` file and are additive:
+// enrolling one changes nothing else about the store.
+fn identity_cmd(op: IdentityOp) -> Result<()> {
+    match op {
+        IdentityOp::Enroll {
+            store,
+            token,
+            fido2,
+        } => {
+            // The master from the passphrase, confirmed by opening the store, so a
+            // keyslot is never cut from a key that does not open it.
+            let key = master_key(&store)?;
+            Lifestream::open(&store, &key).context("open store (wrong passphrase?)")?;
+            let mut auth = make_authenticator(token, fido2, true)?;
+            let slot = identity::enroll(&mut *auth, &key).map_err(|e| anyhow!("{e}"))?;
+            let mut slots = load_keyslots(&store)?;
+            slots.add(slot);
+            save_keyslots(&store, &slots)?;
+            println!(
+                "enrolled; {} keyslot(s) now unlock {}",
+                slots.len(),
+                store.display()
+            );
+        }
+        IdentityOp::Unlock {
+            store,
+            token,
+            fido2,
+        } => {
+            let slots = load_keyslots(&store)?;
+            let key = if !slots.is_empty() && (token.is_some() || fido2) {
+                let mut auth = make_authenticator(token, fido2, false)?;
+                match slots.unlock_any(&mut *auth) {
+                    Ok(key) => {
+                        eprintln!(
+                            "unlocked with {}",
+                            if fido2 { "security key" } else { "token" }
+                        );
+                        key
+                    }
+                    Err(_) => {
+                        eprintln!("no enrolled keyslot matched; falling back to passphrase");
+                        master_key(&store)?
+                    }
+                }
+            } else {
+                if slots.is_empty() {
+                    eprintln!("no keyslots enrolled; using passphrase");
+                }
+                master_key(&store)?
+            };
+            let ls = Lifestream::open(&store, &key).context("open store with unlocked key")?;
+            // Decrypt HEAD to prove the key really is this store's.
+            if let Some(h) = ls.head()? {
+                ls.get(&h)
+                    .context("unlocked key did not decrypt the store")?;
+            }
+            println!("unlocked {}", store.display());
+            println!("objects: {}", ls.object_count()?);
+            match ls.head()? {
+                Some(h) => println!("head:    {h}"),
+                None => println!("head:    none"),
+            }
+        }
+        IdentityOp::Reenroll {
+            store,
+            shares,
+            token,
+            fido2,
+        } => {
+            let parsed = shares
+                .iter()
+                .map(|s| Share::from_hex(s).map_err(|e| anyhow!("bad share: {e}")))
+                .collect::<Result<Vec<_>>>()?;
+            let recovered = reconstitution::combine(&parsed).map_err(|e| anyhow!("{e}"))?;
+            let key: [u8; 32] = recovered
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("recovered secret is not a 32-byte key"))?;
+            // Prove the rebuilt key opens this store before enrolling against it.
+            let ls = Lifestream::open(&store, &key).context("open store with recovered key")?;
+            if let Some(h) = ls.head()? {
+                ls.get(&h)
+                    .context("recovered key did not decrypt the store")?;
+            }
+            let mut auth = make_authenticator(token, fido2, true)?;
+            let slot = identity::enroll(&mut *auth, &key).map_err(|e| anyhow!("{e}"))?;
+            let mut slots = load_keyslots(&store)?;
+            slots.add(slot);
+            save_keyslots(&store, &slots)?;
+            println!(
+                "recovered and enrolled a new key; {} keyslot(s) now unlock {}",
+                slots.len(),
+                store.display()
+            );
+        }
+        IdentityOp::List { store } => {
+            let slots = load_keyslots(&store)?;
+            println!(
+                "{} keyslot(s) enrolled for {}",
+                slots.len(),
+                store.display()
+            );
+            for (i, slot) in slots.slots().iter().enumerate() {
+                let id = &slot.credential().0;
+                let prefix: String = id.iter().take(8).map(|b| format!("{b:02x}")).collect();
+                println!("  [{i}] credential {prefix} ({} bytes)", id.len());
+            }
+        }
+    }
+    Ok(())
+}
+
+// The store's keyslot file, empty if none has been enrolled yet.
+fn load_keyslots(store: &Path) -> Result<identity::Keyslots> {
+    let path = store.join("keyslots");
+    match std::fs::read(&path) {
+        Ok(bytes) => identity::Keyslots::decode(&bytes).map_err(|e| anyhow!("read keyslots: {e}")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(identity::Keyslots::new()),
+        Err(e) => Err(anyhow!("read keyslots: {e}")),
+    }
+}
+
+fn save_keyslots(store: &Path, slots: &identity::Keyslots) -> Result<()> {
+    std::fs::write(store.join("keyslots"), slots.encode()).context("write keyslots")
+}
+
+// Build the authenticator the identity commands act through: a real USB FIDO2 key
+// (--fido2, only in a build with that support) or a software token from a file.
+fn make_authenticator(
+    token: Option<PathBuf>,
+    fido2: bool,
+    create: bool,
+) -> Result<Box<dyn identity::Authenticator>> {
+    if fido2 {
+        #[cfg(feature = "identity-fido2")]
+        {
+            let key = identity::HardwareKey::open(fido2_pin())
+                .map_err(|e| anyhow!("open security key: {e}"))?;
+            return Ok(Box::new(key));
+        }
+        #[cfg(not(feature = "identity-fido2"))]
+        {
+            return Err(anyhow!(
+                "this build has no FIDO2 support (rebuild with --features identity-fido2)"
+            ));
+        }
+    }
+    let path = token
+        .ok_or_else(|| anyhow!("pass --token <file> (or --fido2 in a build with FIDO2 support)"))?;
+    let seed = load_or_create_token(&path, create)?;
+    Ok(Box::new(identity::SoftwareAuthenticator::new(seed)))
+}
+
+// Read a 32-byte software token, or, when enrolling, create one if it is absent so
+// the holder ends up with a token file. The seed is the secret a software token
+// holds, so it is kept out of the store.
+fn load_or_create_token(path: &Path, create: bool) -> Result<[u8; 32]> {
+    use rand::RngCore;
+    match std::fs::read(path) {
+        Ok(bytes) => bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("token file {} is not 32 bytes", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound && create => {
+            let mut seed = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut seed);
+            std::fs::write(path, seed)
+                .with_context(|| format!("write token {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            eprintln!(
+                "wrote a new software token to {} (keep it safe, it unlocks this store)",
+                path.display()
+            );
+            Ok(seed)
+        }
+        Err(e) => Err(anyhow!("read token {}: {e}", path.display())),
+    }
+}
+
+// The FIDO2 device PIN, from the environment or prompted; None if the key needs no
+// user verification.
+#[cfg(feature = "identity-fido2")]
+fn fido2_pin() -> Option<String> {
+    if let Ok(p) = std::env::var("HORIZON_FIDO2_PIN") {
+        return Some(p);
+    }
+    eprint!("security key PIN (blank if none): ");
+    io::stderr().flush().ok();
+    let mut s = String::new();
+    if io::stdin().read_line(&mut s).is_ok() {
+        let p = s.trim_end().to_string();
+        if !p.is_empty() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn print_audit(b: &Broker) -> Result<()> {
     for e in b.audit()? {
         println!(
@@ -1969,6 +2219,60 @@ fn derive(pass: &str, salt: &[u8]) -> [u8; 32] {
 // pure and assertable here without a screen; only the client actually mapping a
 // window needs one. The connect test proves the harder claim, that the empty net
 // namespace still reaches the display, by connecting through the bound socket.
+// The identity story at the store level, cross-platform so it runs in the default
+// test suite on every host: enroll a token, persist and reload the keyslots file,
+// unlock with it, then recover the master from k-of-n shares and enroll a fresh
+// token. Mirrors the identity CLI without the passphrase prompt, and proves the
+// recovered key is the original and opens the store.
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use identity::{enroll, Keyslots, SoftwareAuthenticator};
+
+    #[test]
+    fn enroll_unlock_and_reenroll_from_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let master = [42u8; 32];
+        Lifestream::init(&store, &master).unwrap();
+
+        // Enroll a software token; persist and reload the keyslots from the store.
+        let mut token = SoftwareAuthenticator::new([1u8; 32]);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut token, &master).unwrap());
+        save_keyslots(&store, &slots).unwrap();
+
+        let loaded = load_keyslots(&store).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let unlocked = loaded.unlock_any(&mut token).unwrap();
+        assert_eq!(unlocked, master);
+        // The unlocked key really opens the store.
+        Lifestream::open(&store, &unlocked).unwrap();
+
+        // Lose the token: rebuild the master from 2 of 3 shares, enroll a new one.
+        let shares = reconstitution::split(&master, 2, 3).unwrap();
+        let recovered = reconstitution::combine(&shares[..2]).unwrap();
+        let recovered: [u8; 32] = recovered.try_into().unwrap();
+        assert_eq!(recovered, master);
+
+        let mut new_token = SoftwareAuthenticator::new([2u8; 32]);
+        let mut after_loss = load_keyslots(&store).unwrap();
+        after_loss.add(enroll(&mut new_token, &recovered).unwrap());
+        save_keyslots(&store, &after_loss).unwrap();
+
+        // Both the new and the old token now unlock the store.
+        let final_slots = load_keyslots(&store).unwrap();
+        assert_eq!(final_slots.len(), 2);
+        assert_eq!(final_slots.unlock_any(&mut new_token).unwrap(), master);
+        assert_eq!(final_slots.unlock_any(&mut token).unwrap(), master);
+        Lifestream::open(&store, &final_slots.unlock_any(&mut new_token).unwrap()).unwrap();
+
+        // A token that was never enrolled cannot unlock.
+        let mut stranger = SoftwareAuthenticator::new([9u8; 32]);
+        assert!(final_slots.unlock_any(&mut stranger).is_err());
+    }
+}
+
 #[cfg(all(
     test,
     target_os = "linux",
