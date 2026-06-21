@@ -1,0 +1,33 @@
+[package]
+name = "init"
+description = "Horizon initramfs init: assemble the immutable-base + writable-overlay root and switch_root into horizon boot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "init"
+path = "src/lib.rs"
+
+# The init that becomes PID 1 in the initramfs. The whole boot plan lives in the
+# library (tested with no devices); this binary builds a plan from the kernel
+# command line and runs it.
+[[bin]]
+name = "horizon-init"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+
+# Assembling the root is Linux kernel work (mount, overlayfs, switch_root). On other
+# hosts the crate still compiles (so the workspace builds on darwin) but the executor
+# is absent; the plan and its tests are pure and build everywhere.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["mount", "fs", "process"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
