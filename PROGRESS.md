@@ -944,6 +944,28 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   initialized store, dm-verity over the base, LUKS2 for the writable layer, the
   bootloader, and a QEMU boot of the whole chain. Built and tested on darwin and in the
   Linux container.
+- Phase 0 Key boot keystone (`keybuild` + `init` + `boot`): a complete Horizon Key now
+  boots into its identity on the real image formats, the keystone that ties the three
+  crates together end to end. `keybuild::build_data` adds the persistent data partition,
+  a labeled ext4 image sized per the spec (a new `KeySpec.data_size_mb`); this is the
+  writable side of the Key, where the init lays the overlay upper/work directories and
+  the identity store, so unlike the reproducible base it is mutable state (it shells out
+  to `mkfs.ext4`, as the base shells out to `mksquashfs`). The proof is a gated container
+  integration test exercising the whole pre-boot path on the real formats: it builds both
+  filesystems (a squashfs base, an ext4 data partition), attaches them to loop devices
+  (the base read-only, the data writable, as the init sees the Key's two partitions),
+  initializes an identity store on the data partition the way the boot crate's own tests
+  do (a master derived from a passphrase and salt, a HEAD generation, an enrolled
+  software token), assembles the overlay root through init's Home-mode plan (the squashfs
+  as the read-only lower, the ext4 as the writable backing), binds the store into the new
+  root, and runs `boot::boot` on it, asserting boot finds the carried store, unlocks the
+  master with the token and no passphrase (`Method::Keyslot`), proves HEAD, and that the
+  immutable base's os-release is visible through the assembled root. So "a built Key boots
+  into its identity" is proven for real, short of the switch_root and the on-screen
+  session that need an actual boot; the test skips gracefully where a build tool is absent
+  or mounting is not permitted and tears its loop devices and mounts down on every path.
+  Left next: populating the base with the real userland, dm-verity, LUKS2, the bootloader,
+  and the QEMU boot. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1077,7 +1099,7 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
   the boot unlock core, and the CLI are cross-platform.
 - Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
-  "boots anywhere and remembers" demo. Two steps are done. The init (the `init` crate +
+  "boots anywhere and remembers" demo. Three steps are done. The init (the `init` crate +
   `horizon-init`): the generic initramfs init that assembles the immutable-base +
   writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
   new root, and switch_roots into `horizon boot`, with the policy pure and tested
@@ -1085,13 +1107,15 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   base image (the `keybuild` crate + `horizon-keybuild`): a reproducible squashfs the
   init mounts read-only as the overlay lower, with the build/boot contract (labels, the
   kernel command line) shared with init and the squashfs proven to mount and stack an
-  overlay for real in the container. What is left, in order: populate the base with the
-  real userland (the horizon + horizon-init binaries and their shared libraries, then
-  kernel modules and linux-firmware) so the base actually boots a machine; build the
-  persistent data partition (an ext4 with the overlay upper/work and an initialized
-  identity store) and prove the whole Key assembles and `horizon boot` opens the store
-  on real filesystems (a container loopback integration test, the keystone that ties
-  keybuild + init + boot); dm-verity over the base so the immutable layer is
+  overlay for real in the container. And the Key boot keystone: `keybuild::build_data`
+  adds the ext4 data partition, and a container integration test builds both filesystems,
+  initializes an identity store on the data partition, assembles the overlay root through
+  init's Home-mode plan, and proves `boot::boot` opens the identity with an enrolled token
+  on the real squashfs + ext4 formats, short of the switch_root that needs an actual boot.
+  What is left, in order: populate the base with the real userland (the horizon +
+  horizon-init binaries and their shared libraries, then kernel modules and
+  linux-firmware) so the base actually boots a machine; dm-verity over the base so the
+  immutable layer is
   tamper-evident (a pure-Rust hash tree cross-checked against `veritysetup format`, the
   kernel open eye-verified by booting since this container's kernel lacks
   CONFIG_DM_VERITY); LUKS2 for the Home writable layer and the Ghost read-only store
