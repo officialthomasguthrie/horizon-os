@@ -19,6 +19,13 @@ pub enum Error {
     /// gracefully where the tool is absent (CI) while running for real where it is not.
     #[error("{0} is not installed")]
     Missing(&'static str),
+    /// Requested modules that no file in the kernel's `modules.dep` matches. A base must
+    /// not silently omit a driver it was told to carry, so an unresolved name fails.
+    #[error("modules not found in the kernel's modules.dep: {}", .0.join(", "))]
+    UnknownModules(Vec<String>),
+    /// Modules were requested without naming the kernel version to harvest them from.
+    #[error("a kernel version is required to install modules")]
+    NoKernelVersion,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

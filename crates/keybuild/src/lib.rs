@@ -9,21 +9,27 @@
 //! line, so the two agree by sharing `init`'s types rather than by convention.
 //!
 //! [`build_base`] materializes a minimal base skeleton (the standard mount directories
-//! and an os-release) and, when a spec names userland binaries, populates the real
-//! userland: each binary at `/usr/bin/<name>` together with its shared-library closure
-//! ([`ldd_closure`]) and an `ld.so.cache`, so the base actually runs a program. It then
-//! packs the tree into a reproducible squashfs, so the same inputs yield byte-identical
-//! bytes and the base can be verified by hash. The build shells out to `mksquashfs` (and
-//! `ldd`/`ldconfig` when populating), doing no kernel work itself, so the crate builds
-//! and the pure parts ([`parse_ldd`], the install-path mapping) test on every host;
-//! only the tests that mount and run the result need a Linux kernel and are gated, run
-//! for real in a privileged container. Kernel modules and firmware, the persistent data
-//! partition, and the bootloader come next.
+//! and an os-release) and, when a spec names them, populates the real userland: each
+//! binary at `/usr/bin/<name>` together with its shared-library closure ([`ldd_closure`])
+//! and an `ld.so.cache`, the kernel modules a spec lists at `/lib/modules/<version>` with
+//! their `modules.dep` closure ([`module_closure`]), and the named firmware blobs at
+//! `/lib/firmware`, so the base runs a program and drives real hardware. It then packs
+//! the tree into a reproducible squashfs, so the same inputs yield byte-identical bytes
+//! and the base can be verified by hash. The build shells out to `mksquashfs` (and
+//! `ldd`/`ldconfig` when installing binaries), doing no kernel work itself, so the crate
+//! builds and the pure parts ([`parse_ldd`], [`parse_modules_dep`], [`module_closure`],
+//! the install-path mapping) test on every host; only the tests that mount and run the
+//! result need a Linux kernel and are gated, run for real in a privileged container. The
+//! module dependency closure and placement are plain filesystem work, so they are proven
+//! everywhere; producing the binary module index (`modules.dep.bin`) the kernel's module
+//! autoloader consults is a `depmod` pass that lands with the real kernel toolchain. The
+//! persistent data partition and the bootloader come next.
 
 mod error;
 
 pub use error::{Error, Result};
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -59,6 +65,21 @@ pub struct KeySpec {
     /// closure. Empty builds a skeleton-only base (the reproducible default the pure
     /// tests use); naming `horizon` and `horizon-init` here is what makes the base boot.
     pub userland: Vec<PathBuf>,
+    /// The kernel version whose modules to install, naming the `<modules_root>/<version>`
+    /// subtree to harvest. Required when `modules` is non-empty.
+    pub kernel_version: Option<String>,
+    /// Where to read the kernel's `/lib/modules` tree from (the host's by default; a test
+    /// or a cross build points it at a kernel tree it produced).
+    pub modules_root: PathBuf,
+    /// Kernel modules to install by name; each is installed at its path under
+    /// `/lib/modules/<version>` together with its `modules.dep` dependency closure, so a
+    /// driver and everything it loads land together. Empty installs no modules.
+    pub modules: Vec<String>,
+    /// Where to read firmware blobs from (the host's `/lib/firmware` by default).
+    pub firmware_root: PathBuf,
+    /// Firmware blobs to install, each a path relative to `firmware_root`, copied to the
+    /// same path under `/lib/firmware`. Empty installs no firmware.
+    pub firmware: Vec<String>,
 }
 
 impl KeySpec {
@@ -78,6 +99,11 @@ impl KeySpec {
             os_id: "horizon".to_string(),
             os_version: env!("CARGO_PKG_VERSION").to_string(),
             userland: Vec::new(),
+            kernel_version: None,
+            modules_root: PathBuf::from("/lib/modules"),
+            modules: Vec::new(),
+            firmware_root: PathBuf::from("/lib/firmware"),
+            firmware: Vec::new(),
         }
     }
 }
@@ -146,6 +172,20 @@ pub fn build_base(spec: &KeySpec) -> Result<PathBuf> {
     // the spec names any; an empty userland leaves the reproducible skeleton untouched.
     if !spec.userland.is_empty() {
         populate_userland(&staging, &spec.userland)?;
+    }
+
+    // Install the named kernel modules with their dependency closure and the named
+    // firmware blobs, so the base drives hardware; both are empty by default, leaving
+    // the skeleton-only base byte-for-byte as it was.
+    if !spec.modules.is_empty() {
+        let version = spec
+            .kernel_version
+            .as_deref()
+            .ok_or(Error::NoKernelVersion)?;
+        populate_modules(&staging, &spec.modules_root, version, &spec.modules)?;
+    }
+    if !spec.firmware.is_empty() {
+        populate_firmware(&staging, &spec.firmware_root, &spec.firmware)?;
     }
 
     let out = spec.out.join(BASE_IMAGE);
@@ -276,6 +316,116 @@ pub fn ldd_closure(bin: &Path) -> Result<Vec<PathBuf>> {
     Ok(parse_ldd(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// Parse a `modules.dep` file into a map from each module's path (relative to the
+/// `/lib/modules/<version>` directory) to the paths of the modules it depends on. Each
+/// line is `<module>: <dep> <dep> ...` with paths relative to the modules directory;
+/// blank and colon-less lines are skipped. A module with no dependencies still appears,
+/// with an empty list, so the map is the full set of modules the kernel ships. Pure text
+/// handling, so it is unit-tested with sample output on every host while the
+/// [`populate_modules`] call that reads a real `modules.dep` runs on a build host.
+pub fn parse_modules_dep(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    let mut deps = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((target, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let needs = rest.split_whitespace().map(PathBuf::from).collect();
+        deps.insert(PathBuf::from(target), needs);
+    }
+    deps
+}
+
+// The canonical name of a module file: its base name with the `.ko` (and any compression)
+// suffix stripped and `-` normalized to `_`, the equivalence the kernel's module tools
+// use, so a request for `virtio_net` matches a file named `virtio-net.ko.xz`.
+fn module_name(relpath: &Path) -> String {
+    let file = relpath
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let base = file
+        .strip_suffix(".ko.xz")
+        .or_else(|| file.strip_suffix(".ko.zst"))
+        .or_else(|| file.strip_suffix(".ko.gz"))
+        .or_else(|| file.strip_suffix(".ko"))
+        .unwrap_or(file);
+    base.replace('-', "_")
+}
+
+/// The dependency closure of a set of requested module names: each named module's file
+/// plus every module it transitively depends on, as paths relative to the modules
+/// directory, sorted. A name resolves against each module file's canonical name
+/// ([`module_name`]), so `ext4` finds `kernel/fs/ext4/ext4.ko` and dashes and underscores
+/// are interchangeable. `modules.dep` already lists a module's full transitive
+/// dependencies, but the walk is correct either way and folds duplicates. A name that no
+/// module matches is an error, not a silent omission: a base must carry every driver it
+/// was told to.
+pub fn module_closure(
+    deps: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    requested: &[String],
+) -> Result<Vec<PathBuf>> {
+    // Index every module file by its canonical name so a requested name resolves to a path.
+    let mut by_name: BTreeMap<String, &PathBuf> = BTreeMap::new();
+    for path in deps.keys() {
+        by_name.entry(module_name(path)).or_insert(path);
+    }
+
+    let mut stack: Vec<PathBuf> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for name in requested {
+        match by_name.get(&name.replace('-', "_")) {
+            Some(p) => stack.push((*p).clone()),
+            None => unknown.push(name.clone()),
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(Error::UnknownModules(unknown));
+    }
+
+    let mut closure: BTreeSet<PathBuf> = BTreeSet::new();
+    while let Some(m) = stack.pop() {
+        if !closure.insert(m.clone()) {
+            continue;
+        }
+        if let Some(needs) = deps.get(&m) {
+            for d in needs {
+                if !closure.contains(d) {
+                    stack.push(d.clone());
+                }
+            }
+        }
+    }
+    Ok(closure.into_iter().collect())
+}
+
+/// Emit a `modules.dep` describing exactly `closure`: each module's line with the subset
+/// of its dependencies that are themselves in the closure (all of them, since the closure
+/// is dependency-complete), modules in sorted order. Deterministic, so a base populated
+/// with modules stays reproducible, and it round-trips through [`parse_modules_dep`].
+fn emit_modules_dep(closure: &[PathBuf], deps: &BTreeMap<PathBuf, Vec<PathBuf>>) -> String {
+    let present: BTreeSet<&PathBuf> = closure.iter().collect();
+    let mut out = String::new();
+    for m in closure {
+        out.push_str(&m.to_string_lossy());
+        out.push(':');
+        if let Some(needs) = deps.get(m) {
+            for d in needs {
+                if present.contains(d) {
+                    out.push(' ');
+                    out.push_str(&d.to_string_lossy());
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 // Where a userland binary is installed inside the base: /usr/bin/<name> (relative to
 // the base root), which is exactly where init's DEFAULT_INIT points, so installing the
 // `horizon` binary here is what makes the pivot's exec target exist.
@@ -306,6 +456,51 @@ fn populate_userland(staging: &Path, bins: &[PathBuf]) -> Result<()> {
         copy_file(lib, &staging.join(rel))?;
     }
     build_ld_so_cache(staging)
+}
+
+/// Install the requested kernel modules into the staging tree: read the source kernel's
+/// `modules.dep`, compute the dependency [`module_closure`] of the requested names, copy
+/// each module in the closure to its own path under `/lib/modules/<version>`, and write a
+/// `modules.dep` describing exactly that closure. The closure guarantees every module
+/// present has all of its dependencies present too, so the modules are self-consistent on
+/// the base; the emitted `modules.dep` is deterministic, so the populated base stays
+/// reproducible. Plain filesystem work (no kernel tool), so it runs and is tested on any
+/// host. The binary index (`modules.dep.bin`) the kernel's autoloader prefers is a
+/// `depmod` pass for the build host that has the kernel toolchain; this text `modules.dep`
+/// is what that pass consumes.
+fn populate_modules(
+    staging: &Path,
+    modules_root: &Path,
+    version: &str,
+    requested: &[String],
+) -> Result<()> {
+    let src = modules_root.join(version);
+    let dep_text = std::fs::read_to_string(src.join("modules.dep"))?;
+    let deps = parse_modules_dep(&dep_text);
+    let closure = module_closure(&deps, requested)?;
+
+    let dst = staging.join("lib/modules").join(version);
+    for rel in &closure {
+        copy_file(&src.join(rel), &dst.join(rel))?;
+    }
+    std::fs::create_dir_all(&dst)?;
+    std::fs::write(dst.join("modules.dep"), emit_modules_dep(&closure, &deps))?;
+    Ok(())
+}
+
+/// Install the named firmware blobs into the staging tree: each blob, a path relative to
+/// `firmware_root`, is copied to the same path under `/lib/firmware`, where a driver finds
+/// the firmware it loads by name. Firmware blobs are standalone (no dependency graph), so
+/// this is a straight copy; a named blob the source lacks fails the build rather than
+/// shipping a base with a silent gap. `fs::copy` follows symlinks, so a linux-firmware
+/// blob behind a compatibility symlink resolves to its bytes.
+fn populate_firmware(staging: &Path, firmware_root: &Path, requested: &[String]) -> Result<()> {
+    let dst = staging.join("lib/firmware");
+    for blob in requested {
+        let rel = Path::new(blob);
+        copy_file(&firmware_root.join(rel), &dst.join(rel))?;
+    }
+    Ok(())
 }
 
 // Copy one file into the base, creating parent directories as needed. fs::copy follows
@@ -437,6 +632,177 @@ mod tests {
         assert_eq!(Path::new("/").join(&rel), Path::new(init::DEFAULT_INIT));
         // A path with no filename is rejected rather than silently misplaced.
         assert!(bin_install_path(Path::new("/")).is_err());
+    }
+
+    // A small but realistic modules.dep: ext4 needs crc16 and mbcache, virtio_net needs
+    // virtio (the file spelled with a dash), and an unrelated sound module sits alone.
+    const SAMPLE_DEP: &str = "kernel/fs/ext4/ext4.ko: kernel/lib/crc16.ko kernel/fs/mbcache.ko\n\
+         kernel/lib/crc16.ko:\n\
+         kernel/fs/mbcache.ko:\n\
+         kernel/net/virtio-net.ko: kernel/drivers/virtio/virtio.ko\n\
+         kernel/drivers/virtio/virtio.ko:\n\
+         kernel/sound/foo.ko:\n";
+
+    #[test]
+    fn parse_modules_dep_reads_targets_and_deps() {
+        let deps = parse_modules_dep(SAMPLE_DEP);
+        assert_eq!(
+            deps.get(Path::new("kernel/fs/ext4/ext4.ko")).unwrap(),
+            &vec![
+                PathBuf::from("kernel/lib/crc16.ko"),
+                PathBuf::from("kernel/fs/mbcache.ko"),
+            ]
+        );
+        // A module with no dependencies still appears, with an empty list.
+        assert!(deps
+            .get(Path::new("kernel/lib/crc16.ko"))
+            .unwrap()
+            .is_empty());
+        // A blank or colon-less line contributes no module.
+        let messy = parse_modules_dep("\nnot a dep line\nkernel/x.ko:\n");
+        assert_eq!(messy.len(), 1);
+        assert!(messy.contains_key(Path::new("kernel/x.ko")));
+    }
+
+    #[test]
+    fn module_closure_pulls_transitive_deps_and_excludes_the_rest() {
+        let deps = parse_modules_dep(SAMPLE_DEP);
+        let c = module_closure(&deps, &["ext4".to_string()]).unwrap();
+        assert!(c.contains(&PathBuf::from("kernel/fs/ext4/ext4.ko")));
+        assert!(c.contains(&PathBuf::from("kernel/lib/crc16.ko")));
+        assert!(c.contains(&PathBuf::from("kernel/fs/mbcache.ko")));
+        // Unrelated modules are not dragged in.
+        assert!(!c.iter().any(|p| p.to_string_lossy().contains("virtio")));
+        assert!(!c.iter().any(|p| p.to_string_lossy().contains("foo")));
+    }
+
+    #[test]
+    fn module_closure_normalizes_dashes_and_strips_suffixes() {
+        let deps = parse_modules_dep(SAMPLE_DEP);
+        // "virtio_net" (underscore) resolves the file named virtio-net.ko (dash).
+        let c = module_closure(&deps, &["virtio_net".to_string()]).unwrap();
+        assert!(c.contains(&PathBuf::from("kernel/net/virtio-net.ko")));
+        assert!(c.contains(&PathBuf::from("kernel/drivers/virtio/virtio.ko")));
+        // A compression suffix on the file is stripped for name matching.
+        let xz = parse_modules_dep("kernel/crypto/aes.ko.xz:\n");
+        assert_eq!(
+            module_closure(&xz, &["aes".to_string()]).unwrap(),
+            vec![PathBuf::from("kernel/crypto/aes.ko.xz")]
+        );
+    }
+
+    #[test]
+    fn module_closure_errors_on_an_unknown_module() {
+        let deps = parse_modules_dep(SAMPLE_DEP);
+        let err = module_closure(&deps, &["nosuchmod".to_string()]).unwrap_err();
+        assert!(matches!(err, Error::UnknownModules(m) if m == vec!["nosuchmod".to_string()]));
+    }
+
+    #[test]
+    fn emitted_modules_dep_round_trips_and_is_deterministic() {
+        let deps = parse_modules_dep(SAMPLE_DEP);
+        let closure = module_closure(&deps, &["ext4".to_string()]).unwrap();
+        let emitted = emit_modules_dep(&closure, &deps);
+        // Re-parsing yields exactly the closure, ext4 still carrying its deps.
+        let reparsed = parse_modules_dep(&emitted);
+        assert_eq!(reparsed.len(), 3);
+        assert_eq!(
+            reparsed.get(Path::new("kernel/fs/ext4/ext4.ko")).unwrap(),
+            &vec![
+                PathBuf::from("kernel/lib/crc16.ko"),
+                PathBuf::from("kernel/fs/mbcache.ko"),
+            ]
+        );
+        assert!(!reparsed.contains_key(Path::new("kernel/sound/foo.ko")));
+        // Emitting again is byte-identical, so the populated base is reproducible.
+        assert_eq!(emit_modules_dep(&closure, &deps), emitted);
+    }
+
+    // Build a synthesized kernel module tree under `root`/`ver` whose dependency graph is
+    // SAMPLE_DEP, with each `.ko` holding its own name as a marker. No real modules or
+    // kernel tools are needed: populate_modules is plain filesystem work.
+    #[cfg(test)]
+    fn synth_modules(root: &Path, ver: &str) {
+        let moddir = root.join(ver);
+        for rel in [
+            "kernel/fs/ext4/ext4.ko",
+            "kernel/lib/crc16.ko",
+            "kernel/fs/mbcache.ko",
+            "kernel/net/virtio-net.ko",
+            "kernel/drivers/virtio/virtio.ko",
+            "kernel/sound/foo.ko",
+        ] {
+            let p = moddir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            // The marker is the module's base name, so a copied file is identifiable.
+            std::fs::write(&p, module_name(Path::new(rel))).unwrap();
+        }
+        std::fs::write(moddir.join("modules.dep"), SAMPLE_DEP).unwrap();
+    }
+
+    #[test]
+    fn populate_modules_copies_the_closure_and_writes_a_consistent_dep() {
+        let src = tempfile::tempdir().unwrap();
+        let ver = "6.12.0-horizon";
+        synth_modules(src.path(), ver);
+
+        let staging = tempfile::tempdir().unwrap();
+        populate_modules(staging.path(), src.path(), ver, &["ext4".to_string()]).unwrap();
+
+        let installed = staging.path().join("lib/modules").join(ver);
+        assert_eq!(
+            std::fs::read_to_string(installed.join("kernel/fs/ext4/ext4.ko")).unwrap(),
+            "ext4"
+        );
+        assert!(installed.join("kernel/lib/crc16.ko").exists());
+        assert!(installed.join("kernel/fs/mbcache.ko").exists());
+        // The unrelated module is left out of the base entirely.
+        assert!(!installed.join("kernel/sound/foo.ko").exists());
+        assert!(!installed.join("kernel/net/virtio-net.ko").exists());
+        // The emitted modules.dep describes exactly the installed closure.
+        let dep =
+            parse_modules_dep(&std::fs::read_to_string(installed.join("modules.dep")).unwrap());
+        assert_eq!(dep.len(), 3);
+        assert!(dep.contains_key(Path::new("kernel/fs/ext4/ext4.ko")));
+        assert!(!dep.contains_key(Path::new("kernel/sound/foo.ko")));
+
+        // Reproducible: a second populate yields the same modules.dep bytes.
+        let staging2 = tempfile::tempdir().unwrap();
+        populate_modules(staging2.path(), src.path(), ver, &["ext4".to_string()]).unwrap();
+        assert_eq!(
+            std::fs::read(installed.join("modules.dep")).unwrap(),
+            std::fs::read(
+                staging2
+                    .path()
+                    .join("lib/modules")
+                    .join(ver)
+                    .join("modules.dep")
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn populate_firmware_copies_named_blobs_and_fails_on_a_gap() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("rtl_nic")).unwrap();
+        std::fs::write(src.path().join("rtl_nic/rtl8168.fw"), b"blob").unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        populate_firmware(
+            staging.path(),
+            src.path(),
+            &["rtl_nic/rtl8168.fw".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(staging.path().join("lib/firmware/rtl_nic/rtl8168.fw")).unwrap(),
+            b"blob"
+        );
+        // A named blob the source lacks fails the build rather than shipping a gap.
+        assert!(
+            populate_firmware(staging.path(), src.path(), &["missing.bin".to_string()]).is_err()
+        );
     }
 }
 
@@ -812,5 +1178,101 @@ mod linux_tests {
             .contains("Horizon OS"));
 
         cleanup();
+    }
+
+    // A base built with modules and firmware carries them on the real image: build from a
+    // synthesized kernel module tree and a firmware blob (so no real /lib/modules is
+    // needed), mount the squashfs read-only, and read the closure and the blob back
+    // through it. This proves the dependency closure is placed right and survives the
+    // squashfs round-trip on the format the Key uses, the part the pure populate tests do
+    // not exercise. The modules are not executed (they load into a kernel, not a chroot),
+    // so unlike the userland test this only needs the image to mount.
+    #[test]
+    fn a_base_carries_its_modules_and_firmware_through_the_squashfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ver = "6.12.0-horizon";
+
+        // ext4 needs crc16 and mbcache; an unrelated sound module must stay off the base.
+        let modsrc = dir.path().join("modsrc");
+        let moddir = modsrc.join(ver);
+        for (rel, body) in [
+            ("kernel/fs/ext4/ext4.ko", "ext4"),
+            ("kernel/lib/crc16.ko", "crc16"),
+            ("kernel/fs/mbcache.ko", "mbcache"),
+            ("kernel/sound/foo.ko", "foo"),
+        ] {
+            let p = moddir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        std::fs::write(
+            moddir.join("modules.dep"),
+            "kernel/fs/ext4/ext4.ko: kernel/lib/crc16.ko kernel/fs/mbcache.ko\n\
+             kernel/lib/crc16.ko:\n\
+             kernel/fs/mbcache.ko:\n\
+             kernel/sound/foo.ko:\n",
+        )
+        .unwrap();
+
+        let fwsrc = dir.path().join("fwsrc");
+        std::fs::create_dir_all(fwsrc.join("rtl_nic")).unwrap();
+        std::fs::write(fwsrc.join("rtl_nic/rtl8168.fw"), b"firmware-blob").unwrap();
+
+        let mut spec = KeySpec::new(dir.path());
+        spec.kernel_version = Some(ver.to_string());
+        spec.modules_root = modsrc.clone();
+        spec.modules = vec!["ext4".to_string()];
+        spec.firmware_root = fwsrc.clone();
+        spec.firmware = vec!["rtl_nic/rtl8168.fw".to_string()];
+        let base = match build_base(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) => panic!("build base with modules: {e}"),
+        };
+
+        let Some(loopdev) = losetup(&base, true) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        if let Err(e) = execute(&Plan {
+            steps: vec![Step::Mount {
+                source: Source::new(loopdev.as_str(), "squashfs", MountFlags::default())
+                    .read_only(),
+                target: mnt.clone(),
+            }],
+        }) {
+            losetup_d(&loopdev);
+            if is_unprivileged_error(&e) {
+                eprintln!("skipping: mounting not permitted here ({e})");
+                return;
+            }
+            panic!("mount base: {e}");
+        }
+
+        // Read the modules, the dependency closure, the emitted dep file, and the firmware
+        // back through the read-only mount before tearing it down.
+        let modroot = mnt.join("lib/modules").join(ver);
+        let ext4 = std::fs::read_to_string(modroot.join("kernel/fs/ext4/ext4.ko"));
+        let crc16 = modroot.join("kernel/lib/crc16.ko").exists();
+        let mbcache = modroot.join("kernel/fs/mbcache.ko").exists();
+        let foo = modroot.join("kernel/sound/foo.ko").exists();
+        let dep = std::fs::read_to_string(modroot.join("modules.dep"));
+        let fw = std::fs::read(mnt.join("lib/firmware/rtl_nic/rtl8168.fw"));
+        umount(&mnt);
+        losetup_d(&loopdev);
+
+        assert_eq!(ext4.unwrap(), "ext4");
+        assert!(
+            crc16 && mbcache,
+            "the dependency closure must be on the image"
+        );
+        assert!(!foo, "an unrelated module must not be on the image");
+        assert!(dep.unwrap().contains("kernel/fs/ext4/ext4.ko"));
+        assert_eq!(fw.unwrap(), b"firmware-blob");
     }
 }
