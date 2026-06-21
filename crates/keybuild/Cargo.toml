@@ -1,0 +1,27 @@
+[package]
+name = "keybuild"
+description = "Build the filesystems of a Horizon Key: the reproducible immutable base image the init boots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "keybuild"
+path = "src/lib.rs"
+
+# The host-side tool that builds a Key's images.
+[[bin]]
+name = "horizon-keybuild"
+path = "src/main.rs"
+
+[dependencies]
+# The build emits what init consumes (the labels, the boot command line), so it shares
+# init's types: the build/boot contract lives in one place.
+init = { path = "../init" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -35,13 +35,19 @@ pub use error::{Error, Result};
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{execute, mount_proc, resolve};
+pub use linux::{execute, is_unprivileged_error, mount_proc, resolve};
 
 use std::path::{Path, PathBuf};
 
 /// The default init to exec once the real root is mounted: the `horizon` binary in
 /// the base image, which runs `boot` to unlock the identity and open the desktop.
 pub const DEFAULT_INIT: &str = "/usr/bin/horizon";
+
+/// The filesystem labels a Horizon Key carries: the rendezvous between the image
+/// builder, which writes them onto the base and data partitions, and this init,
+/// which finds those partitions by label so no device path is ever hardcoded.
+pub const BASE_LABEL: &str = "HORIZON-BASE";
+pub const DATA_LABEL: &str = "HORIZON-DATA";
 
 /// Where the new root is assembled and where the Key's identity store is bound, both
 /// under the initramfs's own tmpfs. The store path is what `horizon boot --root` is
@@ -391,9 +397,9 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Params {
         Params {
-            base: Spec::Label("HORIZON-BASE".into()),
+            base: Spec::Label(BASE_LABEL.into()),
             basefs: "squashfs".into(),
-            data: Spec::Label("HORIZON-DATA".into()),
+            data: Spec::Label(DATA_LABEL.into()),
             datafs: "ext4".into(),
             mode: ModeChoice::Auto,
             init: PathBuf::from(DEFAULT_INIT),
@@ -678,20 +684,6 @@ mod linux_tests {
     use nix::mount::{umount2, MntFlags};
     use std::fs;
 
-    // A mount step that the host refuses for lack of privilege, so the test skips
-    // gracefully on an unprivileged CI runner (as the cells tests do) while still
-    // running for real in the privileged container.
-    fn is_unprivileged(e: &Error) -> bool {
-        matches!(
-            e,
-            Error::Step { source, .. }
-                if matches!(
-                    source.raw_os_error(),
-                    Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENODEV) | Some(libc::ENOSYS)
-                )
-        )
-    }
-
     #[test]
     fn assembles_an_immutable_base_with_a_writable_overlay_and_carries_the_store() {
         let dir = tempfile::tempdir().unwrap();
@@ -711,7 +703,7 @@ mod linux_tests {
             execute(&p)
         };
         if let Err(e) = mount_tmpfs(&scratch) {
-            if is_unprivileged(&e) {
+            if is_unprivileged_error(&e) {
                 eprintln!("skipping: mounting is not permitted here ({e})");
                 return;
             }
@@ -756,7 +748,7 @@ mod linux_tests {
         fs::write(store_src.join("keysalt"), b"key").unwrap();
 
         if let Err(e) = execute(&Plan { steps }) {
-            if is_unprivileged(&e) {
+            if is_unprivileged_error(&e) {
                 eprintln!("skipping: assembling the root is not permitted here ({e})");
                 let _ = umount2(&scratch, MntFlags::MNT_DETACH);
                 return;

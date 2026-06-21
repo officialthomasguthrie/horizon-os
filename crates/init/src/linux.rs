@@ -177,3 +177,17 @@ pub fn resolve(spec: &Spec, fstype: &str) -> Result<Source, Error> {
     }
     Ok(Source::new(path, fstype, MountFlags::default()))
 }
+
+/// Whether an error is the host refusing a privileged operation (mount and friends),
+/// so a test can skip gracefully on an unprivileged runner rather than fail. The
+/// privileged container runs these steps for real; a CI runner without privilege
+/// skips them, exactly as the cells tests do.
+pub fn is_unprivileged_error(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Step { source, .. } if matches!(
+            source.raw_os_error(),
+            Some(libc::EPERM) | Some(libc::EACCES) | Some(libc::ENODEV) | Some(libc::ENOSYS)
+        )
+    )
+}
