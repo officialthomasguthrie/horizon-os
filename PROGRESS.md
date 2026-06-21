@@ -912,6 +912,38 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   and booting the whole chain in QEMU (UEFI -> bootloader -> kernel -> horizon-init ->
   horizon boot -> the DRM desktop), the real "boots anywhere and remembers" demo short
   of real metal. Built and tested on darwin and in the Linux container.
+- Phase 0 base image (`keybuild` crate + `horizon-keybuild`): the host-side tool that
+  assembles the filesystems of a Horizon Key, the producer side of the contract the
+  `init` crate consumes. A Key carries two filesystems: an immutable base image,
+  mounted read-only, holding the OS, and a persistent data partition holding the
+  writable overlay layer and the identity store. keybuild writes the partition labels
+  and emits the kernel command line; init finds the partitions by those labels and
+  parses that command line; the two agree by sharing init's types rather than by
+  convention, so to make that one definition the `HORIZON-BASE`/`HORIZON-DATA` labels
+  and the test skip-predicate moved into init (`init::BASE_LABEL`, `init::DATA_LABEL`,
+  `init::is_unprivileged_error`) and keybuild reuses them. This piece builds the
+  immutable base: `build_base` materializes a minimal base skeleton (the standard mount
+  directories and an os-release) and packs it into a squashfs built root-owned, without
+  xattrs, and with every timestamp pinned, so the same skeleton yields byte-identical
+  bytes and the base can be verified by hash; `boot_cmdline` emits the `horizon.*`
+  tokens that `init::parse_cmdline` reads back. The build shells out to `mksquashfs` and
+  does no kernel work itself, so the crate builds and the pure parts test on every host;
+  only the test that mounts the result needs a Linux kernel and is gated. Tests on the
+  usual split: 3 pure tests on darwin and in the container (the emitted command line
+  round-trips through init's parser for every mode, the default labels are the ones init
+  looks for so a Key boots with no explicit command line, the skeleton has the mount
+  directories and names the system); 2 gated container tests prove the build for real,
+  that `build_base` is byte-for-byte reproducible across two builds, and that the
+  produced squashfs loop-mounts read-only as the init's overlay lower with a tmpfs upper
+  (os-release visible through the root, a write landing in the upper, the squashfs lower
+  refusing writes), the immutable-base + writable-overlay model now on the real image
+  format the Key uses. Verified end to end through the binary in the container:
+  `horizon-keybuild --out` writes a valid squashfs (its superblock timestamp zeroed) and
+  prints the boot command line. Left next: populating the base with the real userland
+  (binaries, libraries, kernel modules, firmware), the persistent data partition with an
+  initialized store, dm-verity over the base, LUKS2 for the writable layer, the
+  bootloader, and a QEMU boot of the whole chain. Built and tested on darwin and in the
+  Linux container.
 
 ## Next
 
@@ -1045,21 +1077,31 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
   the boot unlock core, and the CLI are cross-platform.
 - Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
-  "boots anywhere and remembers" demo. The init step is done (the `init` crate +
+  "boots anywhere and remembers" demo. Two steps are done. The init (the `init` crate +
   `horizon-init`): the generic initramfs init that assembles the immutable-base +
   writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
   new root, and switch_roots into `horizon boot`, with the policy pure and tested
-  everywhere and the overlay assembly proven for real in the container. What is left,
-  in order: dm-verity over the base so the immutable layer is tamper-evident (extend
-  the init plan + a build step to compute the hash, container-tested with veritysetup);
-  LUKS2 for the Home writable layer and the Ghost read-only store handoff so persistence
-  is encrypted and a Foreign Surface still boots the identity without writing to the Key
-  (cryptsetup, unlocked with the same master the `boot` crate already recovers); the
-  image build pipeline that assembles a base rootfs (kernel, linux-firmware, the horizon
-  binary) into a squashfs, builds the initramfs cpio around horizon-init, and lays down
-  an isohybrid UEFI/BIOS bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs)
-  into a bootable Key image; and finally booting the whole chain in QEMU with OVMF
-  (UEFI -> bootloader -> kernel -> horizon-init -> horizon boot -> the DRM desktop on
-  virtio-gpu), which proves almost the entire boot path in software short of real metal.
-  The image build and the QEMU boot need tools the lean container lacks (mksquashfs,
-  veritysetup, cryptsetup, qemu, OVMF, a kernel), installed as those pieces land.
+  everywhere and the overlay assembly proven for real in the container. The immutable
+  base image (the `keybuild` crate + `horizon-keybuild`): a reproducible squashfs the
+  init mounts read-only as the overlay lower, with the build/boot contract (labels, the
+  kernel command line) shared with init and the squashfs proven to mount and stack an
+  overlay for real in the container. What is left, in order: populate the base with the
+  real userland (the horizon + horizon-init binaries and their shared libraries, then
+  kernel modules and linux-firmware) so the base actually boots a machine; build the
+  persistent data partition (an ext4 with the overlay upper/work and an initialized
+  identity store) and prove the whole Key assembles and `horizon boot` opens the store
+  on real filesystems (a container loopback integration test, the keystone that ties
+  keybuild + init + boot); dm-verity over the base so the immutable layer is
+  tamper-evident (a pure-Rust hash tree cross-checked against `veritysetup format`, the
+  kernel open eye-verified by booting since this container's kernel lacks
+  CONFIG_DM_VERITY); LUKS2 for the Home writable layer and the Ghost read-only store
+  handoff, unlocked with the same master the `boot` crate recovers (CONFIG_DM_CRYPT=y
+  here, so cryptsetup open is testable in the container); the isohybrid UEFI/BIOS
+  bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs) into a bootable Key
+  image; and finally booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
+  horizon-init -> horizon boot -> the DRM desktop on virtio-gpu). Environment notes for
+  that last stretch: this build container is aarch64 with no KVM, so a shippable x86-64
+  Key needs cross-compilation (the `x86_64-unknown-linux-gnu` target plus a kernel,
+  busybox, and libs) and QEMU runs in TCG; an aarch64 image booted with
+  qemu-system-aarch64 proves the chain on the native ISA short of the x86-64 product.
+  Keep build artifacts off the 92%-full `/work` mount (use the container's own fs).
