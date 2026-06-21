@@ -25,3 +25,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The keystone integration test builds a Key, assembles it through the init, and proves
+# horizon boot opens the identity on it, so it reaches across the whole boot path.
+boot = { path = "../boot" }
+lifestream = { path = "../lifestream" }
+identity = { path = "../identity" }

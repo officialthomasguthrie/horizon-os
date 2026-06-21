@@ -31,6 +31,9 @@ use init::{BASE_LABEL, DATA_LABEL};
 /// The immutable base image's filename under a spec's output directory.
 pub const BASE_IMAGE: &str = "base.squashfs";
 
+/// The persistent data image's filename under a spec's output directory.
+pub const DATA_IMAGE: &str = "data.img";
+
 /// The parameters of a Key to build: where to write it, the partition labels and
 /// filesystems init looks for, the default boot mode, and how the system names itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +46,8 @@ pub struct KeySpec {
     pub data_label: String,
     pub basefs: String,
     pub datafs: String,
+    /// The size of the data partition image, in mebibytes.
+    pub data_size_mb: u64,
     /// The boot mode the command line requests (Auto picks Home or Ghost at boot).
     pub mode: ModeChoice,
     pub os_name: String,
@@ -61,6 +66,7 @@ impl KeySpec {
             data_label: DATA_LABEL.to_string(),
             basefs: "squashfs".to_string(),
             datafs: "ext4".to_string(),
+            data_size_mb: 64,
             mode: ModeChoice::Auto,
             os_name: "Horizon OS".to_string(),
             os_id: "horizon".to_string(),
@@ -155,6 +161,28 @@ pub fn build_base(spec: &KeySpec) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// Build the persistent data partition: a labeled ext4 image at `<out>/data.img`, sized
+/// per the spec. This is the writable side of the Key: the init lays the overlay upper
+/// and work directories and the identity store onto it, so unlike the base it is not
+/// reproducible, it is mutable state. Shells out to `mkfs.ext4`. Returns the image path.
+pub fn build_data(spec: &KeySpec) -> Result<PathBuf> {
+    std::fs::create_dir_all(&spec.out)?;
+    let out = spec.out.join(DATA_IMAGE);
+
+    // A fresh file sized to the partition; mkfs.ext4 lays the filesystem into it.
+    let file = std::fs::File::create(&out)?;
+    file.set_len(spec.data_size_mb * 1024 * 1024)?;
+    drop(file);
+
+    let mut cmd = Command::new("mkfs.ext4");
+    cmd.args(["-F", "-q", "-L"])
+        .arg(&spec.data_label)
+        .arg(&out)
+        .stdout(std::process::Stdio::null());
+    run(cmd, "mkfs.ext4")?;
+    Ok(out)
+}
+
 fn materialize(skeleton: &Skeleton, staging: &Path) -> Result<()> {
     for d in &skeleton.dirs {
         std::fs::create_dir_all(staging.join(d))?;
@@ -227,12 +255,15 @@ mod linux_tests {
     use init::{execute, is_unprivileged_error, Layout, MountFlags, Plan, Source, Step};
     use std::process::Command;
 
-    fn losetup_ro(file: &Path) -> Option<String> {
-        let out = Command::new("losetup")
-            .args(["--find", "--show", "-r"])
-            .arg(file)
-            .output()
-            .ok()?;
+    // Attach `file` to a free loop device (read-only for the immutable base, writable
+    // for the data partition) and return its path, or None if losetup is not permitted.
+    fn losetup(file: &Path, ro: bool) -> Option<String> {
+        let mut cmd = Command::new("losetup");
+        cmd.args(["--find", "--show"]);
+        if ro {
+            cmd.arg("-r");
+        }
+        let out = cmd.arg(file).output().ok()?;
         if !out.status.success() {
             return None;
         }
@@ -286,7 +317,7 @@ mod linux_tests {
 
         // A read-only loop device over the squashfs file, the immutable base as the init
         // would see the Key's base partition.
-        let Some(loopdev) = losetup_ro(&base) else {
+        let Some(loopdev) = losetup(&base, true) else {
             eprintln!("skipping: losetup not permitted here");
             return;
         };
@@ -358,5 +389,162 @@ mod linux_tests {
         umount(&l.lower);
         umount(&scratch);
         losetup_d(&loopdev);
+    }
+
+    // The keystone: a complete Key (a real squashfs base, a real ext4 data partition,
+    // and an initialized identity store) assembles through the init's plan and horizon
+    // boot opens the identity on it, all on the real filesystems keybuild produced. This
+    // ties keybuild, init, and boot together end to end, short of the switch_root and
+    // the on-screen session that need an actual boot.
+    #[test]
+    fn a_built_key_assembles_and_boot_opens_its_identity() {
+        use boot::{boot as boot_device, derive, Method};
+        use identity::{enroll, Keyslots, SoftwareAuthenticator};
+        use lifestream::Lifestream;
+
+        const PASS: &str = "correct horse battery staple";
+        const SALT: &[u8] = b"horizon-keybuild-keystone-salt!!";
+        const SEED: [u8; 32] = [7u8; 32];
+
+        let dir = tempfile::tempdir().unwrap();
+        let spec = KeySpec::new(dir.path());
+
+        // Build both filesystems of the Key, skipping if a build tool is absent.
+        let Some(base) = build_or_skip(dir.path()) else {
+            return;
+        };
+        let data = match build_data(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(_)) => {
+                eprintln!("skipping: mkfs.ext4 not installed");
+                return;
+            }
+            Err(e) => panic!("build data: {e}"),
+        };
+
+        // The base read-only and the data writable, as the init sees the Key's two
+        // partitions.
+        let Some(base_loop) = losetup(&base, true) else {
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+        let Some(data_loop) = losetup(&data, false) else {
+            losetup_d(&base_loop);
+            eprintln!("skipping: losetup not permitted here");
+            return;
+        };
+
+        let scratch = dir.path().join("run");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let l = Layout::new(&scratch);
+        let store = l.over.join("store");
+        let booted_store = l.root.join("run/horizon/store");
+
+        let cleanup = || {
+            umount(&booted_store);
+            umount(&l.root);
+            umount(&l.over);
+            umount(&l.lower);
+            umount(&scratch);
+            losetup_d(&data_loop);
+            losetup_d(&base_loop);
+        };
+
+        // Assemble the writable layer over the immutable base, init's Home-mode plan: a
+        // private tmpfs scratch, the squashfs base as the read-only lower, the ext4 data
+        // as the writable backing for the overlay upper and work.
+        let setup = Plan {
+            steps: vec![
+                Step::Mount {
+                    source: Source::tmpfs(),
+                    target: scratch.clone(),
+                },
+                Step::Mkdir(l.lower.clone()),
+                Step::Mount {
+                    source: Source::new(base_loop.as_str(), "squashfs", MountFlags::default())
+                        .read_only(),
+                    target: l.lower.clone(),
+                },
+                Step::Mkdir(l.over.clone()),
+                Step::Mount {
+                    source: Source::new(data_loop.as_str(), "ext4", MountFlags::default()),
+                    target: l.over.clone(),
+                },
+            ],
+        };
+        if let Err(e) = execute(&setup) {
+            cleanup();
+            if is_unprivileged_error(&e) {
+                eprintln!("skipping: mounting not permitted here ({e})");
+                return;
+            }
+            panic!("mount Key: {e}");
+        }
+
+        // Initialize the identity store on the data partition, the way the boot crate's
+        // own tests build one: a master derived from a passphrase and salt, a HEAD
+        // generation to prove, and an enrolled software token (the touch-to-boot path).
+        std::fs::create_dir_all(&store).unwrap();
+        let master = derive(PASS, SALT);
+        let ls = Lifestream::init(&store, &master).unwrap();
+        std::fs::write(store.join("keysalt"), SALT).unwrap();
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        std::fs::write(seed.join("hello"), b"horizon").unwrap();
+        let tree = ls.snapshot_dir(&seed).unwrap();
+        ls.commit(tree, vec![], "first").unwrap();
+        let mut auth = SoftwareAuthenticator::new(SEED);
+        let mut slots = Keyslots::new();
+        slots.add(enroll(&mut auth, &master).unwrap());
+        std::fs::write(store.join("keyslots"), slots.encode()).unwrap();
+        drop(ls);
+
+        // Overlay the root and carry the store into it, exactly as init's Home-mode plan.
+        let assemble = Plan {
+            steps: vec![
+                Step::Mkdir(l.upper.clone()),
+                Step::Mkdir(l.work.clone()),
+                Step::Mkdir(l.root.clone()),
+                Step::Overlay {
+                    lower: l.lower.clone(),
+                    upper: l.upper.clone(),
+                    work: l.work.clone(),
+                    target: l.root.clone(),
+                },
+                Step::Mkdir(booted_store.clone()),
+                Step::Bind {
+                    from: store.clone(),
+                    to: booted_store.clone(),
+                },
+            ],
+        };
+        if let Err(e) = execute(&assemble) {
+            cleanup();
+            panic!("assemble Key: {e}");
+        }
+
+        // The whole Key boots: boot finds the carried store, unlocks the master with the
+        // enrolled token and no passphrase, and proves HEAD, on the real squashfs + ext4
+        // filesystems keybuild produced.
+        let mut token = SoftwareAuthenticator::new(SEED);
+        let booted = boot_device(&booted_store, Some(&mut token), || {
+            panic!("the passphrase must not be requested when the token unlocks")
+        });
+        let booted = match booted {
+            Ok(b) => b,
+            Err(e) => {
+                cleanup();
+                panic!("boot: {e}");
+            }
+        };
+        assert_eq!(booted.method, Method::Keyslot);
+        assert_eq!(booted.master, master);
+        assert!(booted.head.is_some());
+        // The immutable base is also visible through the assembled root.
+        assert!(std::fs::read_to_string(l.root.join("etc/os-release"))
+            .unwrap()
+            .contains("Horizon OS"));
+
+        cleanup();
     }
 }
