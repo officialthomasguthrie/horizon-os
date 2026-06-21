@@ -870,6 +870,48 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   post-boot trusted device (a Constellation enrollment after boot), and the real
   initramfs/UEFI image Phase 0 proper builds this orchestration into. Built and tested
   on darwin and in the Linux container.
+- Phase 0 init (`init` crate + `horizon-init`): the first userspace process in
+  Horizon's initramfs, the step before the `boot` crate. The kernel execs one program
+  as PID 1; this is that program, and its job is to turn "a kernel with a Key plugged
+  in" into "the real root, mounted, with `horizon boot` running on it", i.e. it gets
+  the machine to where `boot` can unlock the identity. The on-disk model is the one in
+  `docs/03-PORTABILITY-AND-BOOT.md`: an immutable base image, mounted read-only, with a
+  writable layer stacked over it by OverlayFS, so the base resets clean and cannot be
+  corrupted by a runaway process while this machine's state goes in the writable layer.
+  What that layer is made of is the whole Home-vs-Ghost decision: `Mode::Home` (a Known
+  Surface) backs it with a persistent device so OS state survives a power-off;
+  `Mode::Ghost` (a Foreign Surface) backs it with tmpfs in RAM so the machine writes
+  nothing outside memory and the session is gone on power-off. The base is read-only in
+  both modes; only the writable layer differs. On the same headless split the rest of
+  Horizon uses: the policy of a boot, what to mount, in what order, where, the mode
+  decision, the final pivot and exec, is pure logic (a `Recipe` is folded into a `Plan`
+  of ordered `Step`s by `plan()`, and the kernel command line is parsed into `Params`,
+  the `LABEL=`/`UUID=` device specs, the mode, the init, by `parse_cmdline()`, with
+  `choose_mode()` degrading Home to Ghost when no persistent device is present so a
+  "boots anywhere" device still comes up), so it builds and is tested on every host;
+  the execution of the plan (mount, overlayfs, bind, move, switch_root, all behind
+  nix) is Linux-only, so the workspace still builds on darwin. The handoff is a
+  faithful initramfs switch_root: mount devtmpfs/proc/sysfs, mount the immutable base
+  read-only as the overlay lower, mount the writable backing (device or tmpfs) and
+  assemble the overlay root, bind the Key's identity store into the new root so
+  `horizon boot` finds it, move the kernel filesystems across, then move the new root
+  over `/` and exec the init. Tests on the usual split: 11 pure plan/cmdline/mode tests
+  run on darwin and in the container (the base is always read-only, Ghost never touches
+  the data device, the overlay stacks the writable upper on the immutable lower, the
+  carry lands inside the new root, the pivot is last and execs the init); the executor
+  is proven for real where there is a kernel to run it, a privileged-container test
+  assembles the overlay root and carries a stand-in store, asserting the immutable
+  lower is visible through the root, a write lands in the writable upper and never in
+  the lower (the base resets clean), and the store is reachable in the new root. The
+  final switch_root cannot run in a test (it would replace the test process's own
+  root), so it is proven by booting, exactly as the compositor's display backends are.
+  Left for the rest of Phase 0: dm-verity over the base (tamper-evident immutable),
+  LUKS2 for the Home writable layer (encrypted persistence) and the Foreign-Surface
+  store handoff (reading the identity read-only from the Key in Ghost mode), the image
+  build that assembles the base + initramfs + kernel + bootloader into a bootable Key,
+  and booting the whole chain in QEMU (UEFI -> bootloader -> kernel -> horizon-init ->
+  horizon boot -> the DRM desktop), the real "boots anywhere and remembers" demo short
+  of real metal. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -999,5 +1041,25 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   on-hardware part: eye-verifying a real device boots into its desktop with a touch
   (the DRM session launch), a phone as a post-boot trusted device (a Constellation
   enrollment after boot), and Phase 0 proper (the initramfs/UEFI image this
-  orchestration slots into). Linux for the real key and the desktop; the keyslot core,
-  the secret-sharing core, the boot unlock core, and the CLI are cross-platform.
+  orchestration slots into; its init step is now done, see the Phase 0 bullet below).
+  Linux for the real key and the desktop; the keyslot core, the secret-sharing core,
+  the boot unlock core, and the CLI are cross-platform.
+- Phase 0 proper: the actual bootable artifact this orchestration slots into, the real
+  "boots anywhere and remembers" demo. The init step is done (the `init` crate +
+  `horizon-init`): the generic initramfs init that assembles the immutable-base +
+  writable-overlay root (Home device or Ghost tmpfs), carries the Key's store into the
+  new root, and switch_roots into `horizon boot`, with the policy pure and tested
+  everywhere and the overlay assembly proven for real in the container. What is left,
+  in order: dm-verity over the base so the immutable layer is tamper-evident (extend
+  the init plan + a build step to compute the hash, container-tested with veritysetup);
+  LUKS2 for the Home writable layer and the Ghost read-only store handoff so persistence
+  is encrypted and a Foreign Surface still boots the identity without writing to the Key
+  (cryptsetup, unlocked with the same master the `boot` crate already recovers); the
+  image build pipeline that assembles a base rootfs (kernel, linux-firmware, the horizon
+  binary) into a squashfs, builds the initramfs cpio around horizon-init, and lays down
+  an isohybrid UEFI/BIOS bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs)
+  into a bootable Key image; and finally booting the whole chain in QEMU with OVMF
+  (UEFI -> bootloader -> kernel -> horizon-init -> horizon boot -> the DRM desktop on
+  virtio-gpu), which proves almost the entire boot path in software short of real metal.
+  The image build and the QEMU boot need tools the lean container lacks (mksquashfs,
+  veritysetup, cryptsetup, qemu, OVMF, a kernel), installed as those pieces land.
