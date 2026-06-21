@@ -16,10 +16,13 @@
 //! brought up (multi-GPU), a GPU hotplugged in or out is added or dropped, and
 //! each device rescans its connectors when udev signals a change, so plugging or
 //! unplugging a monitor lights or drops its output. A VT switch away and back is
-//! recovered: every device and swapchain is reset on reactivation. Clients here
-//! attach shm (CPU) buffers, so a window composites on whichever GPU drives the
-//! output with no cross-GPU buffer sharing; a display-only secondary GPU (render
-//! on one card, scan out on another) is the one multi-GPU case still left.
+//! recovered: every device and swapchain is reset on reactivation. Every output is
+//! composited on the primary GPU: one whose own GPU is the primary scans out
+//! straight from it, while one driven by any other GPU has its finished frame
+//! copied across to that GPU for scanout (render on one card, scan out on another,
+//! the display-only secondary GPU case). Client buffers are shm (CPU), so only the
+//! composited frame ever crosses the GPU boundary, never per-window buffers, which
+//! is what keeps the cross-GPU path to a single copy.
 //!
 //! Every output is placed in one shared logical space (a left-to-right
 //! [`layout`](crate::layout)) and scans out its own region of the scene, so a real
@@ -273,26 +276,52 @@ pub(crate) fn run(
 }
 
 // Composite the current scene onto every output of every GPU that is ready for a
-// new frame. Each device renders with its own GLES renderer (client buffers are
-// shm, so there is no cross-GPU import); only an output with damage is queued, an
-// empty one is retried next iteration (the dispatch timeout paces it).
+// new frame. Every output is composited on the primary GPU; one whose own GPU is
+// the primary scans out straight from it (`single_renderer`, no copy), one on any
+// other GPU has its finished frame copied across to that GPU for scanout
+// (`renderer`, the display-only secondary GPU case). Client buffers are shm, so
+// only the composited frame crosses the GPU boundary, never per-window buffers.
+// Only an output with damage is queued, an empty one is retried next iteration (the
+// dispatch timeout paces it).
 fn render_all(comp: &mut Compositor, backend: &mut DrmBackend) {
     let clear = Color32F::new(0.06, 0.06, 0.06, 1.0);
     // Rebuild the cached background upload if the shell changed it (cheap when
     // unchanged: just a generation compare).
     backend.sync_background(comp);
+
+    // The render node every frame is composited on. An output on a different GPU
+    // copies its finished frame there for scanout; the primary's own outputs do
+    // not. None only when there is no GPU, where the device loop below is empty.
+    let primary_render_node = backend
+        .primary_gpu
+        .and_then(|node| backend.devices.get(&node))
+        .map(|device| device.render_node);
+
     for device in backend.devices.values_mut() {
-        let mut renderer = match backend.gpus.single_renderer(&device.render_node) {
-            Ok(renderer) => renderer,
-            Err(e) => {
-                eprintln!("compositor: renderer: {e}");
-                continue;
-            }
-        };
+        let render_node = device.render_node;
         for surface in device.surfaces.values_mut() {
             if surface.pending {
                 continue;
             }
+            // Composite on the primary GPU. If this output scans out on a different
+            // GPU, the MultiRenderer copies the finished frame across to it in the
+            // surface's own scanout format; otherwise it renders straight onto this
+            // GPU. Acquired per surface because the copy target and the scanout
+            // format are per output.
+            let format = surface.drm.format();
+            let renderer = match primary_render_node {
+                Some(primary) if primary != render_node => {
+                    backend.gpus.renderer(&primary, &render_node, format)
+                }
+                _ => backend.gpus.single_renderer(&render_node),
+            };
+            let mut renderer = match renderer {
+                Ok(renderer) => renderer,
+                Err(e) => {
+                    eprintln!("compositor: renderer: {e}");
+                    continue;
+                }
+            };
             // This output's own region of the shared scene (only the windows that
             // fall on it, offset to its logical origin), then the shell background
             // appended last so it sits behind them (render_frame draws the element
