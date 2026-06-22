@@ -44,7 +44,20 @@
 //! shelling out, because the container has no `mkfs.fat`; it is proven by loop-mounting the
 //! self-built ESP as `vfat` in the container. [`build_disk`] then lays the ESP, base, data,
 //! and Home images side by side under one GPT into a bootable `key.img` (see [`mod@gpt`]).
+//!
+//! [`build_initramfs`] builds the root filesystem the kernel unpacks before any disk is
+//! mounted: a gzip-compressed newc cpio archive (`initramfs.img`) holding `/init`
+//! (`horizon-init`) with its shared-library closure, `cryptsetup` (the one tool the init
+//! shells out to), and the boot-path kernel modules. It owns the cpio format (see
+//! [`mod@cpio`]) for the same reasons verity, the GPT, and FAT are owned, because the
+//! container has no `cpio` or `busybox`; the init does its mounting, overlay assembly, and
+//! `switch_root` with syscalls, so no shell or coreutils are vendored, only `cryptsetup`.
+//! The compression shells out to `gzip` (present, like `mksquashfs`/`cryptsetup`), while the
+//! archive itself is owned. There is no cpio tool to cross-check, so it is proven by the
+//! reader half ([`cpio::read`]) round-tripping the writer and a gated container test that
+//! gunzips and inspects a built archive; the kernel unpacking it is eye-verified at boot.
 
+pub mod cpio;
 mod error;
 pub mod fat;
 pub mod gpt;
@@ -85,6 +98,12 @@ pub const ESP_IMAGE: &str = "esp.img";
 
 /// The partition label (GPT PARTLABEL) and FAT volume label of the ESP.
 pub const ESP_LABEL: &str = "HORIZON-ESP";
+
+/// The initramfs image's filename: a gzip-compressed newc cpio archive holding `/init`
+/// (`horizon-init`), `cryptsetup`, and the boot-path kernel modules, the root filesystem the
+/// kernel unpacks before the real root is mounted. A bootloader loads it alongside the
+/// kernel; the bootloader step writes it into the ESP.
+pub const INITRAMFS_IMAGE: &str = "initramfs.img";
 
 /// The assembled bootable disk's filename: a GPT image with the base, data, and Home
 /// partitions laid side by side, the artifact a bootloader and a kernel are written onto.
@@ -136,6 +155,19 @@ pub struct KeySpec {
     /// Firmware blobs to install, each a path relative to `firmware_root`, copied to the
     /// same path under `/lib/firmware`. Empty installs no firmware.
     pub firmware: Vec<String>,
+    /// The binary installed as the initramfs `/init`, the program the kernel execs as PID 1,
+    /// with its shared-library closure. This is `horizon-init`. Required by
+    /// [`build_initramfs`]; unused by the base build.
+    pub init_bin: Option<PathBuf>,
+    /// Extra binaries to install into the initramfs, each at `/usr/sbin/<name>` with its
+    /// shared-library closure. This is `cryptsetup` (the one external tool `horizon-init`
+    /// shells out to, for the Home LUKS open); the rest of the boot is syscalls in `init`.
+    pub initramfs_bins: Vec<PathBuf>,
+    /// Boot-path kernel modules to install into the initramfs (the drivers needed to reach
+    /// the real root: squashfs, overlay, the block driver), with their `modules.dep`
+    /// closure. Uses `kernel_version`/`modules_root` like the base modules. Empty installs
+    /// none; a module-free kernel (everything built in) needs no initramfs modules.
+    pub initramfs_modules: Vec<String>,
 }
 
 impl KeySpec {
@@ -162,6 +194,9 @@ impl KeySpec {
             modules: Vec::new(),
             firmware_root: PathBuf::from("/lib/firmware"),
             firmware: Vec::new(),
+            init_bin: None,
+            initramfs_bins: Vec::new(),
+            initramfs_modules: Vec::new(),
         }
     }
 }
@@ -403,6 +438,97 @@ pub fn build_esp(spec: &KeySpec) -> Result<PathBuf> {
     let mut tree = fat::Dir::new();
     tree.mkdir("EFI/BOOT")?;
     build_esp_with(spec, &tree)
+}
+
+/// Build the initramfs: the root filesystem the kernel unpacks before any disk is mounted, a
+/// gzip-compressed newc cpio archive at `<out>/initramfs.img`. It holds `/init` (the
+/// `init_bin`, `horizon-init`) with its shared-library closure, each extra `initramfs_bins`
+/// binary (`cryptsetup`) under `/usr/sbin` with its closure, the boot-path `initramfs_modules`
+/// with their `modules.dep` closure, and the `/dev/console` and `/dev/null` device nodes the
+/// init needs for console output before it mounts devtmpfs.
+///
+/// No `busybox` or coreutils are vendored: `horizon-init` does its mounting, overlay
+/// assembly, bind, move, and `switch_root` with syscalls and recovers the identity master
+/// in-process, shelling out only to `cryptsetup` to open the encrypted Home layer, so the
+/// boot path is one real program plus that one tool, not a shell driving applets. The
+/// archive is assembled with the same binary-and-closure machinery as the base
+/// ([`ldd_closure`], [`build_ld_so_cache`], [`populate_modules`]) into a staging tree, which
+/// [`cpio::read_dir_tree`] imports; the device nodes (which a staging directory cannot hold
+/// without privilege) are added to the tree directly, and the result is gzip-compressed.
+///
+/// Needs `ldd`/`ldconfig`/`gzip`, so it runs on a Linux build host like [`build_base`]'s
+/// userland path; errors with [`Error::NoInitBin`] if no `init_bin` is set.
+pub fn build_initramfs(spec: &KeySpec) -> Result<PathBuf> {
+    let init_bin = spec.init_bin.as_ref().ok_or(Error::NoInitBin)?;
+    std::fs::create_dir_all(&spec.out)?;
+
+    // A clean staging tree each time, so the input to the cpio packer is deterministic.
+    let staging = spec.out.join("initramfs.staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    // The mountpoints early_mounts needs (/dev, /proc, /sys must exist before they are
+    // mounted onto) plus the standard homes for the tools and the loader cache. The closure
+    // copy creates /lib/... as it goes; these are the directories that must exist regardless.
+    for d in [
+        "dev", "proc", "sys", "run", "tmp", "root", "etc", "usr", "usr/bin", "usr/sbin",
+    ] {
+        std::fs::create_dir_all(staging.join(d))?;
+    }
+
+    // /init is the program the kernel execs as PID 1 (horizon-init), at the root with its
+    // shared-library closure; each extra binary (cryptsetup) goes under /usr/sbin with its
+    // own closure. The closures are collected across every binary and deduplicated, so a
+    // library init and cryptsetup share is copied once, exactly as the base userland does.
+    copy_file(init_bin, &staging.join("init"))?;
+    let mut libs: Vec<PathBuf> = ldd_closure(init_bin)?;
+    for bin in &spec.initramfs_bins {
+        copy_file(bin, &staging.join(bin_sbin_path(bin)?))?;
+        for lib in ldd_closure(bin)? {
+            if !libs.contains(&lib) {
+                libs.push(lib);
+            }
+        }
+    }
+    for lib in &libs {
+        // Strip the leading slash so /lib/.../libc.so.6 lands under the initramfs root.
+        let rel = lib.strip_prefix("/").unwrap_or(lib);
+        copy_file(lib, &staging.join(rel))?;
+    }
+    build_ld_so_cache(&staging)?;
+
+    // The boot-path kernel modules and their dependency closure, if the kernel needs any
+    // loaded to reach the root (squashfs, overlay, the block driver). A kernel with those
+    // built in needs none, leaving no modules directory.
+    if !spec.initramfs_modules.is_empty() {
+        let version = spec
+            .kernel_version
+            .as_deref()
+            .ok_or(Error::NoKernelVersion)?;
+        populate_modules(
+            &staging,
+            &spec.modules_root,
+            version,
+            &spec.initramfs_modules,
+        )?;
+    }
+
+    // Import the staging tree into a cpio archive, then add the device nodes a staging
+    // directory on disk cannot hold without privilege: /dev/console so the init's console
+    // output is visible before it mounts devtmpfs, and /dev/null. The kernel creates the
+    // nodes on unpack.
+    let mut tree = cpio::read_dir_tree(&staging)?;
+    tree.device("dev/console", 0o600, cpio::NodeKind::Char, 5, 1)?;
+    tree.device("dev/null", 0o666, cpio::NodeKind::Char, 1, 3)?;
+    let archive = cpio::write(&tree);
+
+    // gzip the archive into the final image, the form a bootloader loads and the kernel
+    // detects and decompresses.
+    let out = spec.out.join(INITRAMFS_IMAGE);
+    gzip_to(&archive, &out)?;
+
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(out)
 }
 
 /// A partition to place on the assembled disk: the image file that fills it, its GPT type
@@ -719,6 +845,47 @@ fn bin_install_path(bin: &Path) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| Error::NotAFile(bin.to_path_buf()))?;
     Ok(Path::new("usr/bin").join(name))
+}
+
+// Where an extra initramfs binary is installed: /usr/sbin/<name>, where cryptsetup
+// conventionally lives, so its closure and any compiled-in paths line up.
+fn bin_sbin_path(bin: &Path) -> Result<PathBuf> {
+    let name = bin
+        .file_name()
+        .ok_or_else(|| Error::NotAFile(bin.to_path_buf()))?;
+    Ok(Path::new("usr/sbin").join(name))
+}
+
+// gzip `data` into `out` with `gzip -n -9`, the compression the kernel reads an initramfs
+// back from. Shelling out (gzip is present, like mksquashfs and cryptsetup) rather than
+// owning the format: gzip is neither absent nor fiddly-and-security-irrelevant the way the
+// owned formats are, and the reproducible artifact is the cpio archive, which is owned. `-n`
+// drops the filename and timestamp from the gzip header so the wrapper is reproducible given
+// the same archive. The archive is staged to a temp file and gzip's stdin/stdout are
+// redirected to files (not piped through this process) so a large initramfs never deadlocks.
+fn gzip_to(data: &[u8], out: &Path) -> Result<()> {
+    let tmp = out.with_file_name("initramfs.cpio");
+    std::fs::write(&tmp, data)?;
+    let infile = std::fs::File::open(&tmp)?;
+    let outfile = std::fs::File::create(out)?;
+    // status() (not output()) so the configured stdout File is respected rather than
+    // overridden by a capture pipe; gzip with no file operand reads stdin and writes stdout.
+    let status = Command::new("gzip")
+        .args(["-n", "-9"])
+        .stdin(infile)
+        .stdout(outfile)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(Error::Tool {
+            name: "gzip",
+            code: s.code(),
+            stderr: String::new(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::Missing("gzip")),
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 /// Install the userland into the staging tree: each binary at /usr/bin/<name>, the
@@ -2299,6 +2466,151 @@ mod linux_tests {
             assert_eq!(read_boot.unwrap(), boot, "{size_mb} MiB ESP: bootloader");
             assert_eq!(read_vmlinuz.unwrap(), vmlinuz, "{size_mb} MiB ESP: kernel");
             assert_eq!(read_initrd.unwrap(), initrd, "{size_mb} MiB ESP: initramfs");
+        }
+    }
+
+    // The initramfs cross-check: build a real initramfs, gunzip it, and parse the cpio back.
+    // There is no cpio tool to compare against (the reason this crate owns the format), so the
+    // proof is the reader half ([`cpio::read`]) walking the same bytes the kernel would, after
+    // a real `gzip` round-trip. It asserts the assembly is complete and correctly placed: the
+    // /init program at the root with its loader cache, the cryptsetup stand-in under /usr/sbin
+    // with the shared closure, the boot-path module with its modules.dep closure, and the
+    // /dev/console device node the build adds for the init's console output. The kernel
+    // actually unpacking and exec'ing /init is eye-verified at the QEMU boot. Skips where a
+    // build tool (ldd/ldconfig/gzip) is absent (a bare host, darwin runs the pure tests only).
+    #[test]
+    fn built_initramfs_gunzips_and_unpacks_with_init_tools_and_modules() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two ubiquitous dynamic binaries stand in for horizon-init and cryptsetup: their
+        // closures (libc and the loader) exercise the same machinery the real binaries use.
+        let init_probe = Path::new("/bin/cat");
+        let tool_probe = Path::new("/bin/echo");
+        if !init_probe.exists() || !tool_probe.exists() {
+            eprintln!("skipping: no /bin/cat or /bin/echo to assemble");
+            return;
+        }
+
+        // A tiny synthesized module tree: squashfs needs a stand-in dep, the kind of boot-path
+        // driver an initramfs carries; an unrelated module must stay out (the closure is exact).
+        let ver = "9.9.9-horizon";
+        let modsrc = dir.path().join("modsrc");
+        let moddir = modsrc.join(ver);
+        for (rel, body) in [
+            ("kernel/fs/squashfs/squashfs.ko", "squashfs"),
+            ("kernel/lib/decompress.ko", "decompress"),
+            ("kernel/drivers/net/unrelated.ko", "unrelated"),
+        ] {
+            let p = moddir.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        std::fs::write(
+            moddir.join("modules.dep"),
+            "kernel/fs/squashfs/squashfs.ko: kernel/lib/decompress.ko\n\
+             kernel/lib/decompress.ko:\n\
+             kernel/drivers/net/unrelated.ko:\n",
+        )
+        .unwrap();
+
+        let mut spec = KeySpec::new(dir.path());
+        spec.init_bin = Some(init_probe.to_path_buf());
+        spec.initramfs_bins = vec![tool_probe.to_path_buf()];
+        spec.kernel_version = Some(ver.to_string());
+        spec.modules_root = modsrc.clone();
+        spec.initramfs_modules = vec!["squashfs".to_string()];
+
+        let img = match build_initramfs(&spec) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) => panic!("build initramfs: {e}"),
+        };
+
+        // gunzip the image (the kernel reads it compressed; the test decompresses to inspect)
+        // and parse the newc cpio back into entries.
+        let gz = std::fs::read(&img).unwrap();
+        assert_eq!(&gz[..2], &[0x1f, 0x8b], "the image must be gzip-compressed");
+        let unzip = Command::new("gzip")
+            .args(["-dc"])
+            .arg(&img)
+            .output()
+            .unwrap();
+        assert!(
+            unzip.status.success(),
+            "gunzip failed: {}",
+            String::from_utf8_lossy(&unzip.stderr)
+        );
+        let entries = cpio::read(&unzip.stdout).expect("parse the cpio archive");
+
+        let find = |path: &str| {
+            entries.iter().find(|e| matches!(e, cpio::Entry::Dir { path: p, .. } | cpio::Entry::File { path: p, .. } | cpio::Entry::Symlink { path: p, .. } | cpio::Entry::Device { path: p, .. } if p == path))
+        };
+
+        // /init is the program the kernel execs as PID 1, executable, with the cat bytes intact.
+        match find("init").expect("/init present") {
+            cpio::Entry::File { mode, data, .. } => {
+                assert_eq!(mode & 0o111, 0o111, "/init must be executable");
+                assert_eq!(
+                    *data,
+                    std::fs::read(init_probe).unwrap(),
+                    "/init is the init bytes"
+                );
+            }
+            other => panic!("init should be a file, got {other:?}"),
+        }
+        // The cryptsetup stand-in landed under /usr/sbin with its closure.
+        assert!(
+            matches!(find("usr/sbin/echo"), Some(cpio::Entry::File { .. })),
+            "the extra tool must be under /usr/sbin"
+        );
+        // The loader cache the closure copy built, so libc resolves by soname at boot.
+        assert!(
+            matches!(find("etc/ld.so.cache"), Some(cpio::Entry::File { .. })),
+            "the ld.so.cache must be present"
+        );
+        // At least one shared object from the closure (the loader/libc) is on the image.
+        assert!(
+            entries.iter().any(|e| matches!(e, cpio::Entry::File { path, .. } if path.starts_with("lib/") && !path.starts_with("lib/modules/"))),
+            "the shared-library closure must be on the initramfs"
+        );
+        // The boot-path module and its dependency are there; the unrelated one is not.
+        let modroot = format!("lib/modules/{ver}");
+        assert!(
+            matches!(
+                find(&format!("{modroot}/kernel/fs/squashfs/squashfs.ko")),
+                Some(cpio::Entry::File { .. })
+            ),
+            "the boot-path module must be on the initramfs"
+        );
+        assert!(
+            matches!(
+                find(&format!("{modroot}/kernel/lib/decompress.ko")),
+                Some(cpio::Entry::File { .. })
+            ),
+            "the module dependency closure must be on the initramfs"
+        );
+        assert!(
+            find(&format!("{modroot}/kernel/drivers/net/unrelated.ko")).is_none(),
+            "an unrelated module must not be on the initramfs"
+        );
+        assert!(
+            matches!(
+                find(&format!("{modroot}/modules.dep")),
+                Some(cpio::Entry::File { .. })
+            ),
+            "the emitted modules.dep must be on the initramfs"
+        );
+        // The console device node, so horizon-init's output is visible before devtmpfs.
+        match find("dev/console").expect("/dev/console present") {
+            cpio::Entry::Device {
+                kind, major, minor, ..
+            } => {
+                assert_eq!((*kind, *major, *minor), (cpio::NodeKind::Char, 5, 1));
+            }
+            other => panic!("/dev/console should be a char device, got {other:?}"),
         }
     }
 }

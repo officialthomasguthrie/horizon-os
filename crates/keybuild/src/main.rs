@@ -13,7 +13,10 @@
 // --esp builds the FAT EFI System Partition (esp.img) with the /EFI/BOOT skeleton, the
 // partition firmware reads the bootloader from. --disk assembles the ESP, base, data, and
 // Home partitions into one bootable GPT disk (key.img), building the ESP, data, and Home
-// partitions too, so it needs --home-keyfile.
+// partitions too, so it needs --home-keyfile. --initramfs builds the initramfs (initramfs.img,
+// a gzip newc cpio) with /init from --init-bin (horizon-init), each --initramfs-bin
+// (cryptsetup) under /usr/sbin, and each --initramfs-module under /lib/modules/<kver>, all
+// with their shared-library / modules.dep closures.
 // The build logic is in the keybuild library, tested there; this is the thin CLI over it.
 
 use std::path::PathBuf;
@@ -32,6 +35,10 @@ struct Args {
     home_keyfile: Option<PathBuf>,
     esp: bool,
     disk: bool,
+    initramfs: bool,
+    init_bin: Option<PathBuf>,
+    initramfs_bins: Vec<PathBuf>,
+    initramfs_modules: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -41,7 +48,9 @@ fn main() -> ExitCode {
             "usage: horizon-keybuild --out <dir> [--bin <path>]... \
              [--kver <version> --module <name>...] [--modules-root <dir>] \
              [--firmware <path>]... [--firmware-root <dir>] [--verity] \
-             [--home --home-keyfile <32-byte-master>] [--esp] [--disk]"
+             [--home --home-keyfile <32-byte-master>] [--esp] [--disk] \
+             [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
+             [--initramfs-module <name>]...]"
         );
         return ExitCode::FAILURE;
     };
@@ -57,8 +66,12 @@ fn main() -> ExitCode {
     if let Some(root) = parsed.firmware_root {
         spec.firmware_root = root;
     }
+    spec.init_bin = parsed.init_bin;
+    spec.initramfs_bins = parsed.initramfs_bins;
+    spec.initramfs_modules = parsed.initramfs_modules;
     let verity = parsed.verity;
     let disk = parsed.disk;
+    let initramfs = parsed.initramfs;
     // The assembled disk carries the encrypted Home and ESP partitions, so --disk needs the
     // master too; build the Home layer and the ESP whenever either flag asks for it.
     let home = parsed.home || disk;
@@ -141,6 +154,24 @@ fn main() -> ExitCode {
                     }
                 }
             }
+            // The initramfs: the cpio root filesystem the kernel unpacks before any disk,
+            // holding /init (horizon-init) and cryptsetup with their closures and the
+            // boot-path modules. Independent of the disk for now; the bootloader step writes
+            // it into the ESP.
+            if initramfs {
+                match keybuild::build_initramfs(&spec) {
+                    Ok(p) => println!(
+                        "initramfs: built {} (gzip newc cpio: /init plus {} tool(s), {} module(s))",
+                        p.display(),
+                        spec.initramfs_bins.len(),
+                        spec.initramfs_modules.len()
+                    ),
+                    Err(e) => {
+                        eprintln!("horizon-keybuild: initramfs: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             // Assemble the partitions into a bootable GPT disk. The disk carries the plain
             // data store partition too, so build it here; the base, the Home layer, and the
             // ESP are already built above.
@@ -187,6 +218,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut home_keyfile = None;
     let mut esp = false;
     let mut disk = false;
+    let mut initramfs = false;
+    let mut init_bin = None;
+    let mut initramfs_bins = Vec::new();
+    let mut initramfs_modules = Vec::new();
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -202,6 +237,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--home-keyfile" => home_keyfile = Some(PathBuf::from(it.next()?)),
             "--esp" => esp = true,
             "--disk" => disk = true,
+            "--initramfs" => initramfs = true,
+            "--init-bin" => init_bin = Some(PathBuf::from(it.next()?)),
+            "--initramfs-bin" => initramfs_bins.push(PathBuf::from(it.next()?)),
+            "--initramfs-module" => initramfs_modules.push(it.next()?.clone()),
             _ => return None,
         }
     }
@@ -218,6 +257,10 @@ fn parse_args(args: &[String]) -> Option<Args> {
         home_keyfile,
         esp,
         disk,
+        initramfs,
+        init_bin,
+        initramfs_bins,
+        initramfs_modules,
     })
 }
 

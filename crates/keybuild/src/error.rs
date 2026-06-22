@@ -39,6 +39,13 @@ pub enum Error {
     /// The ESP partition is too small to format as a valid FAT16/FAT32 filesystem.
     #[error("ESP is too small to format as FAT: {0} bytes")]
     EspTooSmall(u64),
+    /// A cpio archive could not be built or parsed: a malformed path on write, or a
+    /// corrupt header/field on read (the reader half that cross-checks the writer).
+    #[error("cpio: {0}")]
+    Cpio(&'static str),
+    /// `build_initramfs` was called without naming the `/init` binary to install as PID 1.
+    #[error("an init binary is required to build the initramfs")]
+    NoInitBin,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
