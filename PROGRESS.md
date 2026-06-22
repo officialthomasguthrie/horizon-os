@@ -1315,6 +1315,42 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   as vfat and reads those long-named configs back by their long paths, which only correct LFN
   entries make possible (a wrong checksum or layout would surface the short alias instead). Built
   and tested on darwin and in the Linux container.
+- Phase 0 bootloader proper (`keybuild` crate + `horizon-keybuild`): the ESP now carries a real,
+  loadable bootloader, finishing Phase 0 step (4). UEFI firmware runs an EFI application off the ESP,
+  which loads the kernel and the initramfs; `build_esp`, which until now laid only the `/EFI/BOOT`
+  skeleton, now lays a loadable EFI System Partition when the spec names a `kernel` and a `bootloader`:
+  the bootloader (systemd-boot, or shim for Secure Boot) at the removable path `/EFI/BOOT/BOOTX64.EFI`
+  that firmware runs with no boot entry configured, the kernel and the built `initramfs.img` at the
+  root as `VMLINUZ` and `INITRD.IMG`, any extra EFI binaries under `/EFI/BOOT`, and the systemd-boot
+  loader config; with neither it lays the skeleton, the reproducible default. The loader config is the
+  owned text format: `loader.conf` (the default entry and the menu timeout) and `entries/horizon.conf`
+  (the title, the kernel and initramfs paths, and the `options` line), both written by their long
+  names through the new VFAT long-name support. The `options` line is `boot_cmdline(spec)` plus a
+  `horizon.verity=<roothash>` token when the base is verity-protected, the dm-verity trust anchor the
+  loader hands the init (from the signed or measured config, never the disk); the whole line
+  round-trips through `init`'s own `parse_cmdline` back to the verity root in a pure test, so a build
+  and a boot cannot drift. `build_disk` now also lays the dm-verity hash device as a `HORIZON-VERITY`
+  partition (right after the base it hashes, generic Linux type GUID, told apart by its label)
+  whenever `build_verity` has produced `base.verity`, so the init's default `horizon.veritydev` label
+  resolves it; `disk_parts` is the pure layout, asserted with no tools. `horizon-keybuild` gains
+  `--kernel`, `--bootloader`, `--esp-efi`, and `--loader-timeout`, threads the verity root hash from
+  `--verity` into the loader config, and builds the initramfs before the ESP so a bootable ESP can
+  write it in. On the usual headless split the kernel and bootloader are external artifacts (host
+  paths, fetched or cross-compiled, eye-verified at the QEMU boot, the one part this container cannot
+  run); the assembly, the layout, and the loader config are proven without them: pure unit tests for
+  the loader config and the verity partition's place in `disk_parts`, plus gated container tests that
+  loop-mount a self-built bootable ESP as vfat and read the bootloader, kernel, initramfs, and the
+  long-named loader configs back through the kernel's own FAT driver, and that the assembled disk
+  carries the verity partition (its dm-verity superblock magic at the GPT offset) alongside the four
+  filesystems. Verified end to end through the binary in the container: `horizon-keybuild --disk
+  --verity --kernel ... --bootloader ... --initramfs ...` built a five-partition bootable Key
+  (HORIZON-ESP / -BASE / -VERITY / -DATA / -HOME) whose ESP holds the bootloader, kernel, and
+  initramfs and whose `entries/horizon.conf` carries the boot command line plus the `horizon.verity=`
+  root hash `build_verity` printed. This completes Phase 0 step (4): the Key is fully assembled,
+  bootloader and all. Left next, step (5): fetch or cross-compile the real kernel + systemd-boot +
+  shim and boot the whole chain in QEMU (UEFI -> systemd-boot -> kernel -> horizon-init -> horizon
+  boot -> the desktop), where the dm-verity/dm-crypt kernel opens and the init's orchestration get
+  their eye-verification. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1524,13 +1560,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   And init's own `dm-verity` open over the base: `init::verity_open` shells to `veritysetup` (pure args plus a
   Linux shell-out, the analog of `luks_open` for dm-crypt) and `parse_cmdline` reads a `horizon.verity=<roothash>`
   token, so a tampered base fails to boot; the kernel open is eye-verified at the QEMU boot since this container
-  lacks `CONFIG_DM_VERITY`.
-  What is left, to finish step (4): the UEFI bootloader itself (the kernel, the built initramfs, and systemd-boot
-  written into the ESP via `build_esp_with`, with shim for Secure Boot), the systemd-boot loader config carrying
-  the boot command line and the `horizon.verity` dm-verity root hash (which needs VFAT long names in
-  `keybuild::fat`, since `loader.conf`/`entries/*.conf` do not fit 8.3), and the verity hash device laid on the
-  assembled disk as the `HORIZON-VERITY` partition so the init resolves it;
-  and finally (5) booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
+  lacks `CONFIG_DM_VERITY`. And the bootloader proper, which completes step (4): VFAT long names in `keybuild::fat`
+  (so systemd-boot's `loader.conf`/`entries/*.conf` fit the FAT writer), `build_esp` laying systemd-boot at
+  `/EFI/BOOT/BOOTX64.EFI` with the kernel and the built initramfs and the loader config (the boot command line
+  plus the `horizon.verity` root hash), and the verity hash device laid on the disk as the `HORIZON-VERITY`
+  partition the init resolves, all proven by a vfat-mount cross-check and end to end through `horizon-keybuild
+  --disk --verity --kernel ... --bootloader ...` building a five-partition bootable Key.
+  Step (4) is now complete; what is left is step (5): fetch or cross-compile the real kernel + systemd-boot + shim,
+  then boot the whole chain in QEMU (UEFI -> systemd-boot -> kernel ->
   horizon-init -> horizon boot -> the DRM desktop on virtio-gpu), where the init's boot orchestration
   and the dm-verity/dm-crypt kernel opens get their eye-verification. Refinements that ride along with
   the boot bring-up: a FIDO2 key at the initramfs (touch-to-boot, not only a console passphrase),
