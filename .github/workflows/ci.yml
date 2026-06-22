@@ -22,8 +22,10 @@ jobs:
       # renderer (the `render` feature) links libpixman. The winit/EGL/GL bindings
       # are pure Rust (loaded at runtime), but the bare-metal DRM/KMS backend (the
       # `udev` feature) links real system libraries: libdrm, libgbm, libinput,
-      # libseat, and libudev.
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libpixman-1-dev libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev
+      # libseat, and libudev. cryptsetup-bin provides veritysetup, the reference
+      # the keybuild dm-verity tests cross-check the hash tree against byte-for-byte
+      # (an unprivileged, file-only check: no loop devices, so it runs in CI).
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libpixman-1-dev libdrm-dev libgbm-dev libinput-dev libseat-dev libudev-dev cryptsetup-bin
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo clippy -p compositor --all-targets --features render -- -D warnings

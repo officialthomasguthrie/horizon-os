@@ -22,6 +22,9 @@ path = "src/main.rs"
 # init's types: the build/boot contract lives in one place.
 init = { path = "../init" }
 thiserror.workspace = true
+# dm-verity over the base is a SHA-256 Merkle hash tree (the format veritysetup writes),
+# so the hash primitive is SHA-256, not the BLAKE3 the Lifestream addresses with.
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

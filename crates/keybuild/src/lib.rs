@@ -22,12 +22,20 @@
 //! result need a Linux kernel and are gated, run for real in a privileged container. The
 //! module dependency closure and placement are plain filesystem work, so they are proven
 //! everywhere; producing the binary module index (`modules.dep.bin`) the kernel's module
-//! autoloader consults is a `depmod` pass that lands with the real kernel toolchain. The
-//! persistent data partition and the bootloader come next.
+//! autoloader consults is a `depmod` pass that lands with the real kernel toolchain.
+//!
+//! [`build_verity`] then makes the base tamper-evident: it builds a SHA-256 dm-verity
+//! Merkle hash tree over `base.squashfs` (see [`mod@verity`]) and writes the hash device to
+//! `base.verity`, returning the root hash that anchors it. The tree is owned pure Rust, not
+//! a shell-out, so it builds and the hashing tests run on any host; a gated test proves the
+//! bytes match `veritysetup format` exactly, and the kernel's `dm-verity` open is
+//! eye-verified by booting. The bootloader comes next.
 
 mod error;
+pub mod verity;
 
 pub use error::{Error, Result};
+pub use verity::{Verity, VerityParams};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -41,6 +49,9 @@ pub const BASE_IMAGE: &str = "base.squashfs";
 
 /// The persistent data image's filename under a spec's output directory.
 pub const DATA_IMAGE: &str = "data.img";
+
+/// The base image's dm-verity hash device filename under a spec's output directory.
+pub const VERITY_IMAGE: &str = "base.verity";
 
 /// The parameters of a Key to build: where to write it, the partition labels and
 /// filesystems init looks for, the default boot mode, and how the system names itself.
@@ -234,6 +245,49 @@ pub fn build_data(spec: &KeySpec) -> Result<PathBuf> {
         .stdout(std::process::Stdio::null());
     run(cmd, "mkfs.ext4")?;
     Ok(out)
+}
+
+/// What a verity build produced: the hash device image and the root hash that anchors it.
+/// The root is the trust anchor a bootloader carries (signed or measured) and hands the
+/// kernel's `dm-verity` target, which then catches any tampering of the immutable base.
+#[derive(Debug, Clone)]
+pub struct VerityArtifact {
+    /// The hash device image written next to the base.
+    pub image: PathBuf,
+    pub root_hash: [u8; verity::DIGEST_SIZE],
+    pub data_blocks: u64,
+    pub levels: usize,
+}
+
+impl VerityArtifact {
+    /// The root hash as lowercase hex, the form a boot command line carries.
+    pub fn root_hex(&self) -> String {
+        verity::to_hex(&self.root_hash)
+    }
+}
+
+/// Build the dm-verity hash device over the immutable base: read `<out>/base.squashfs`,
+/// compute its [`verity::format`] Merkle tree with the reproducible defaults, and write the
+/// hash device to `<out>/base.verity`. Returns the image path and the root hash. The base
+/// must already be built ([`build_base`]). The hash tree and root are a pure function of the
+/// base bytes, so a reproducible base yields a reproducible hash device and root; the
+/// kernel's `dm-verity` opens this image unchanged (eye-verified by booting), and a gated
+/// test proves the bytes match `veritysetup format` exactly.
+pub fn build_verity(spec: &KeySpec) -> Result<VerityArtifact> {
+    let base = spec.out.join(BASE_IMAGE);
+    // The base is a modest image; read it whole. (Streaming the data blocks is a later
+    // refinement if base images ever grow large enough to matter.)
+    let data = std::fs::read(&base)?;
+    let v = verity::format(&data, &VerityParams::default());
+
+    let out = spec.out.join(VERITY_IMAGE);
+    std::fs::write(&out, &v.hash_device)?;
+    Ok(VerityArtifact {
+        image: out,
+        root_hash: v.root_hash,
+        data_blocks: v.data_blocks,
+        levels: v.levels,
+    })
 }
 
 fn materialize(skeleton: &Skeleton, staging: &Path) -> Result<()> {
@@ -1274,5 +1328,152 @@ mod linux_tests {
         assert!(!foo, "an unrelated module must not be on the image");
         assert!(dep.unwrap().contains("kernel/fs/ext4/ext4.ko"));
         assert_eq!(fw.unwrap(), b"firmware-blob");
+    }
+
+    // Cross-check the verity hash device byte-for-byte against `veritysetup format`, the
+    // reference implementation. This is the proof the owned SHA-256 Merkle tree is exactly
+    // the on-disk format the kernel's dm-verity target reads: the same superblock, level
+    // layout, salted digests, and root. It needs only the veritysetup binary (no loop
+    // devices, no root), so it runs in CI as well as the container, and skips where
+    // veritysetup is absent.
+
+    // Run `veritysetup format` over `data` with the given params and return the bytes it
+    // wrote to the hash device and the root hash it printed, or None if veritysetup is not
+    // installed (so the caller skips rather than fails).
+    fn veritysetup_format(dir: &Path, data: &[u8], p: &VerityParams) -> Option<(Vec<u8>, String)> {
+        let data_path = dir.join("data.img");
+        let hash_path = dir.join("hash.img");
+        std::fs::write(&data_path, data).unwrap();
+        std::fs::write(&hash_path, b"").unwrap(); // veritysetup writes into an existing file
+
+        let data_blocks = (data.len() / p.data_block_size as usize).max(1);
+        let out = match Command::new("veritysetup")
+            .arg("format")
+            .arg("--hash=sha256")
+            .arg(format!("--data-block-size={}", p.data_block_size))
+            .arg(format!("--hash-block-size={}", p.hash_block_size))
+            .arg(format!("--data-blocks={data_blocks}"))
+            .arg(format!("--salt={}", verity::to_hex(&p.salt)))
+            .arg(format!("--uuid={}", verity::format_uuid(&p.uuid)))
+            .arg(&data_path)
+            .arg(&hash_path)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping: veritysetup not installed");
+                return None;
+            }
+            Err(e) => panic!("spawn veritysetup: {e}"),
+        };
+        assert!(
+            out.status.success(),
+            "veritysetup format failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The "Root hash:" line carries the value as its last whitespace token.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let root = stdout
+            .lines()
+            .find(|l| l.contains("Root hash"))
+            .and_then(|l| l.split_whitespace().last())
+            .expect("veritysetup printed a root hash")
+            .to_string();
+        Some((std::fs::read(&hash_path).unwrap(), root))
+    }
+
+    // Compare two hash devices, reporting the first differing offset and a window around it
+    // so a format mismatch is quick to locate rather than an opaque "vectors differ".
+    fn assert_bytes_eq(ours: &[u8], theirs: &[u8]) {
+        if ours == theirs {
+            return;
+        }
+        let at = ours
+            .iter()
+            .zip(theirs.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(ours.len().min(theirs.len()));
+        let lo = at.saturating_sub(8);
+        let hi = (at + 24).min(ours.len()).min(theirs.len()).max(lo);
+        panic!(
+            "hash device differs at offset {at} (ours {} bytes, veritysetup {} bytes)\n ours:   {:02x?}\n vsetup: {:02x?}",
+            ours.len(),
+            theirs.len(),
+            &ours[lo..hi],
+            &theirs[lo..hi],
+        );
+    }
+
+    // Deterministic, non-zero, block-varying data so adjacent block hashes differ.
+    fn aligned(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8 + 1).collect()
+    }
+
+    #[test]
+    fn verity_matches_veritysetup_byte_for_byte() {
+        // A 32-byte salt, and cases of (data_blocks, data_block_size, hash_block_size): a
+        // single level, a two-level tree, and a three-level tree forced cheaply with small
+        // hash blocks (hashes per block = 1024/32 = 32, so 1025 data blocks needs three
+        // levels) on differing data and hash block sizes.
+        let salt = b"horizon cross-check salt 32 byte".to_vec();
+        let cases: &[(usize, u32, u32)] = &[
+            (1, 4096, 4096),
+            (5, 4096, 4096),
+            (200, 4096, 4096),
+            (1025, 512, 1024),
+        ];
+        let mut ran = false;
+        for &(blocks, dbs, hbs) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let params = VerityParams {
+                data_block_size: dbs,
+                hash_block_size: hbs,
+                salt: salt.clone(),
+                uuid: verity::DEFAULT_UUID,
+            };
+            let data = aligned(blocks * dbs as usize);
+            let ours = verity::format(&data, &params);
+            let Some((theirs_bytes, theirs_root)) = veritysetup_format(dir.path(), &data, &params)
+            else {
+                return; // veritysetup absent: skip the whole test
+            };
+            ran = true;
+            assert_eq!(
+                ours.root_hex(),
+                theirs_root,
+                "root hash mismatch for {blocks} blocks ({dbs}/{hbs})"
+            );
+            assert_bytes_eq(&ours.hash_device, &theirs_bytes);
+        }
+        assert!(ran, "at least one case must have run");
+    }
+
+    #[test]
+    fn build_verity_over_a_real_base_matches_veritysetup() {
+        // The whole producer path on the real image: build a squashfs base, run build_verity
+        // to emit base.verity with the default reproducible params, and cross-check that file
+        // and its root against veritysetup over the same base.squashfs. Proves the defaults
+        // (salt, uuid, block size) are exactly what veritysetup writes and that build_verity
+        // places the hash device correctly.
+        let dir = tempfile::tempdir().unwrap();
+        let Some(base) = build_or_skip(dir.path()) else {
+            return;
+        };
+        let artifact = build_verity(&KeySpec::new(dir.path())).unwrap();
+        let our_bytes = std::fs::read(&artifact.image).unwrap();
+
+        let data = std::fs::read(&base).unwrap();
+        // mksquashfs pads to a 4K boundary, so the base is hash-block aligned; assert it,
+        // since an unaligned base would make veritysetup and our reader disagree on the tail.
+        assert_eq!(data.len() % verity::DEFAULT_BLOCK_SIZE as usize, 0);
+
+        let xdir = tempfile::tempdir().unwrap();
+        let Some((theirs_bytes, theirs_root)) =
+            veritysetup_format(xdir.path(), &data, &VerityParams::default())
+        else {
+            return;
+        };
+        assert_eq!(artifact.root_hex(), theirs_root);
+        assert_bytes_eq(&our_bytes, &theirs_bytes);
     }
 }

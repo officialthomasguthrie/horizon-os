@@ -6,8 +6,9 @@
 // with its shared-library closure, so `--bin target/release/horizon --bin
 // target/release/horizon-init` makes a base that boots. --module installs a kernel
 // module and its modules.dep closure under /lib/modules/<kver>, and --firmware copies a
-// firmware blob under /lib/firmware, so the base drives hardware. The build logic is in
-// the keybuild library, tested there; this is the thin CLI over it.
+// firmware blob under /lib/firmware, so the base drives hardware. --verity builds the
+// dm-verity hash tree over the base into base.verity and prints the root hash that anchors
+// it. The build logic is in the keybuild library, tested there; this is the thin CLI over it.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ struct Args {
     modules_root: Option<PathBuf>,
     firmware: Vec<String>,
     firmware_root: Option<PathBuf>,
+    verity: bool,
 }
 
 fn main() -> ExitCode {
@@ -28,7 +30,7 @@ fn main() -> ExitCode {
         eprintln!(
             "usage: horizon-keybuild --out <dir> [--bin <path>]... \
              [--kver <version> --module <name>...] [--modules-root <dir>] \
-             [--firmware <path>]... [--firmware-root <dir>]"
+             [--firmware <path>]... [--firmware-root <dir>] [--verity]"
         );
         return ExitCode::FAILURE;
     };
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
     if let Some(root) = parsed.firmware_root {
         spec.firmware_root = root;
     }
+    let verity = parsed.verity;
 
     match keybuild::build_base(&spec) {
         Ok(path) => {
@@ -63,6 +66,25 @@ fn main() -> ExitCode {
             if !spec.firmware.is_empty() {
                 println!("firmware: {} blob(s)", spec.firmware.len());
             }
+            // dm-verity over the just-built base: a tamper-evident immutable layer anchored
+            // by the printed root hash, which a bootloader carries (signed or measured).
+            if verity {
+                match keybuild::build_verity(&spec) {
+                    Ok(v) => {
+                        println!(
+                            "verity: built {} ({} data blocks, {} tree level(s))",
+                            v.image.display(),
+                            v.data_blocks,
+                            v.levels
+                        );
+                        println!("verity root: {}", v.root_hex());
+                    }
+                    Err(e) => {
+                        eprintln!("horizon-keybuild: verity: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
             println!("boot cmdline: {}", keybuild::boot_cmdline(&spec));
             ExitCode::SUCCESS
         }
@@ -81,6 +103,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut modules_root = None;
     let mut firmware = Vec::new();
     let mut firmware_root = None;
+    let mut verity = false;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -91,6 +114,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--modules-root" => modules_root = Some(PathBuf::from(it.next()?)),
             "--firmware" => firmware.push(it.next()?.clone()),
             "--firmware-root" => firmware_root = Some(PathBuf::from(it.next()?)),
+            "--verity" => verity = true,
             _ => return None,
         }
     }
@@ -102,5 +126,6 @@ fn parse_args(args: &[String]) -> Option<Args> {
         modules_root,
         firmware,
         firmware_root,
+        verity,
     })
 }
