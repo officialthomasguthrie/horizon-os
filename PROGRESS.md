@@ -1097,6 +1097,31 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   ext4, with a missing keyfile cleanly rejected. The kernel `dm-crypt` open at boot (the init recovering the
   master and unlocking this layer before assembling the overlay, plus the Ghost read-only store handoff) is
   the next piece. Built and tested on darwin and in the Linux container.
+- Phase 0 encrypted Home boot-time open (`init` crate + keybuild encrypted keystone): the init can now open
+  the encrypted Home writable layer at boot with the master recovered from the store, the consumer side of
+  the LUKS2 layer keybuild produces. The label contract gains `HORIZON-HOME` (in `init` alongside
+  `HORIZON-BASE`/`HORIZON-DATA`, so the build and boot agree by shared type, not convention; keybuild
+  re-exports it), and the kernel command line gains `horizon.home=`/`horizon.homefs=` (default
+  `LABEL=HORIZON-HOME` / ext4), parsed into `Params` like the base and data devices, so a Key boots with no
+  explicit command line. `init::luks_open` shells out to `cryptsetup luksOpen`, feeding the 32-byte master
+  on stdin (exactly `MASTER_KEY_SIZE` bytes, so a master containing a newline is not truncated and never
+  lands in a key file or an argument), exposing the decrypted volume at `/dev/mapper/horizon-home`;
+  `luks_close` tears it down. On the usual split the argv construction is pure and unit-tested on every host
+  (luksOpen, the exact 32-byte stdin key, the container and mapper positionals) while the execution needs
+  device-mapper and is proven in the container. The proof is an encrypted keystone, a container integration
+  test (in keybuild, which reaches across all the crates) that builds a squashfs base, a plain ext4 data
+  partition, and a LUKS2 Home layer keyed by the master, initializes the identity store on the data
+  partition, then assembles exactly as a Home boot does: mount the base read-only as the overlay lower,
+  mount the data partition, recover the master from the store with an enrolled token (`boot::unlock`), open
+  the Home layer with that master (`init::luks_open`), and overlay the decrypted layer over the base. It
+  asserts the recovered master opens the layer, a write to the root lands in the encrypted upper (not the
+  immutable base), the base shows through, and `boot::boot` opens the carried identity, all on the real
+  squashfs + ext4 + LUKS2 formats, short of the switch_root that needs an actual boot. The store stays on
+  the plain data partition (its confidentiality is the Lifestream's own object encryption), which is what
+  lets the master be recovered before the layer it unlocks is opened. Left next: wiring the `horizon-init`
+  binary to do this at real boot (mount the store partition, recover the master through a present
+  authenticator or a console passphrase, luksOpen, assemble) plus the Ghost read-only store handoff,
+  eye-verified by booting. Built and tested on darwin and in the Linux container.
 
 ## Next
 
