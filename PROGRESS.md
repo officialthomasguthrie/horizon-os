@@ -1227,6 +1227,50 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   initramfs) written into this ESP, the loader config carrying the boot command line and the dm-verity root
   hash, and init's own `dm-verity` open over the base; then the QEMU boot. Refinement still owed: VFAT long
   names for a loader that needs them. Built and tested on darwin and in the Linux container.
+- Phase 0 initramfs (`keybuild` crate + `horizon-keybuild`): the root filesystem the kernel unpacks before any
+  disk is mounted is now built, continuing step (4) after the ESP. The kernel cannot mount the Key's squashfs
+  base, recover the identity, or open the encrypted Home layer on its own; it execs one program, `/init`, out
+  of an initramfs, and that program (`horizon-init`) does the rest. A new `keybuild::cpio` owns the `newc` cpio
+  format (the one the kernel unpacks) in pure Rust: the writer (110-byte 8-hex-digit-field records, the NUL-
+  terminated name and the data each padded to 4 bytes, a `TRAILER!!!` record, directories with no data,
+  symlinks carrying their target, and character/block device nodes carrying the rdev major/minor, every record
+  a unique inode with `nlink` 1 so the kernel never coalesces two into a hardlink), the reader half (`cpio::read`)
+  that parses an archive back, a `Tree` authoring API (`mkdir`/`insert_file`/`symlink`/`device`), and
+  `read_dir_tree` to import a populated staging directory. It owns the format for the same reasons `gpt`,
+  `verity`, and `fat` do and the inverse of `luks`: the container has no `cpio` (and no `busybox`), the archive
+  is a deterministic function of its contents so an initramfs is reproducible (uid/gid 0, mtime 0, inodes by a
+  deterministic walk), and the format is fiddly but not security-critical, so it is pure logic that builds and
+  tests on any host; the gzip wrapper shells out to `gzip` (present, like `mksquashfs`/`cryptsetup`) while the
+  cpio itself is owned, since gzip is neither absent nor fiddly-and-secret. The busybox decision: none is
+  vendored, and neither are coreutils. `horizon-init` does its mounting, OverlayFS assembly, bind, move, and
+  `switch_root` with syscalls (nix) and recovers the master in-process, shelling out only to `cryptsetup` to
+  open the Home layer, so the boot path is one real program plus that one tool, not a shell driving applets.
+  `build_initramfs` assembles it with the same binary-and-closure machinery as the base: `/init` (the
+  `init_bin`, `horizon-init`) with its `ldd` closure, `cryptsetup` under `/usr/sbin` with its closure (the two
+  share libraries, copied once), the boot-path `initramfs_modules` with their `modules.dep` closure, an
+  `ld.so.cache`, and the `/dev/console` and `/dev/null` device nodes (added to the cpio tree directly, since a
+  staging directory cannot hold a node without privilege; `/dev/console` is why the init's console output is
+  visible before it mounts devtmpfs), packed to a `newc` cpio and gzipped to `initramfs.img`. On the usual
+  headless split the whole format is pure and unit-tested on every host (a tree of files, directories,
+  symlinks, and device nodes round-tripping through `cpio::read`, the pinned `newc` header fields, unique
+  inodes, reproducibility, rejected bad paths and corrupt archives, and `read_dir_tree` importing a real
+  directory); the proof the built image is coherent is a gated container test that gunzips a freshly built
+  initramfs and parses the cpio back, asserting `/init` is the executable init bytes, the cryptsetup stand-in is
+  under `/usr/sbin` with its shared-library closure, the boot-path module and its dependency are present (an
+  unrelated one excluded), and `/dev/console` is a char device, the reader half standing in for the absent cpio
+  tool exactly as the FAT mount and the `veritysetup` cross-check do for their formats; the kernel actually
+  unpacking and exec'ing `/init` is eye-verified at the QEMU boot, the dm-verity model when the kernel consumer
+  is absent. `horizon-keybuild --initramfs --init-bin <p> [--initramfs-bin <p>]... [--initramfs-module <n>]...`
+  builds it. Verified end to end through the binary in the container: it built a 6.7 MiB gzipped `newc` cpio (21
+  MiB unpacked) holding the real `horizon-init` at `/init`, the real `cryptsetup` at `/usr/sbin/cryptsetup` with
+  its full closure (libcryptsetup, libcrypto, libargon2, libdevmapper, libjson-c, libblkid, libudev, the loader,
+  ...), the `ld.so.cache`, the `/dev/console` and `/dev/null` nodes, and exactly one `TRAILER!!!`. Refinement
+  owed (surfaced building this): `horizon-init` invokes `cryptsetup` by name through `PATH`, but the kernel
+  gives PID 1 no `PATH`, so it needs an absolute path or a set `PATH` at the real boot, eye-verified at the
+  QEMU boot alongside the other init refinements. Left next, to finish step (4): the bootloader proper (shim ->
+  systemd-boot/GRUB -> kernel + this initramfs) written into the ESP via `build_esp_with`, the loader config
+  carrying the boot command line and the dm-verity root hash, and init's own `dm-verity` open over the base;
+  then the QEMU boot. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1423,19 +1467,29 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `build_esp` lays the `/EFI/BOOT` skeleton and `build_disk` puts the ESP at partition one with the EFI
   System Partition type GUID, proven by a pure suite (round-tripping a tree through an in-test FAT reader for
   both types) and a container test that loop-mounts the self-built ESP as `vfat` and reads its files back,
-  the kernel's own FAT driver the cross-check.
+  the kernel's own FAT driver the cross-check. And the initramfs, the root filesystem the kernel unpacks
+  before any disk: `keybuild::cpio` owns the `newc` cpio format in pure Rust (the writer, the `cpio::read`
+  reader half, a `Tree` authoring API, and `read_dir_tree`) for the same reasons gpt/verity/fat own theirs
+  (no `cpio`/`busybox` in the container, deterministic and reproducible, fiddly but not secret), with the
+  gzip wrapper shelled out like `mksquashfs`; no busybox or coreutils are vendored, since `horizon-init`
+  mounts, assembles the overlay, and `switch_root`s with syscalls and shells out only to `cryptsetup`, so
+  `build_initramfs` packs `/init` (horizon-init) and `cryptsetup` with their `ldd` closures, the boot-path
+  modules with their `modules.dep` closure, and the `/dev/console`/`/dev/null` nodes into a gzipped
+  `initramfs.img`, proven by a pure round-trip suite and a container test that gunzips a built image and
+  parses the cpio back, with the kernel unpacking it eye-verified at the QEMU boot.
   What is left, to finish step (4): the isohybrid UEFI/BIOS bootloader itself (shim -> systemd-boot/GRUB ->
-  kernel + initramfs) written into the ESP, the loader config carrying the boot command line and the
-  dm-verity root hash, and init's own `dm-verity` open (it opens dm-crypt for the Home layer but not yet
-  dm-verity over the base);
+  kernel + the built initramfs) written into the ESP via `build_esp_with`, the loader config carrying the
+  boot command line and the dm-verity root hash, and init's own `dm-verity` open (it opens dm-crypt for the
+  Home layer but not yet dm-verity over the base);
   and finally (5) booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
   horizon-init -> horizon boot -> the DRM desktop on virtio-gpu), where the init's boot orchestration
   and the dm-verity/dm-crypt kernel opens get their eye-verification. Refinements that ride along with
   the boot bring-up: a FIDO2 key at the initramfs (touch-to-boot, not only a console passphrase),
-  handing the master from init to horizon boot so the session does not unlock twice, and udev (or
+  handing the master from init to horizon boot so the session does not unlock twice, `horizon-init`
+  reaching `cryptsetup` by an absolute path or a set `PATH` (the kernel gives PID 1 none), and udev (or
   UUID) resolution so by-label finds the partitions in a minimal initramfs. Environment notes for
   that last stretch: this build container is aarch64 with no KVM, so a shippable x86-64
-  Key needs cross-compilation (the `x86_64-unknown-linux-gnu` target plus a kernel,
-  busybox, and libs) and QEMU runs in TCG; an aarch64 image booted with
+  Key needs cross-compilation (the `x86_64-unknown-linux-gnu` target plus a kernel and
+  libs) and QEMU runs in TCG; an aarch64 image booted with
   qemu-system-aarch64 proves the chain on the native ISA short of the x86-64 product.
   Keep build artifacts off the 92%-full `/work` mount (use the container's own fs).
