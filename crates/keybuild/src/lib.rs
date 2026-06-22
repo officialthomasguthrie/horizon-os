@@ -29,12 +29,21 @@
 //! `base.verity`, returning the root hash that anchors it. The tree is owned pure Rust, not
 //! a shell-out, so it builds and the hashing tests run on any host; a gated test proves the
 //! bytes match `veritysetup format` exactly, and the kernel's `dm-verity` open is
-//! eye-verified by booting. The bootloader comes next.
+//! eye-verified by booting.
+//!
+//! [`build_home`] builds the writable side a Home Surface persists into: a LUKS2 container
+//! (`home.img`) keyed by the identity master, holding the OverlayFS upper encrypted at
+//! rest (see [`mod@luks`]). Unlike verity this shells out to `cryptsetup`, because LUKS2's
+//! format is complex and security-critical and the kernel's `dm-crypt` open is testable
+//! here, so the whole round-trip is proven for real in the container rather than matched
+//! byte-for-byte. The bootloader comes next.
 
 mod error;
+pub mod luks;
 pub mod verity;
 
 pub use error::{Error, Result};
+pub use luks::HOME_LABEL;
 pub use verity::{Verity, VerityParams};
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +62,10 @@ pub const DATA_IMAGE: &str = "data.img";
 /// The base image's dm-verity hash device filename under a spec's output directory.
 pub const VERITY_IMAGE: &str = "base.verity";
 
+/// The encrypted Home writable layer's filename under a spec's output directory: a LUKS2
+/// container holding the OverlayFS upper, keyed by the identity master.
+pub const HOME_IMAGE: &str = "home.img";
+
 /// The parameters of a Key to build: where to write it, the partition labels and
 /// filesystems init looks for, the default boot mode, and how the system names itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +80,10 @@ pub struct KeySpec {
     pub datafs: String,
     /// The size of the data partition image, in mebibytes.
     pub data_size_mb: u64,
+    /// The size of the encrypted Home writable layer image, in mebibytes. Larger than
+    /// the data partition because it holds the bulk OS state; the LUKS2 header takes a
+    /// fixed ~16 MiB off the top, so a tiny value leaves little usable space.
+    pub home_size_mb: u64,
     /// The boot mode the command line requests (Auto picks Home or Ghost at boot).
     pub mode: ModeChoice,
     pub os_name: String,
@@ -105,6 +122,7 @@ impl KeySpec {
             basefs: "squashfs".to_string(),
             datafs: "ext4".to_string(),
             data_size_mb: 64,
+            home_size_mb: 256,
             mode: ModeChoice::Auto,
             os_name: "Horizon OS".to_string(),
             os_id: "horizon".to_string(),
@@ -244,6 +262,47 @@ pub fn build_data(spec: &KeySpec) -> Result<PathBuf> {
         .arg(&out)
         .stdout(std::process::Stdio::null());
     run(cmd, "mkfs.ext4")?;
+    Ok(out)
+}
+
+/// Build the encrypted Home writable layer: a LUKS2 container at `<out>/home.img`, sized
+/// per the spec and keyed by `master` (the identity master `boot` recovers), with an
+/// empty ext4 filesystem laid inside it. This is the persistent OverlayFS upper for a
+/// Home (Known) Surface, so it is encrypted at rest: a lost Key reveals nothing without
+/// the identity. Returns the image path.
+///
+/// Shells out to `cryptsetup` (see [`mod@luks`]) and `mkfs.ext4`. Formatting writes only
+/// the LUKS header, but opening the volume to lay the inner filesystem needs
+/// device-mapper, so the whole call runs where that is permitted (the privileged build
+/// container) and is gated in tests; the mapper is always closed, even when `mkfs` fails,
+/// so a build never leaks an open mapping. The master is fed to cryptsetup on stdin, so
+/// it is never written to disk.
+pub fn build_home(spec: &KeySpec, master: &[u8; luks::MASTER_KEY_SIZE]) -> Result<PathBuf> {
+    std::fs::create_dir_all(&spec.out)?;
+    let out = spec.out.join(HOME_IMAGE);
+
+    // A fresh file sized to the partition; cryptsetup writes the LUKS header into it and
+    // the inner ext4 lives in the rest.
+    let file = std::fs::File::create(&out)?;
+    file.set_len(spec.home_size_mb * 1024 * 1024)?;
+    drop(file);
+
+    luks::format(&out, master)?;
+
+    // Open the volume, lay an empty ext4 inside, then close, closing even if mkfs fails so
+    // the device-mapper node is never left behind. The mapper name is unique to this build
+    // so concurrent builds do not collide on one global name.
+    let mapper = format!("horizon-home-build-{}", std::process::id());
+    let dev = luks::open(&out, master, &mapper)?;
+    let mkfs = {
+        let mut cmd = Command::new("mkfs.ext4");
+        cmd.args(["-F", "-q", "-L", HOME_LABEL])
+            .arg(&dev)
+            .stdout(std::process::Stdio::null());
+        run(cmd, "mkfs.ext4")
+    };
+    luks::close(&mapper)?;
+    mkfs?;
     Ok(out)
 }
 
@@ -1446,6 +1505,94 @@ mod linux_tests {
             assert_bytes_eq(&ours.hash_device, &theirs_bytes);
         }
         assert!(ran, "at least one case must have run");
+    }
+
+    // A cryptsetup error from device-mapper being unavailable (no privilege, no dm_mod),
+    // so the encrypted-layer test skips on an unprivileged runner the way the mount tests
+    // do, rather than failing. luksFormat writes only a header and needs none of this; it
+    // is luksOpen that needs device-mapper.
+    fn is_dm_unavailable(e: &Error) -> bool {
+        matches!(e, Error::Tool { stderr, .. } if {
+            let s = stderr.to_lowercase();
+            s.contains("device-mapper")
+                || s.contains("permission denied")
+                || s.contains("operation not permitted")
+                || s.contains("dm_mod")
+        })
+    }
+
+    // The encrypted Home writable layer round-trips on the real format: build_home formats
+    // a LUKS2 container keyed by a master and lays an ext4 inside, and the same master
+    // opens it to a mountable, writable filesystem while a wrong master is refused. This is
+    // the proof the producer keys the layer with the master (so boot's recovered master
+    // unlocks it) on the real cryptsetup format, the part the pure arg tests cannot show.
+    // CONFIG_DM_CRYPT=y here, so the open runs for real; it skips where device-mapper is
+    // not permitted (CI) and tears the mapping and mount down on every path.
+    #[test]
+    fn build_home_makes_a_luks2_layer_the_master_unlocks() {
+        const MASTER: [u8; luks::MASTER_KEY_SIZE] = [7u8; luks::MASTER_KEY_SIZE];
+        const WRONG: [u8; luks::MASTER_KEY_SIZE] = [9u8; luks::MASTER_KEY_SIZE];
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = KeySpec::new(dir.path());
+        // Small but past the ~16 MiB LUKS2 header, so the inner ext4 has room.
+        spec.home_size_mb = 48;
+
+        let home = match build_home(&spec, &MASTER) {
+            Ok(p) => p,
+            Err(Error::Missing(t)) => {
+                eprintln!("skipping: {t} not installed");
+                return;
+            }
+            Err(e) if is_dm_unavailable(&e) => {
+                eprintln!("skipping: device-mapper not permitted here ({e})");
+                return;
+            }
+            Err(e) => panic!("build home: {e}"),
+        };
+
+        // A real LUKS header was written.
+        assert!(luks::is_luks(&home), "home.img must be a LUKS volume");
+
+        // The master opens it; the inner ext4 is a real, writable filesystem.
+        let mapper = "horizon-home-test";
+        let dev = match luks::open(&home, &MASTER, mapper) {
+            Ok(d) => d,
+            Err(e) if is_dm_unavailable(&e) => {
+                eprintln!("skipping: device-mapper not permitted here ({e})");
+                return;
+            }
+            Err(e) => panic!("open with the master must succeed: {e}"),
+        };
+        let mnt = dir.path().join("mnt");
+        std::fs::create_dir_all(&mnt).unwrap();
+        let mounted = Command::new("mount").arg(&dev).arg(&mnt).output();
+        let mounted = mounted.expect("spawn mount");
+        if !mounted.status.success() {
+            let _ = luks::close(mapper);
+            let err = String::from_utf8_lossy(&mounted.stderr);
+            if err.contains("Permission denied") || err.contains("not permitted") {
+                eprintln!("skipping: mounting not permitted here ({err})");
+                return;
+            }
+            panic!("mount decrypted home: {err}");
+        }
+        std::fs::write(mnt.join("proof"), b"encrypted persistence").unwrap();
+        let read_back = std::fs::read(mnt.join("proof")).unwrap();
+        umount(&mnt);
+        luks::close(mapper).unwrap();
+        assert_eq!(read_back, b"encrypted persistence");
+
+        // A wrong master is refused: the key genuinely gates the layer.
+        match luks::open(&home, &WRONG, "horizon-home-wrong") {
+            Err(Error::Tool { .. }) => {}
+            Err(e) if is_dm_unavailable(&e) => {}
+            Ok(_) => {
+                let _ = luks::close("horizon-home-wrong");
+                panic!("a wrong master must not open the encrypted layer");
+            }
+            Err(e) => panic!("unexpected error opening with a wrong master: {e}"),
+        }
     }
 
     #[test]
