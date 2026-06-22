@@ -1295,6 +1295,26 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   written into the ESP), the loader config carrying `boot_cmdline` plus this `horizon.verity` root
   hash, and the verity hash device laid on the assembled disk as the `HORIZON-VERITY` partition so
   the init resolves it; then the QEMU boot. Built and tested on darwin and in the Linux container.
+- Phase 0 ESP VFAT long names (`keybuild` crate): `keybuild::fat` now writes VFAT long-name (LFN)
+  entries, the refinement owed for a bootloader whose config files do not fit an 8.3 short name.
+  systemd-boot reads `/loader/loader.conf` and `/loader/entries/*.conf`, whose four-character
+  `.conf` extension overflows the 8.3 three-character limit, so the ESP must carry their full
+  names. A name that fits 8.3 is still written as one (uppercased, no LFN), so an all-8.3 tree is
+  byte-for-byte identical to before and the existing ESP stays reproducible; a longer name is
+  written as a run of LFN slots plus a generated `~N` short alias, exactly as `mkfs.fat`/`mtools`
+  do. Each LFN slot carries 13 UCS-2 characters split 5/6/2, the slots emitted last-part-first with
+  1-based sequence numbers (the first physical slot OR'd with 0x40) and the short alias's
+  rotate-and-add checksum, the name NUL-terminated and 0xFFFF-padded; the directory sizing
+  (`content_slots`) counts the extra slots so the cluster and FAT16-root allocation always matches
+  what is written. The `Dir` tree now keys children by the uppercased name (FAT being
+  case-insensitive) and keeps the exact-case name for the long entry. On the usual headless split
+  the format is unit-tested on every host (the long names `loader.conf` and `entries/horizon.conf`
+  round-trip through an LFN-aware reader that reassembles the slots and checks every checksum, the
+  `~N` alias is asserted, and the all-8.3 reproducibility is re-confirmed) and the authoritative
+  cross-check is the kernel's own FAT driver: the gated container test loop-mounts a self-built ESP
+  as vfat and reads those long-named configs back by their long paths, which only correct LFN
+  entries make possible (a wrong checksum or layout would surface the short alias instead). Built
+  and tested on darwin and in the Linux container.
 
 ## Next
 
