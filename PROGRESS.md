@@ -1062,6 +1062,41 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   where its `base.verity` is byte-for-byte identical (`cmp`) to veritysetup's output over the same base
   and the printed root matches. Left next: LUKS2 for the writable layer and the Ghost store handoff,
   the bootloader, and the QEMU boot. Built and tested on darwin and in the Linux container.
+- Phase 0 base encrypted Home layer (`keybuild` crate + `horizon-keybuild`): the writable side a Home
+  (Known) Surface persists into is now encrypted at rest, so a lost or stolen Key reveals nothing without
+  the identity. The immutable base is read-only and tamper-evident, but a device that remembers also has
+  an OverlayFS upper where this machine's OS state accumulates; on a Home Surface that layer persists
+  across power-offs, so it must be encrypted. A new `keybuild::luks` builds it: `build_home` creates a
+  LUKS2 container (`home.img`) keyed by the one 32-byte master everything turns on, with an empty ext4
+  laid inside, the persistent upper a Home boot stacks over the base. The key is the master itself, not a
+  second passphrase: the Lifestream addresses with it, the Constellation binds Noise to it, Reconstitution
+  splits it, and `boot` already recovers it from the store with a touch or a passphrase, so keying the
+  layer with the master means one unlock at boot gates everything (recover the master, then luksOpen the
+  layer with it). The circularity that would create, the store holding the master sitting inside the layer
+  the master unlocks, is broken by keeping the store on a plain readable partition: the store's
+  confidentiality is the Lifestream's own per-object encryption (the keysalt and keyslots are deliberately
+  non-secret), so it is read to recover the master before the encrypted layer is opened. Unlike `verity`,
+  this shells out to `cryptsetup` rather than owning the format, and the reasons are the inverse of
+  verity's: LUKS2's on-disk format is genuinely complex and security-critical (a binary header, JSON
+  metadata, Argon2id-sealed keyslots, AEAD keyslot areas); verity owned its tree only because the kernel
+  consumer (`CONFIG_DM_VERITY`) was absent, so matching `veritysetup` byte-for-byte was the sole available
+  proof, while here `CONFIG_DM_CRYPT=y`, so a real luksFormat/luksOpen runs in the container and the whole
+  round-trip is proven end to end; and reproducibility (which argued for owning the verity tree) cuts the
+  other way, since the layer is per-device mutable state and LUKS deliberately uses a random volume key and
+  salts, so a byte-reproducible container would be a security regression. The master is fed to cryptsetup
+  on stdin (exactly 32 bytes via `--keyfile-size 32`, so a master containing a newline byte is not
+  truncated), never written to disk as a key file, and the build always closes the device-mapper node even
+  when the inner mkfs fails, so it never leaks an open mapping. On the usual split the argv construction is
+  pure and unit-tested on every host (luks2, argon2id, the exact 32-byte stdin key); the execution needs
+  device-mapper, so the round-trip is proven for real in the container and skips gracefully where dm is not
+  permitted (CI). Tests: 3 pure arg units on darwin and in the container, plus a gated container
+  integration test that `build_home` formats a LUKS2 layer keyed by a master, the same master opens it to a
+  mountable writable ext4 (label HORIZON-HOME), and a wrong master is refused (the key genuinely gates the
+  layer). Verified end to end through the binary in the container: `horizon-keybuild --home --home-keyfile`
+  builds a 256 MiB LUKS2 `home.img` (isLuks yes, LUKS2 magic) that the keyfile master opens to a mountable
+  ext4, with a missing keyfile cleanly rejected. The kernel `dm-crypt` open at boot (the init recovering the
+  master and unlocking this layer before assembling the overlay, plus the Ghost read-only store handoff) is
+  the next piece. Built and tested on darwin and in the Linux container.
 
 ## Next
 
@@ -1224,10 +1259,21 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the root hash that anchors it, so the immutable base is tamper-evident, not just read-only;
   the tree is owned pure Rust (the `sha2` dep), proven byte-for-byte against `veritysetup
   format` in a gated test that runs in CI and the container, with the kernel `dm-verity` open
-  eye-verified by booting since this container's kernel lacks CONFIG_DM_VERITY.
-  What is left, in order: LUKS2 for the Home writable layer and the Ghost read-only store
-  handoff, unlocked with the same master the `boot` crate recovers (CONFIG_DM_CRYPT=y
-  here, so cryptsetup open is testable in the container); the isohybrid UEFI/BIOS
+  eye-verified by booting since this container's kernel lacks CONFIG_DM_VERITY. And the
+  encrypted Home writable layer (producer side): `keybuild::luks` + `build_home` build a LUKS2
+  container (`home.img`) keyed by the same 32-byte master `boot` recovers, with an empty ext4
+  inside, the persistent OverlayFS upper a Home Surface stacks over the base, so it is encrypted
+  at rest; this one shells out to `cryptsetup` (the inverse of verity's owned-format call,
+  because LUKS2's format is complex and security-critical and `CONFIG_DM_CRYPT=y` makes the real
+  open testable, and a per-device encrypted layer must not be byte-reproducible), proven by a
+  gated container round-trip (format, open with the master, mount the inner ext4, refuse a wrong
+  master) and end to end through `horizon-keybuild --home`. The store stays on a plain readable
+  partition (its confidentiality is the Lifestream's own object encryption), which is what lets
+  the master be recovered before the layer it unlocks is opened.
+  What is left, in order: the boot-time consumer of that encrypted layer, the init recovering the
+  master in the initramfs (reusing `boot`'s discover + unlock) and `luksOpen`-ing the Home layer
+  before it assembles the overlay, plus the Ghost read-only store handoff (mount the store
+  read-only off a Foreign Surface so nothing is written to it); the isohybrid UEFI/BIOS
   bootloader (shim -> systemd-boot/GRUB -> kernel + initramfs) into a bootable Key
   image; and finally booting the whole chain in QEMU (UEFI -> bootloader -> kernel ->
   horizon-init -> horizon boot -> the DRM desktop on virtio-gpu). Environment notes for
