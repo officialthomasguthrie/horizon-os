@@ -2432,15 +2432,26 @@ mod linux_tests {
             spec.esp_size_mb = size_mb;
 
             // A tree that spans subdirectories and multi-cluster files, the shape a real ESP
-            // (bootloader under /EFI/BOOT, a kernel and initramfs at the root) has.
+            // (bootloader under /EFI/BOOT, a kernel and initramfs at the root) has, plus
+            // systemd-boot's long-named config files (loader.conf and entries/horizon.conf,
+            // whose four-character .conf extension does not fit 8.3): reading those back by
+            // their long names is the kernel FAT driver's own cross-check on the VFAT long-name
+            // entries the writer produced (a wrong checksum or layout would surface the ~N short
+            // alias instead, so the long-path read failing is how a broken LFN would show).
             let boot = b"this stands in for the bootloader".to_vec();
             let vmlinuz = vec![0xABu8; 4096 * 5 + 123];
             let initrd = vec![0xCDu8; 300_000];
+            let loader_conf = b"default horizon\ntimeout 3\n".to_vec();
+            let entry_conf = b"title Horizon OS\nlinux /VMLINUZ\ninitrd /INITRD.IMG\n".to_vec();
             let mut tree = fat::Dir::new();
             tree.insert_file("EFI/BOOT/BOOTX64.EFI", boot.clone())
                 .unwrap();
             tree.insert_file("VMLINUZ", vmlinuz.clone()).unwrap();
             tree.insert_file("INITRD.IMG", initrd.clone()).unwrap();
+            tree.insert_file("loader/loader.conf", loader_conf.clone())
+                .unwrap();
+            tree.insert_file("loader/entries/horizon.conf", entry_conf.clone())
+                .unwrap();
             let img = build_esp_with(&spec, &tree).expect("build esp");
 
             let size = std::fs::metadata(&img).unwrap().len();
@@ -2456,16 +2467,29 @@ mod linux_tests {
             }
 
             // FAT lookup is case-insensitive, so the uppercase 8.3 paths open regardless of how
-            // the vfat driver displays short names.
+            // the vfat driver displays short names; the loader configs open by their exact long
+            // names, which only the long-name entries provide.
             let read_boot = std::fs::read(mnt.join("EFI/BOOT/BOOTX64.EFI"));
             let read_vmlinuz = std::fs::read(mnt.join("VMLINUZ"));
             let read_initrd = std::fs::read(mnt.join("INITRD.IMG"));
+            let read_loader = std::fs::read(mnt.join("loader/loader.conf"));
+            let read_entry = std::fs::read(mnt.join("loader/entries/horizon.conf"));
             umount(&mnt);
             losetup_d(&dev);
 
             assert_eq!(read_boot.unwrap(), boot, "{size_mb} MiB ESP: bootloader");
             assert_eq!(read_vmlinuz.unwrap(), vmlinuz, "{size_mb} MiB ESP: kernel");
             assert_eq!(read_initrd.unwrap(), initrd, "{size_mb} MiB ESP: initramfs");
+            assert_eq!(
+                read_loader.unwrap(),
+                loader_conf,
+                "{size_mb} MiB ESP: loader.conf reads back by its long name"
+            );
+            assert_eq!(
+                read_entry.unwrap(),
+                entry_conf,
+                "{size_mb} MiB ESP: entries/horizon.conf reads back by its long name"
+            );
         }
     }
 

@@ -13,17 +13,19 @@
 //! back (the kernel's own FAT driver is the cross-check, like the GPT loop test and verity's
 //! `veritysetup` cross-check); firmware reading it is eye-verified by booting.
 //!
-//! Scope is deliberately minimal: 512-byte sectors, two FATs, 8.3 short names (uppercase),
-//! files and subdirectories, no long-name (VFAT LFN) entries yet. The bootloader's standard
-//! removable path (`/EFI/BOOT/BOOTX64.EFI`) and 8.3-friendly kernel/initramfs names fit; LFN
-//! is a refinement for when a loader needs a long name. The FAT type is chosen by volume
-//! size so a real ESP is FAT32 (the firmware-friendly default) and small volumes are FAT16,
-//! always respecting the Microsoft cluster-count thresholds so firmware that keys off the
-//! count agrees with the BPB this writes, and never landing on FAT12.
+//! Scope is deliberately minimal: 512-byte sectors, two FATs, files and subdirectories. A
+//! name that fits an 8.3 short name is written as one (uppercased, the reproducible default
+//! the existing tree relies on); a longer name (systemd-boot's `loader.conf` and
+//! `entries/*.conf`, whose four-character extensions do not fit 8.3) is written as VFAT
+//! long-name (LFN) entries with a generated `~N` short alias, the same way `mkfs.fat`/`mtools`
+//! would, so a loader that reads its config by long name finds it. The FAT type is chosen by
+//! volume size so a real ESP is FAT32 (the firmware-friendly default) and small volumes are
+//! FAT16, always respecting the Microsoft cluster-count thresholds so firmware that keys off
+//! the count agrees with the BPB this writes, and never landing on FAT12.
 
 use crate::{Error, Result};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The logical sector size. 512 is universal and what the BPB's `256`-based FAT-size formula
 /// assumes; the rest of keybuild (GPT, the partition images) uses it too.
@@ -45,6 +47,9 @@ const FAT32_ROOT_CLUSTER: u32 = 2;
 const ATTR_VOLUME_ID: u8 = 0x08;
 const ATTR_DIRECTORY: u8 = 0x10;
 const ATTR_ARCHIVE: u8 = 0x20;
+/// The attribute marking a long-name slot (read-only + hidden + system + volume-id), the value
+/// a FAT reader keys on to tell an LFN entry from a real 8.3 one.
+const ATTR_LONG_NAME: u8 = 0x0F;
 
 /// A fixed timestamp stamped on every directory entry so the image is byte-reproducible (the
 /// same reason verity pins its salt and UUID). FAT dates cannot be zero (day and month are
@@ -99,12 +104,20 @@ enum Node {
     Dir(Dir),
 }
 
+/// One named child of a directory: the name exactly as requested (case preserved, for the
+/// long-name entry when it does not fit an 8.3 short name) and its node.
+struct Child {
+    name: String,
+    node: Node,
+}
+
 /// A directory tree to write into a FAT volume. Build one with [`Dir::new`] and
-/// [`Dir::insert_file`]/[`Dir::mkdir`], then hand it to [`format`]. Entries are kept in a
-/// sorted map so the on-disk order, and thus the image, is deterministic.
+/// [`Dir::insert_file`]/[`Dir::mkdir`], then hand it to [`format`]. Entries are keyed by the
+/// uppercased name (FAT is case-insensitive, so this dedups case variants) in a sorted map,
+/// so the on-disk order, and thus the image, is deterministic.
 #[derive(Default)]
 pub struct Dir {
-    entries: BTreeMap<String, Node>,
+    entries: BTreeMap<String, Child>,
 }
 
 impl Dir {
@@ -113,9 +126,11 @@ impl Dir {
     }
 
     /// Insert a file at `path` (slash-separated, e.g. `EFI/BOOT/BOOTX64.EFI`), creating the
-    /// intermediate directories. Every component must be a valid 8.3 short name; the file
-    /// name and directory names are uppercased and validated. Errors on a malformed name or
-    /// a path that runs through an existing file.
+    /// intermediate directories. Each component is either a valid 8.3 short name (written
+    /// uppercased, no long-name entry) or a longer name (written with VFAT long-name entries
+    /// and a generated short alias, e.g. `loader.conf`). Errors on a name that is neither (an
+    /// illegal character, an empty or reserved name) or a path that runs through an existing
+    /// file.
     pub fn insert_file(&mut self, path: &str, data: Vec<u8>) -> Result<()> {
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         let Some((file, dirs)) = parts.split_last() else {
@@ -123,18 +138,16 @@ impl Dir {
         };
         let mut cur = self;
         for d in dirs {
-            let name = canon_83(d)?;
-            let node = cur
-                .entries
-                .entry(name)
-                .or_insert_with(|| Node::Dir(Dir::new()));
-            match node {
-                Node::Dir(sub) => cur = sub,
-                Node::File(_) => return Err(Error::BadName(path.to_string())),
-            }
+            cur = cur.child_dir(d)?;
         }
-        let name = canon_83(file)?;
-        cur.entries.insert(name, Node::File(data));
+        validate_name(file)?;
+        cur.entries.insert(
+            file.to_ascii_uppercase(),
+            Child {
+                name: file.to_string(),
+                node: Node::File(data),
+            },
+        );
         Ok(())
     }
 
@@ -143,17 +156,26 @@ impl Dir {
     pub fn mkdir(&mut self, path: &str) -> Result<()> {
         let mut cur = self;
         for p in path.split('/').filter(|p| !p.is_empty()) {
-            let name = canon_83(p)?;
-            let node = cur
-                .entries
-                .entry(name)
-                .or_insert_with(|| Node::Dir(Dir::new()));
-            match node {
-                Node::Dir(sub) => cur = sub,
-                Node::File(_) => return Err(Error::BadName(path.to_string())),
-            }
+            cur = cur.child_dir(p)?;
         }
         Ok(())
+    }
+
+    /// Descend into (or create) the subdirectory named `name`, validating the name. Errors if
+    /// the path runs through an existing file.
+    fn child_dir(&mut self, name: &str) -> Result<&mut Dir> {
+        validate_name(name)?;
+        let child = self
+            .entries
+            .entry(name.to_ascii_uppercase())
+            .or_insert_with(|| Child {
+                name: name.to_string(),
+                node: Node::Dir(Dir::new()),
+            });
+        match &mut child.node {
+            Node::Dir(sub) => Ok(sub),
+            Node::File(_) => Err(Error::BadName(name.to_string())),
+        }
     }
 }
 
@@ -344,7 +366,7 @@ pub fn format(total_bytes: u64, root: &Dir, params: &Params) -> Result<Vec<u8>> 
     // FAT32. Either way it holds the volume label and the top-level entries (no dot entries).
     match geom.fat_type {
         FatType::Fat16 => {
-            let count = 1 + root.entries.len() as u64; // volume label + entries
+            let count = content_slots(root, true); // volume label + entries (with any LFN slots)
             if count > geom.root_entries {
                 return Err(Error::EspFull {
                     needed: count,
@@ -354,7 +376,7 @@ pub fn format(total_bytes: u64, root: &Dir, params: &Params) -> Result<Vec<u8>> 
             b.render_dir(root, None, 0, 0, true)?;
         }
         FatType::Fat32 => {
-            let count = 1 + root.entries.len() as u64;
+            let count = content_slots(root, true);
             let clusters = (count * 32).div_ceil(geom.cluster_bytes()).max(1);
             let chain = b.alloc_chain(clusters)?;
             debug_assert_eq!(chain[0], FAT32_ROOT_CLUSTER);
@@ -439,8 +461,10 @@ impl Builder<'_> {
         // A subdirectory's `..` must point at its parent, except the root, whose children use 0.
         let child_dotdot = if is_root { 0 } else { self_first };
 
-        for (name, node) in &dir.entries {
-            match node {
+        // Each child's on-disk short field (an 8.3 name, or a generated `~N` alias) plus, for a
+        // long name, the full name to write as LFN entries just before its short entry.
+        for (field, long, child) in plan_children(dir) {
+            match &child.node {
                 Node::File(data) => {
                     let first = if data.is_empty() {
                         0
@@ -450,20 +474,20 @@ impl Builder<'_> {
                         self.write_clusters(&chain, data);
                         chain[0]
                     };
-                    buf.extend_from_slice(&entry(
-                        &to_field(name),
-                        first,
-                        data.len() as u32,
-                        ATTR_ARCHIVE,
-                    ));
+                    if let Some(name) = long {
+                        buf.extend_from_slice(&lfn_entries(name, &field));
+                    }
+                    buf.extend_from_slice(&entry(&field, first, data.len() as u32, ATTR_ARCHIVE));
                 }
                 Node::Dir(sub) => {
-                    // dot + dotdot + the children, one 32-byte slot each (short names only).
-                    let count = 2 + sub.entries.len() as u64;
-                    let n = (count * 32).div_ceil(cb).max(1);
+                    // dot + dotdot + each child (with any LFN slots), in 32-byte slots.
+                    let n = (content_slots(sub, false) * 32).div_ceil(cb).max(1);
                     let chain = self.alloc_chain(n)?;
                     let first = chain[0];
-                    buf.extend_from_slice(&entry(&to_field(name), first, 0, ATTR_DIRECTORY));
+                    if let Some(name) = long {
+                        buf.extend_from_slice(&lfn_entries(name, &field));
+                    }
+                    buf.extend_from_slice(&entry(&field, first, 0, ATTR_DIRECTORY));
                     self.render_dir(sub, Some(&chain), first, child_dotdot, false)?;
                 }
             }
@@ -666,6 +690,175 @@ fn canon_83(name: &str) -> Result<String> {
     })
 }
 
+/// Whether `name` fits an 8.3 short name and, if so, its 11-byte field. A fitting name needs
+/// no long-name entry; it is written uppercased exactly as before LFN support existed, so an
+/// all-8.3 tree is byte-for-byte unchanged.
+fn fits_83(name: &str) -> Option<[u8; 11]> {
+    canon_83(name).ok().map(|c| to_field(&c))
+}
+
+/// Validate a path component: it must be a usable 8.3 short name or a usable long name.
+fn validate_name(name: &str) -> Result<()> {
+    if fits_83(name).is_some() || is_long_name(name) {
+        Ok(())
+    } else {
+        Err(Error::BadName(name.to_string()))
+    }
+}
+
+/// Whether `name` is a usable VFAT long name: non-empty, at most 255 UCS-2 units, no path or
+/// reserved character, no control character, not `.`/`..`, and not a name FAT would alter by
+/// stripping a trailing dot or space. Characters outside the Basic Multilingual Plane (which
+/// would need UTF-16 surrogate pairs) are rejected, since the writer emits one code unit per
+/// character; every name Horizon writes is ASCII, so this never bites in practice.
+fn is_long_name(name: &str) -> bool {
+    let units = name.encode_utf16().count();
+    (1..=255).contains(&units)
+        && name != "."
+        && name != ".."
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+        && name.chars().all(|c| {
+            let u = c as u32;
+            (0x20..0xFFFF).contains(&u) && !"/\\:*?\"<>|".contains(c)
+        })
+}
+
+/// The number of 32-byte long-name slots a child needs: zero for an 8.3 name, else one per 13
+/// UCS-2 characters plus one for the NUL terminator (so a name whose length is a multiple of
+/// 13 gets its own terminator slot, the conservative layout every FAT reader accepts).
+fn lfn_slots(name: &str) -> u64 {
+    if fits_83(name).is_some() {
+        0
+    } else {
+        name.encode_utf16().count() as u64 / 13 + 1
+    }
+}
+
+/// The number of 32-byte directory-entry slots a directory's contents occupy: the volume label
+/// (root) or the `.`/`..` pair (subdirectory), plus, per child, one short entry and any
+/// long-name slots. The cluster and FAT16-root-capacity sizing is computed from this, so the
+/// storage allocated always matches what [`Builder::render_dir`] writes.
+fn content_slots(dir: &Dir, is_root: bool) -> u64 {
+    let base = if is_root { 1 } else { 2 };
+    base + dir
+        .entries
+        .values()
+        .map(|c| 1 + lfn_slots(&c.name))
+        .sum::<u64>()
+}
+
+/// Decide each child's on-disk short field, in the directory's deterministic order: the 8.3
+/// field when the name fits, else a `~N` alias unique among the directory's real short names
+/// and the aliases already handed out, in which case the full name is carried alongside to be
+/// written as long-name entries before the short one.
+fn plan_children(dir: &Dir) -> Vec<([u8; 11], Option<&str>, &Child)> {
+    let mut taken: BTreeSet<[u8; 11]> = dir
+        .entries
+        .values()
+        .filter_map(|c| fits_83(&c.name))
+        .collect();
+    let mut plan = Vec::with_capacity(dir.entries.len());
+    for child in dir.entries.values() {
+        match fits_83(&child.name) {
+            Some(field) => plan.push((field, None, child)),
+            None => {
+                let field = short_alias(&child.name, &taken);
+                taken.insert(field);
+                plan.push((field, Some(child.name.as_str()), child));
+            }
+        }
+    }
+    plan
+}
+
+/// A `BASE~N.EXT` 8.3 alias for a long name, unique among `taken`: the long name's base and
+/// extension cleaned to the 8.3 character set (illegal characters mapped to `_`, dots and
+/// spaces dropped), the base truncated to leave room for the `~N` tail, with N counting up
+/// until the field is free. The numbering is deterministic given the directory's fixed order.
+fn short_alias(long: &str, taken: &BTreeSet<[u8; 11]>) -> [u8; 11] {
+    let up = long.to_ascii_uppercase();
+    let (lbase, lext) = match up.rsplit_once('.') {
+        Some((b, e)) => (b, e),
+        None => (up.as_str(), ""),
+    };
+    let clean = |s: &str, n: usize| -> Vec<u8> {
+        s.chars()
+            .filter(|c| *c != ' ' && *c != '.')
+            .map(|c| {
+                if c.is_ascii_uppercase() || c.is_ascii_digit() || "-_~".contains(c) {
+                    c as u8
+                } else {
+                    b'_'
+                }
+            })
+            .take(n)
+            .collect()
+    };
+    let ext = clean(lext, 3);
+    for i in 1..=u32::MAX {
+        let tail = format!("~{i}");
+        let base = clean(lbase, 8usize.saturating_sub(tail.len()));
+        let mut field = [b' '; 11];
+        for (j, b) in base.iter().chain(tail.as_bytes()).take(8).enumerate() {
+            field[j] = *b;
+        }
+        for (j, b) in ext.iter().enumerate() {
+            field[8 + j] = *b;
+        }
+        if !taken.contains(&field) {
+            return field;
+        }
+    }
+    unreachable!("a free ~N alias always exists for a realistic directory")
+}
+
+/// The VFAT checksum of an 11-byte 8.3 field, carried in every long-name slot so a reader can
+/// tell the slots belong to the short entry that follows. The standard rotate-right-and-add.
+fn lfn_checksum(field: &[u8; 11]) -> u8 {
+    let mut sum = 0u8;
+    for &b in field {
+        sum = (sum >> 1 | (sum & 1) << 7).wrapping_add(b);
+    }
+    sum
+}
+
+/// The long-name (LFN) directory entries for `long`, decorating the short entry whose field is
+/// `short_field`. The name is encoded UCS-2, terminated with `0x0000` and padded with `0xFFFF`
+/// to fill the last slot; the slots are emitted last-part-first (the on-disk order), each
+/// carrying its 1-based sequence number (the first physical slot OR'd with `0x40`), the short
+/// field's checksum, and 13 characters split 5/6/2 across the slot.
+fn lfn_entries(long: &str, short_field: &[u8; 11]) -> Vec<u8> {
+    let cksum = lfn_checksum(short_field);
+    let mut units: Vec<u16> = long.encode_utf16().collect();
+    let nslots = units.len() / 13 + 1;
+    units.push(0x0000); // NUL terminator
+    units.resize(nslots * 13, 0xFFFF); // pad the last slot with 0xFFFF
+
+    let mut out = Vec::with_capacity(nslots * 32);
+    for seq in (1..=nslots).rev() {
+        let chars = &units[(seq - 1) * 13..seq * 13];
+        let mut e = [0u8; 32];
+        e[0] = seq as u8 | if seq == nslots { 0x40 } else { 0 };
+        e[11] = ATTR_LONG_NAME;
+        e[13] = cksum; // 12 (type) and 26..28 (first-cluster-low) stay zero
+        let put = |e: &mut [u8; 32], at: usize, c: u16| {
+            e[at..at + 2].copy_from_slice(&c.to_le_bytes());
+        };
+        for (k, &c) in chars[0..5].iter().enumerate() {
+            put(&mut e, 1 + k * 2, c);
+        }
+        for (k, &c) in chars[5..11].iter().enumerate() {
+            put(&mut e, 14 + k * 2, c);
+        }
+        for (k, &c) in chars[11..13].iter().enumerate() {
+            put(&mut e, 28 + k * 2, c);
+        }
+        out.extend_from_slice(&e);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,6 +1005,63 @@ mod tests {
                 c = self.fat_next(c);
             }
             out.truncate(size as usize);
+            out
+        }
+
+        // Reconstruct the long names in a directory: for each real (short) entry preceded by LFN
+        // slots, return (long_name, short_field, first_cluster, size). Each slot's checksum is
+        // asserted against the short field (the tie a reader uses to bind the two), and the
+        // slots are reassembled in sequence order, terminated at the first 0x0000. This is the
+        // pure round-trip cross-check; the kernel's own vfat driver is the authoritative one in
+        // the gated mount test.
+        fn long_entries(&self, dir: &[u8]) -> Vec<(String, [u8; 11], u32, u32)> {
+            // The 13 character byte offsets within a long-name entry: 5, then 6, then 2.
+            const OFF: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+            let mut out = Vec::new();
+            let mut slots: Vec<(u8, [u16; 13], u8)> = Vec::new();
+            for e in dir.chunks_exact(32) {
+                if e[0] == 0x00 {
+                    break;
+                }
+                if e[0] == 0xE5 {
+                    slots.clear();
+                    continue;
+                }
+                if e[11] == ATTR_LONG_NAME {
+                    let mut chars = [0u16; 13];
+                    for (slot, &o) in chars.iter_mut().zip(OFF.iter()) {
+                        *slot = u16::from_le_bytes(e[o..o + 2].try_into().unwrap());
+                    }
+                    slots.push((e[0] & 0x3F, chars, e[13]));
+                    continue;
+                }
+                if !slots.is_empty() {
+                    let field: [u8; 11] = e[0..11].try_into().unwrap();
+                    let cksum = lfn_checksum(&field);
+                    assert!(
+                        slots.iter().all(|(_, _, c)| *c == cksum),
+                        "every LFN slot must carry the short field's checksum"
+                    );
+                    slots.sort_by_key(|(seq, _, _)| *seq);
+                    let mut units: Vec<u16> = Vec::new();
+                    for (_, chars, _) in &slots {
+                        units.extend_from_slice(chars);
+                    }
+                    if let Some(pos) = units.iter().position(|&c| c == 0x0000) {
+                        units.truncate(pos);
+                    }
+                    let hi = u16::from_le_bytes(e[20..22].try_into().unwrap()) as u32;
+                    let lo = u16::from_le_bytes(e[26..28].try_into().unwrap()) as u32;
+                    let size = u32::from_le_bytes(e[28..32].try_into().unwrap());
+                    out.push((
+                        String::from_utf16(&units).unwrap(),
+                        field,
+                        (hi << 16) | lo,
+                        size,
+                    ));
+                }
+                slots.clear();
+            }
             out
         }
     }
@@ -977,15 +1227,68 @@ mod tests {
     #[test]
     fn bad_names_are_rejected() {
         let mut root = Dir::new();
-        assert!(root.insert_file("TOOLONGNAME.EFI", vec![1]).is_err()); // base > 8
-        assert!(root.insert_file("name.long", vec![1]).is_err()); // ext > 3
-        assert!(root.insert_file("bad*char.txt", vec![1]).is_err()); // illegal char
-        assert!(root.insert_file(".hidden", vec![1]).is_err()); // empty base
-                                                                // A lowercase name is accepted and uppercased.
+        // A name too long for 8.3 is no longer an error: it becomes a long name (see the LFN
+        // test). What stays rejected is a name with no valid spelling at all.
+        assert!(root.insert_file("bad*char.txt", vec![1]).is_err()); // illegal character
+        assert!(root.insert_file("a:b.txt", vec![1]).is_err()); // reserved character
+        assert!(root.insert_file("", vec![1]).is_err()); // empty path
+        assert!(root.mkdir(".").is_err()); // reserved name
+        assert!(root.mkdir("..").is_err()); // reserved name
+        assert!(root.insert_file(&"x".repeat(256), vec![1]).is_err()); // past the 255-unit limit
+                                                                       // A lowercase 8.3 name is still accepted and uppercased, with no long-name entry.
         root.insert_file("efi/grub.cfg", vec![1]).unwrap();
         let img = format(mib(16), &root, &Params::for_label("ESP")).unwrap();
         let r = Reader::new(&img);
         let efi = r.dir_bytes(r.find(&r.root_bytes(), "EFI").unwrap().0, false);
         assert!(r.find(&efi, "GRUB.CFG").is_some());
+    }
+
+    #[test]
+    fn long_names_round_trip_as_lfn() {
+        // The systemd-boot config names, whose four-character `.conf` extension does not fit
+        // 8.3: one in the root's `loader/` and one a level deeper in `entries/`, alongside an
+        // ordinary 8.3 file. Both FAT types exercise the cluster-chain and fixed-root paths.
+        let mut root = Dir::new();
+        root.insert_file("loader/loader.conf", b"default horizon\n".to_vec())
+            .unwrap();
+        root.insert_file(
+            "loader/entries/horizon.conf",
+            b"title Horizon OS\n".to_vec(),
+        )
+        .unwrap();
+        root.insert_file("VMLINUZ", vec![0xAB; 2048]).unwrap();
+
+        for size_mb in [16u64, 96u64] {
+            let img = format(mib(size_mb), &root, &Params::for_label("HORIZON-ESP")).unwrap();
+            let r = Reader::new(&img);
+
+            // `loader/` is an 8.3 directory; descend it and read loader.conf back by long name.
+            let (loader_c, _, attr) = r.find(&r.root_bytes(), "LOADER").expect("loader dir");
+            assert_eq!(attr & ATTR_DIRECTORY, ATTR_DIRECTORY);
+            let loader = r.dir_bytes(loader_c, false);
+            let conf = r
+                .long_entries(&loader)
+                .into_iter()
+                .find(|(n, ..)| n == "loader.conf")
+                .expect("loader.conf by its long name");
+            // The long name is backed by a generated ~N short alias, never a truncated 8.3 name.
+            assert!(conf.1.contains(&b'~'), "a long name gets a ~N short alias");
+            assert_eq!(r.read_file(conf.2, conf.3), b"default horizon\n");
+
+            // entries/horizon.conf, a long name one directory deeper.
+            let (entries_c, _, _) = r.find(&loader, "ENTRIES").expect("entries dir");
+            let entries = r.dir_bytes(entries_c, false);
+            let hz = r
+                .long_entries(&entries)
+                .into_iter()
+                .find(|(n, ..)| n == "horizon.conf")
+                .expect("horizon.conf by its long name");
+            assert_eq!(r.read_file(hz.2, hz.3), b"title Horizon OS\n");
+
+            // The plain 8.3 file still reads back with no long-name entry at all.
+            assert!(r.long_entries(&r.root_bytes()).is_empty());
+            let (c, size, _) = r.find(&r.root_bytes(), "VMLINUZ").expect("vmlinuz");
+            assert_eq!(r.read_file(c, size), vec![0xAB; 2048]);
+        }
     }
 }
