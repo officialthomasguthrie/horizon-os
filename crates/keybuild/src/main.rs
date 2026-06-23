@@ -6,7 +6,10 @@
 // with its shared-library closure, so `--bin target/release/horizon --bin
 // target/release/horizon-init` makes a base that boots. --module installs a kernel
 // module and its modules.dep closure under /lib/modules/<kver>, and --firmware copies a
-// firmware blob under /lib/firmware, so the base drives hardware. --verity builds the
+// firmware blob under /lib/firmware, so the base drives hardware. --stage <src[:dst]> copies
+// a host data tree verbatim into the base (the xkb keymap data /usr/share/X11/xkb a keyboard
+// needs, libinput's /usr/share/libinput quirks), to dst or, with no dst, the same path.
+// --verity builds the
 // dm-verity hash tree over the base into base.verity and prints the root hash that anchors
 // it. --home builds the encrypted Home writable layer (home.img, a LUKS2 container) keyed
 // by the 32-byte master in --home-keyfile, so a Home Surface persists encrypted at rest.
@@ -35,6 +38,7 @@ struct Args {
     modules_root: Option<PathBuf>,
     firmware: Vec<String>,
     firmware_root: Option<PathBuf>,
+    staged: Vec<keybuild::Stage>,
     verity: bool,
     home: bool,
     home_keyfile: Option<PathBuf>,
@@ -57,7 +61,8 @@ fn main() -> ExitCode {
         eprintln!(
             "usage: horizon-keybuild --out <dir> [--bin <path>]... \
              [--kver <version> --module <name>...] [--modules-root <dir>] \
-             [--firmware <path>]... [--firmware-root <dir>] [--verity] \
+             [--firmware <path>]... [--firmware-root <dir>] \
+             [--stage <src[:dst]>]... [--verity] \
              [--home --home-keyfile <32-byte-master>] [--esp] [--disk] \
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
              [--initramfs-module <name>]...] \
@@ -78,6 +83,7 @@ fn main() -> ExitCode {
     if let Some(root) = parsed.firmware_root {
         spec.firmware_root = root;
     }
+    spec.staged = parsed.staged;
     spec.init_bin = parsed.init_bin;
     spec.initramfs_bins = parsed.initramfs_bins;
     spec.initramfs_modules = parsed.initramfs_modules;
@@ -114,6 +120,9 @@ fn main() -> ExitCode {
             }
             if !spec.firmware.is_empty() {
                 println!("firmware: {} blob(s)", spec.firmware.len());
+            }
+            if !spec.staged.is_empty() {
+                println!("staged: {} data tree(s)", spec.staged.len());
             }
             // dm-verity over the just-built base: a tamper-evident immutable layer anchored by
             // the printed root hash, which the loader config carries into the kernel command
@@ -244,6 +253,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut modules_root = None;
     let mut firmware = Vec::new();
     let mut firmware_root = None;
+    let mut staged = Vec::new();
     let mut verity = false;
     let mut home = false;
     let mut home_keyfile = None;
@@ -268,6 +278,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--modules-root" => modules_root = Some(PathBuf::from(it.next()?)),
             "--firmware" => firmware.push(it.next()?.clone()),
             "--firmware-root" => firmware_root = Some(PathBuf::from(it.next()?)),
+            "--stage" => staged.push(parse_stage(it.next()?)?),
             "--verity" => verity = true,
             "--home" => home = true,
             "--home-keyfile" => home_keyfile = Some(PathBuf::from(it.next()?)),
@@ -293,6 +304,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         modules_root,
         firmware,
         firmware_root,
+        staged,
         verity,
         home,
         home_keyfile,
@@ -307,6 +319,25 @@ fn parse_args(args: &[String]) -> Option<Args> {
         esp_efi,
         loader_timeout,
         cmdline_extra,
+    })
+}
+
+// Parse a --stage argument: SRC[:DST], the host path to stage and the absolute path it
+// lands at in the base. With no ":DST" the destination defaults to the source path, so
+// `--stage /usr/share/X11/xkb` ships that tree at the same path (where libxkbcommon looks);
+// an explicit DST is for a cross build whose source tree sits elsewhere. Empty either side
+// is rejected so a malformed argument fails the parse rather than staging a root.
+fn parse_stage(arg: &str) -> Option<keybuild::Stage> {
+    let (src, dst) = match arg.split_once(':') {
+        Some((s, d)) => (s, d),
+        None => (arg, arg),
+    };
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    Some(keybuild::Stage {
+        src: PathBuf::from(src),
+        dst: PathBuf::from(dst),
     })
 }
 

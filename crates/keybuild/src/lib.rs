@@ -122,6 +122,21 @@ pub const INITRAMFS_IMAGE: &str = "initramfs.img";
 /// partitions laid side by side, the artifact a bootloader and a kernel are written onto.
 pub const DISK_IMAGE: &str = "key.img";
 
+/// A host file or directory tree to stage verbatim into the base at a chosen path. Unlike
+/// `userland`/`modules`/`firmware`, which install a binary or module and compute a closure,
+/// this is a plain recursive copy of a data tree the closure logic does not apply to: the
+/// xkb keymap data (`/usr/share/X11/xkb`, which libxkbcommon compiles a keymap from, so the
+/// compositor seat gets a keyboard) and libinput's device quirks (`/usr/share/libinput`).
+/// `src` is the host path to read; `dst` is the absolute path it lands at in the base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stage {
+    /// The host path to copy from (a file or a directory).
+    pub src: PathBuf,
+    /// The absolute path in the base to copy to (the leading slash is stripped so it
+    /// lands under the base root).
+    pub dst: PathBuf,
+}
+
 /// The parameters of a Key to build: where to write it, the partition labels and
 /// filesystems init looks for, the default boot mode, and how the system names itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +183,11 @@ pub struct KeySpec {
     /// Firmware blobs to install, each a path relative to `firmware_root`, copied to the
     /// same path under `/lib/firmware`. Empty installs no firmware.
     pub firmware: Vec<String>,
+    /// Host data trees to stage verbatim into the base, each copied recursively from its
+    /// `src` to its `dst` (see [`Stage`]). This is how non-binary runtime data the closure
+    /// logic does not cover reaches the base: the xkb keymap data a keyboard needs and
+    /// libinput's quirks. Empty stages nothing, leaving the reproducible base untouched.
+    pub staged: Vec<Stage>,
     /// The binary installed as the initramfs `/init`, the program the kernel execs as PID 1,
     /// with its shared-library closure. This is `horizon-init`. Required by
     /// [`build_initramfs`]; unused by the base build.
@@ -233,6 +253,7 @@ impl KeySpec {
             modules: Vec::new(),
             firmware_root: PathBuf::from("/lib/firmware"),
             firmware: Vec::new(),
+            staged: Vec::new(),
             init_bin: None,
             initramfs_bins: Vec::new(),
             initramfs_modules: Vec::new(),
@@ -352,6 +373,12 @@ pub fn build_base(spec: &KeySpec) -> Result<PathBuf> {
     }
     if !spec.firmware.is_empty() {
         populate_firmware(&staging, &spec.firmware_root, &spec.firmware)?;
+    }
+
+    // Stage the named data trees (xkb keymap data, libinput quirks) verbatim into the
+    // base; empty by default, leaving the skeleton-only base byte-for-byte as it was.
+    for s in &spec.staged {
+        populate_staged(&staging, s)?;
     }
 
     let out = spec.out.join(BASE_IMAGE);
@@ -1148,6 +1175,34 @@ fn populate_firmware(staging: &Path, firmware_root: &Path, requested: &[String])
     Ok(())
 }
 
+/// Stage one data tree into the base: copy `stage.src` (a host file or directory)
+/// recursively to `stage.dst` under the base root (the leading slash stripped so an
+/// absolute target lands inside the staging tree). Plain filesystem work with no kernel
+/// tool, so it runs and is tested on any host.
+fn populate_staged(staging: &Path, stage: &Stage) -> Result<()> {
+    let rel = stage.dst.strip_prefix("/").unwrap_or(&stage.dst);
+    copy_tree(&stage.src, &staging.join(rel))
+}
+
+/// Recursively copy a host file or directory tree into the base. A directory is recreated
+/// and its entries copied in turn; a file (or a symlink, which the metadata follows) is
+/// copied by [`copy_file`], resolving to its bytes so a data tree behind compatibility
+/// symlinks lands whole. The result depends only on the source contents, not the read-dir
+/// order, and squashfs pins ownership and timestamps, so the staged tree stays
+/// reproducible given the same source.
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    if std::fs::metadata(src)?.is_dir() {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        copy_file(src, dst)
+    }
+}
+
 // Copy one file into the base, creating parent directories as needed. fs::copy follows
 // symlinks (a versioned .so behind its soname) and preserves the mode bits, so an
 // executable or the loader stays executable; squashfs then pins ownership and
@@ -1577,6 +1632,64 @@ mod tests {
         assert!(
             populate_firmware(staging.path(), src.path(), &["missing.bin".to_string()]).is_err()
         );
+    }
+
+    #[test]
+    fn populate_staged_copies_a_tree_to_its_target_following_symlinks() {
+        // A stand-in xkb-style tree: a nested directory of files, plus a symlink, to prove
+        // the recursive copy and that copy_tree resolves a symlink to its bytes.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("rules")).unwrap();
+        std::fs::create_dir_all(src.path().join("symbols")).unwrap();
+        std::fs::write(src.path().join("rules/evdev"), b"! model").unwrap();
+        std::fs::write(src.path().join("symbols/us"), b"xkb_symbols").unwrap();
+        std::os::unix::fs::symlink("evdev", src.path().join("rules/evdev.compat")).unwrap();
+
+        let staging = tempfile::tempdir().unwrap();
+        let stage = Stage {
+            src: src.path().to_path_buf(),
+            dst: PathBuf::from("/usr/share/X11/xkb"),
+        };
+        populate_staged(staging.path(), &stage).unwrap();
+
+        // The tree lands under the base root at the target path, leading slash stripped.
+        let dst = staging.path().join("usr/share/X11/xkb");
+        assert_eq!(std::fs::read(dst.join("rules/evdev")).unwrap(), b"! model");
+        assert_eq!(
+            std::fs::read(dst.join("symbols/us")).unwrap(),
+            b"xkb_symbols"
+        );
+        // The symlink is dereferenced to a plain file holding the target's bytes.
+        let link = dst.join("rules/evdev.compat");
+        assert!(!std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert_eq!(std::fs::read(&link).unwrap(), b"! model");
+
+        // A single file stages too, at exactly its target path.
+        let onefile = tempfile::tempdir().unwrap();
+        std::fs::write(onefile.path().join("quirk"), b"q").unwrap();
+        let staging2 = tempfile::tempdir().unwrap();
+        populate_staged(
+            staging2.path(),
+            &Stage {
+                src: onefile.path().join("quirk"),
+                dst: PathBuf::from("/usr/share/libinput/quirk"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(staging2.path().join("usr/share/libinput/quirk")).unwrap(),
+            b"q"
+        );
+
+        // A missing source fails the build rather than staging a gap.
+        assert!(populate_staged(
+            staging.path(),
+            &Stage {
+                src: src.path().join("does-not-exist"),
+                dst: PathBuf::from("/usr/share/X11/xkb"),
+            },
+        )
+        .is_err());
     }
 
     // A stand-in partition image of `mib` megabytes (zeros), enough for `write_disk` to size

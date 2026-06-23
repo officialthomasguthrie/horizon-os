@@ -1514,6 +1514,31 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   (clicking `sever`, typing a command), then the multi-output/hotplug/VT-switch hardening the GLES
   backend got. Built and tested on darwin and in the Linux container, eye-verified in
   qemu-system-aarch64.
+- Phase 0 step (5) base data staging, the keyboard data on the base (`keybuild` crate +
+  `horizon-keybuild`): the immutable base can now carry arbitrary host data trees, not only
+  binaries, modules, and firmware, which is what a working keyboard needs. The base already held
+  libxkbcommon (horizon's ldd closure), but libxkbcommon compiles a keymap from data files under
+  `/usr/share/X11/xkb`, and the base had none, so the compositor ran with no keyboard (the seat
+  degraded to pointer-only, the non-fatal path `Compositor::new` takes when that dir is absent). The
+  `userland`/`modules`/`firmware` installers each compute a closure (ldd, modules.dep) that does not
+  apply to a plain data tree, so this adds a fourth, closure-free installer: a `Stage { src, dst }`
+  copied recursively into the base, `populate_staged` stripping the leading slash so an absolute
+  target lands under the base root and `copy_tree` walking the tree (following symlinks to their
+  bytes, so a data tree behind compatibility symlinks lands whole), deterministic so the staged base
+  stays the reproducible squashfs it was (empty by default, leaving a skeleton or binary-only base
+  byte-for-byte as before). `horizon-keybuild --stage <src[:dst]>` ships a tree (dst defaults to src,
+  the common case where the host path is the base path; an explicit dst is for a cross build whose
+  source tree sits elsewhere). On the usual headless split the copy is plain filesystem work proven on
+  every host: a unit test stages a stand-in xkb-style tree and asserts it lands at the target with the
+  leading slash stripped, a symlink is dereferenced to a plain file, a single file stages too, and a
+  missing source fails the build rather than shipping a gap. Eye-verified in qemu-system-aarch64: a
+  softdrm Key rebuilt with `--stage /usr/share/X11/xkb --stage /usr/share/libinput` boots the desktop
+  with the seat keyboard added (the boot no longer prints `no xkb data`) and scans out the
+  four-principal Glass dashboard at 1920x1080. The keyboard data is now on the base; making it take
+  input is the next piece, and it surfaced a deeper gap: libinput rejects the virtio input devices
+  with `udev device never initialized`, because it requires udev to have processed each device (a
+  `/run/udev/data` entry a udev daemon writes) and the minimal boot runs none, so input bring-up needs
+  a udev coldplug, not just the device nodes. Built and tested on darwin and in the Linux container.
 
 ## Next
 
