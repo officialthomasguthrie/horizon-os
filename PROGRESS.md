@@ -1405,6 +1405,34 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   partitions (`vda: vda1 vda2 vda3 vda4`); the boot then stops at the by-label partition resolve, the
   next piece, since a minimal initramfs has no udev to maintain `/dev/disk/by-label`. Built and tested
   on darwin and in the Linux container, eye-verified in qemu-system-aarch64.
+- Phase 0 step (5) init partition resolution and the `/dev` mount fix (`init` crate, Linux):
+  `horizon-init` now boots a real Key through `switch_root`, resolving and mounting the partitions in
+  a minimal initramfs. Getting there caught two real bugs the QEMU boot surfaced. (1) Resolution
+  without udev: `resolve` looked labels up under `/dev/disk/by-label`, the symlinks udev maintains,
+  but a minimal initramfs runs no udev, and the squashfs base and the dm-verity hash device carry no
+  filesystem label at all, only a GPT partition name. So `resolve_label` now falls back to reading
+  the GPT directly (`parse_gpt`, the symmetric reader to keybuild's GPT writer): scan the whole-disk
+  block devices in `/sys/block`, read each disk's partition table, and map the requested name to
+  `/dev/<disk><N>`. `parse_gpt` is pure and unit-tested (names and slot-derived numbers, an empty
+  slot skipped without renumbering, a non-GPT disk refused); the Linux scan reads the bytes off the
+  real disk and returns the partition node once it exists. (2) The `/dev` mount: `early_mounts`
+  mounted devtmpfs with the scratch flags, which include `nodev`, and a `nodev` `/dev` makes the
+  kernel refuse to open `/dev/vda` (or the encrypted layer) with `EACCES` even as root, so nothing
+  could be read off a partition; devtmpfs now mounts with a `DEV` flag (`nosuid`, but device nodes
+  allowed). That bug was latent because every prior test used tmpfs and binds, never a real device
+  open, exactly what the eye-verify exists to catch. The init also sets a `PATH` before shelling out
+  (the kernel gives PID 1 none, so `cryptsetup`/`veritysetup` under `/usr/sbin` were unreachable) and
+  polls for the required base to resolve, since block-device probing is asynchronous (virtio_blk
+  creates the disk and its partition nodes a moment after it loads). Verified for real in
+  qemu-system-aarch64: the same aarch64 Key now boots AAVMF -> systemd-boot -> kernel -> initramfs ->
+  `horizon-init`, which loads the modules, resolves the base to `/dev/vda2` off the GPT, mounts the
+  ext4 data partition (once `crc32c_generic` is added to the initramfs, since ext4 requests the
+  crc32c crypto algorithm at runtime and a minimal initramfs has no modprobe for the kernel's
+  `request_module` to call), finds no identity store on the still-empty Key, falls back to Ghost,
+  mounts the squashfs base, assembles the OverlayFS, and `switch_root`s into `horizon boot`, which
+  runs as the real init and reports the Key carries no identity yet. So the whole init orchestration
+  is proven end to end through the pivot, short only of an identity store to boot into. Built and
+  tested on darwin and in the Linux container, eye-verified in qemu-system-aarch64.
 
 ## Next
 
