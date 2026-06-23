@@ -41,10 +41,11 @@ pub use error::{Error, Result};
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    execute, is_unprivileged_error, luks_close, luks_open, mount_proc, resolve, verity_close,
-    verity_open,
+    execute, is_unprivileged_error, load_modules, luks_close, luks_open, modules_dir, mount_proc,
+    resolve, verity_close, verity_open,
 };
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The default init to exec once the real root is mounted: the `horizon` binary in
@@ -578,6 +579,65 @@ pub fn mapper_path(mapper: &str) -> PathBuf {
     Path::new("/dev/mapper").join(mapper)
 }
 
+/// Parse a kernel `modules.dep` into a map from each module's path (relative to the modules
+/// directory) to the modules it depends on. The init reads the closure-consistent `modules.dep`
+/// keybuild wrote into the initramfs; each line is `<module>: <dep> <dep> ...`, paths relative to
+/// the modules directory, blank and colon-less lines skipped. A module with no dependencies still
+/// appears, with an empty list, so the map is the full set the initramfs carries. Pure text
+/// handling, unit-tested on every host; the [`load_modules`] that consumes it is Linux-only. (The
+/// keybuild producer has the same parser over the source kernel tree; init reparses the trimmed
+/// closure it shipped, so the two share a format, not a dependency.)
+pub fn parse_modules_dep(text: &str) -> BTreeMap<PathBuf, Vec<PathBuf>> {
+    let mut deps = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some((target, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let target = target.trim();
+        if target.is_empty() {
+            continue;
+        }
+        let needs = rest.split_whitespace().map(PathBuf::from).collect();
+        deps.insert(PathBuf::from(target), needs);
+    }
+    deps
+}
+
+/// The order to load a set of kernel modules so every module's dependencies load before it: a
+/// post-order walk of the `modules.dep` graph. Modules are visited in sorted order and each is
+/// emitted once, so the boot loads the same deterministic sequence every time and a dependency
+/// two modules share is loaded a single time. A dependency named in `modules.dep` but absent as a
+/// key (it has its own line in a well-formed file, so this is only a malformed input) is still
+/// emitted before its dependent. Pure, so the ordering is unit-tested with no kernel.
+pub fn module_load_order(deps: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Vec<PathBuf> {
+    let mut order = Vec::new();
+    let mut done = BTreeSet::new();
+    for m in deps.keys() {
+        visit_module(m, deps, &mut done, &mut order);
+    }
+    order
+}
+
+// Post-order DFS: mark on entry so a malformed dependency cycle terminates, push after the
+// dependencies so they precede the dependent in the load order.
+fn visit_module(
+    m: &Path,
+    deps: &BTreeMap<PathBuf, Vec<PathBuf>>,
+    done: &mut BTreeSet<PathBuf>,
+    order: &mut Vec<PathBuf>,
+) {
+    if !done.insert(m.to_path_buf()) {
+        return;
+    }
+    if let Some(needs) = deps.get(m) {
+        for d in needs {
+            visit_module(d, deps, done, order);
+        }
+    }
+    order.push(m.to_path_buf());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,6 +948,37 @@ mod tests {
         assert!(!home_wanted(ModeChoice::Auto, true, false));
         assert!(!home_wanted(ModeChoice::Auto, false, true));
         assert!(!home_wanted(ModeChoice::Home, false, false));
+    }
+
+    #[test]
+    fn module_load_order_puts_dependencies_first() {
+        // A slice of a real modules.dep: ext4 needs mbcache and jbd2, dm-crypt needs dm-mod,
+        // squashfs needs nothing. The initramfs carries the closure keybuild trimmed, and the
+        // init must load each module after the ones it depends on.
+        let text = "\
+kernel/fs/ext4/ext4.ko: kernel/fs/mbcache.ko kernel/fs/jbd2/jbd2.ko
+kernel/fs/mbcache.ko:
+kernel/fs/jbd2/jbd2.ko:
+kernel/fs/squashfs/squashfs.ko:
+kernel/drivers/md/dm-crypt.ko: kernel/drivers/md/dm-mod.ko
+kernel/drivers/md/dm-mod.ko:
+";
+        let deps = parse_modules_dep(text);
+        let order = module_load_order(&deps);
+        let pos = |name: &str| {
+            order
+                .iter()
+                .position(|p| p.to_string_lossy().contains(name))
+                .unwrap_or_else(|| panic!("{name} not in load order"))
+        };
+        // Every dependency loads before the module that needs it.
+        assert!(pos("mbcache") < pos("ext4.ko"));
+        assert!(pos("jbd2") < pos("ext4.ko"));
+        assert!(pos("dm-mod") < pos("dm-crypt"));
+        // Six distinct modules, each loaded exactly once (a shared dependency is not repeated).
+        assert_eq!(order.len(), 6);
+        let unique: std::collections::BTreeSet<_> = order.iter().collect();
+        assert_eq!(unique.len(), 6);
     }
 }
 

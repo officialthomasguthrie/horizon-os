@@ -42,6 +42,21 @@ fn run() -> init::Result<()> {
         steps: early_mounts(),
     })?;
 
+    // Load the boot-path kernel modules the initramfs carries (the Debian-class kernel ships
+    // squashfs, overlay, ext4, the dm-verity/dm-crypt targets, and the virtio block drivers as
+    // modules, and a minimal initramfs has no udev or modprobe to load them on demand), in
+    // dependency order, so the partitions appear under /dev and the verity/LUKS layers can be
+    // opened. A kernel with these built in carries no modules directory, so this is a no-op.
+    if let Some(dir) = modules_dir() {
+        match load_modules(&dir) {
+            Ok(n) => eprintln!(
+                "horizon-init: loaded {n} boot-path module(s) from {}",
+                dir.display()
+            ),
+            Err(e) => eprintln!("horizon-init: module load: {e}"),
+        }
+    }
+
     // The base must resolve; without the immutable OS there is nothing to boot. The store
     // (data) partition and the encrypted Home layer are optional: their absence, or an
     // explicit Ghost request, means a stateless boot.

@@ -26,7 +26,7 @@ thiserror.workspace = true
 # hosts the crate still compiles (so the workspace builds on darwin) but the executor
 # is absent; the plan and its tests are pure and build everywhere.
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.29", features = ["mount", "fs", "process"] }
+nix = { version = "0.29", features = ["mount", "fs", "process", "feature"] }
 libc = "0.2"
 # The initramfs binary recovers the identity master from the store (discover + unlock)
 # to open the encrypted Home layer before assembling the overlay. Only the Linux init

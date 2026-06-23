@@ -6,6 +6,7 @@
 use std::ffi::CString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -181,6 +182,84 @@ pub fn resolve(spec: &Spec, fstype: &str) -> Result<Source, Error> {
         return Err(Error::Resolve(format!("{spec:?}")));
     }
     Ok(Source::new(path, fstype, MountFlags::default()))
+}
+
+/// Load the boot-path kernel modules the initramfs carries, in dependency order, so the Key's
+/// partitions appear under `/dev` and the dm-verity and dm-crypt layers can be opened. A
+/// Debian-class kernel ships squashfs, overlay, ext4, the device-mapper targets, and the virtio
+/// block drivers as modules, and a minimal initramfs has no udev or modprobe to load them on
+/// demand, so the init loads them itself: read the `modules.dep` keybuild wrote, order it with
+/// [`crate::module_load_order`], and `finit_module` each `.ko`. The modules are uncompressed, so
+/// no decompression and no compressed-file flag is needed. A module already loaded (`EEXIST`) is
+/// fine; any other failure is logged and the load continues, so a module that will not load
+/// surfaces at the mount that needs it rather than wedging the whole boot here. Returns how many
+/// loaded. A kernel with these drivers built in carries no modules directory ([`modules_dir`]
+/// returns `None`), so the caller does no work.
+pub fn load_modules(dir: &Path) -> Result<usize, Error> {
+    let dep_path = dir.join("modules.dep");
+    let text = match std::fs::read_to_string(&dep_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(Error::step("modules.dep", &dep_path, e)),
+    };
+    let deps = crate::parse_modules_dep(&text);
+    let mut loaded = 0;
+    for rel in crate::module_load_order(&deps) {
+        let ko = dir.join(&rel);
+        match finit_module(&ko) {
+            Ok(()) => loaded += 1,
+            // Already loaded (a dependency pulled in earlier, or a built-in stub): not an error.
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+            Err(e) => eprintln!("horizon-init: module {}: {e}", rel.display()),
+        }
+    }
+    Ok(loaded)
+}
+
+// finit_module(2): load an uncompressed .ko by file descriptor, with no module parameters and no
+// flags. The kernel reads the module image straight from the fd, so nothing is copied through
+// userspace; uncompressed modules need no MODULE_INIT_COMPRESSED_FILE.
+fn finit_module(ko: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::open(ko)?;
+    let params = c"";
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_finit_module,
+            file.as_raw_fd(),
+            params.as_ptr(),
+            0 as libc::c_int,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The initramfs's kernel-modules directory (`/lib/modules/<version>`), or `None` when the kernel
+/// ships its drivers built in (no such directory). Prefers the running kernel's release (`uname`),
+/// falling back to the single versioned directory a Horizon initramfs carries.
+pub fn modules_dir() -> Option<PathBuf> {
+    let base = Path::new("/lib/modules");
+    if let Some(release) = uname_release() {
+        let d = base.join(&release);
+        if d.join("modules.dep").exists() {
+            return Some(d);
+        }
+    }
+    std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("modules.dep").exists())
+}
+
+// The running kernel's release string (`uname -r`), used to find its modules directory.
+fn uname_release() -> Option<String> {
+    let u = nix::sys::utsname::uname().ok()?;
+    u.release().to_str().map(str::to_string)
 }
 
 /// Open the encrypted Home layer at `container` with the 32-byte `master`, exposing the
