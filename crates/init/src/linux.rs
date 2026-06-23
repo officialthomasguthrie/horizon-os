@@ -4,7 +4,7 @@
 // lib.rs.
 
 use std::ffi::CString;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -173,15 +173,121 @@ pub fn mount_proc() -> Result<(), Error> {
 /// hardcoded. An absent device is an error the caller decides how to handle (a missing
 /// base aborts the boot; a missing data device falls back to Ghost).
 pub fn resolve(spec: &Spec, fstype: &str) -> Result<Source, Error> {
-    let path = match spec {
-        Spec::Path(p) => p.clone(),
-        Spec::Label(l) => Path::new("/dev/disk/by-label").join(l),
-        Spec::Uuid(u) => Path::new("/dev/disk/by-uuid").join(u),
+    let resolved = match spec {
+        Spec::Path(p) => p.exists().then(|| p.clone()),
+        Spec::Label(l) => resolve_label(l),
+        Spec::Uuid(u) => {
+            let p = Path::new("/dev/disk/by-uuid").join(u);
+            p.exists().then_some(p)
+        }
     };
-    if !path.exists() {
-        return Err(Error::Resolve(format!("{spec:?}")));
+    match resolved {
+        Some(path) => Ok(Source::new(path, fstype, MountFlags::default())),
+        None => Err(Error::Resolve(format!("{spec:?}"))),
     }
-    Ok(Source::new(path, fstype, MountFlags::default()))
+}
+
+/// Resolve a label to a device. On a full system udev maintains the `/dev/disk/by-label` and
+/// `/dev/disk/by-partlabel` symlinks, so those are tried first; a minimal initramfs has no udev,
+/// so the fallback reads the GPT directly ([`resolve_partlabel`]). The labels a Key uses are GPT
+/// partition names, which every partition has, including the label-less squashfs base and the
+/// filesystem-less dm-verity hash device, so the partition-name path is what a Key relies on.
+fn resolve_label(label: &str) -> Option<PathBuf> {
+    for dir in ["/dev/disk/by-label", "/dev/disk/by-partlabel"] {
+        let p = Path::new(dir).join(label);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    resolve_partlabel(label)
+}
+
+/// Find the partition whose GPT name is `label` by reading the partition tables of the whole-disk
+/// block devices directly, the resolution a minimal initramfs relies on with no udev to maintain
+/// the by-label symlinks. Returns `/dev/<disk><N>` for the first match. Only the Key's disk
+/// carries `HORIZON-*` partition names, so scanning every disk and matching the name needs no
+/// guess at which disk is the Key.
+fn resolve_partlabel(label: &str) -> Option<PathBuf> {
+    for disk in whole_disks() {
+        let dev = Path::new("/dev").join(&disk);
+        let Some(parts) = read_disk_gpt(&dev, sector_size(&disk)) else {
+            continue;
+        };
+        if let Some(p) = parts.into_iter().find(|p| p.name == label) {
+            // Return the partition node only once it exists: the GPT on the whole disk is
+            // readable before the kernel finishes the asynchronous partition scan, so a node
+            // named but not yet created would resolve to a path that cannot be mounted. The
+            // caller polls, so a not-yet-created node simply retries.
+            let node = partition_dev(&disk, p.number);
+            if node.exists() {
+                return Some(node);
+            }
+        }
+    }
+    None
+}
+
+// The whole-disk block devices the kernel knows, from /sys/block, minus the pseudo devices that
+// never hold a Key (ram disks, loop devices). Reading a non-GPT disk's table returns None, so
+// this list need not be exact, only a superset of the real disks.
+fn whole_disks() -> Vec<String> {
+    let mut disks = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/block") {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("ram") || name.starts_with("loop") {
+                continue;
+            }
+            disks.push(name);
+        }
+    }
+    disks
+}
+
+// A disk's logical sector size, read from sysfs (the unit the GPT's LBAs count in); 512 if it
+// cannot be read, the near-universal default the Key is built with.
+fn sector_size(disk: &str) -> u64 {
+    std::fs::read_to_string(format!("/sys/block/{disk}/queue/logical_block_size"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(512)
+}
+
+// Read a disk's primary GPT (the header at LBA 1, then the entry array it points at) and parse
+// it. None if the disk is not GPT or cannot be read, so a non-Key disk is silently skipped.
+fn read_disk_gpt(dev: &Path, sector: u64) -> Option<Vec<crate::GptPart>> {
+    let mut f = std::fs::File::open(dev).ok()?;
+    let mut header = [0u8; 512];
+    f.seek(SeekFrom::Start(sector)).ok()?; // LBA 1
+    f.read_exact(&mut header).ok()?;
+    if &header[0..8] != b"EFI PART" {
+        return None;
+    }
+    let entry_lba = u64::from_le_bytes(header[72..80].try_into().ok()?);
+    let num = u32::from_le_bytes(header[80..84].try_into().ok()?) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().ok()?) as usize;
+    let total = num.checked_mul(size)?;
+    // A sane GPT entry array is small (128 entries x 128 bytes = 16 KiB); cap it so a corrupt
+    // header cannot ask for a huge allocation.
+    if total == 0 || total > 1 << 20 {
+        return None;
+    }
+    let mut entries = vec![0u8; total];
+    f.seek(SeekFrom::Start(entry_lba.checked_mul(sector)?))
+        .ok()?;
+    f.read_exact(&mut entries).ok()?;
+    crate::parse_gpt(&header, &entries)
+}
+
+// The device node of partition `number` on `disk`: nvme0n1 -> nvme0n1p2, vda -> vda2. A disk
+// whose name ends in a digit takes the `p` separator, the kernel's partition-naming rule.
+fn partition_dev(disk: &str, number: u32) -> PathBuf {
+    let sep = if disk.ends_with(|c: char| c.is_ascii_digit()) {
+        "p"
+    } else {
+        ""
+    };
+    Path::new("/dev").join(format!("{disk}{sep}{number}"))
 }
 
 /// Load the boot-path kernel modules the initramfs carries, in dependency order, so the Key's

@@ -29,6 +29,11 @@ fn run() -> init::Result<()> {
     use init::*;
     use std::path::PathBuf;
 
+    // The kernel gives PID 1 no environment, so set a PATH before anything shells out: cryptsetup
+    // and veritysetup live under /usr/sbin in the initramfs, and a bare Command::new finds them by
+    // PATH. Without this the LUKS and dm-verity opens fail with "No such file or directory".
+    std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
+
     // Mount proc first so the kernel command line is readable, then plan from it.
     mount_proc()?;
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
@@ -60,7 +65,23 @@ fn run() -> init::Result<()> {
     // The base must resolve; without the immutable OS there is nothing to boot. The store
     // (data) partition and the encrypted Home layer are optional: their absence, or an
     // explicit Ghost request, means a stateless boot.
-    let base = resolve(&params.base, &params.basefs)?.read_only();
+    //
+    // Block-device probing is asynchronous: virtio_blk creates the disk and its partition nodes a
+    // moment after it loads, so poll for the required base to resolve before mounting it (the
+    // other partitions on the same disk are ready once the base is). Give up after a few seconds,
+    // so a genuinely absent base still fails the boot rather than hanging forever.
+    let base = {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match resolve(&params.base, &params.basefs) {
+                Ok(s) => break s.read_only(),
+                Err(e) if Instant::now() >= deadline => return Err(e),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    };
+    eprintln!("horizon-init: base resolved to {}", base.dev.display());
 
     // If the loader supplied a dm-verity root hash, verify the base before mounting it: open
     // a verity device over the raw partition against the hash tree, anchored by that hash,

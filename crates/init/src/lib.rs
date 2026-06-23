@@ -108,6 +108,18 @@ impl MountFlags {
         nodev: true,
         noexec: false,
     };
+
+    /// The `/dev` devtmpfs: device nodes must function, since it is the device filesystem
+    /// itself, so unlike a scratch filesystem it does NOT set `nodev` (a `nodev` /dev makes the
+    /// kernel refuse to open `/dev/vda` and the encrypted layer with EACCES, even as root).
+    /// `nosuid` hardening stays; executables are allowed (the dynamic loader and tools run from
+    /// device-backed paths the boot reaches through here).
+    pub const DEV: MountFlags = MountFlags {
+        rdonly: false,
+        nosuid: true,
+        nodev: false,
+        noexec: false,
+    };
 }
 
 /// A filesystem to mount: the source (a block device path, or a pseudo-source like
@@ -278,7 +290,7 @@ impl Plan {
 pub fn early_mounts() -> Vec<Step> {
     vec![
         Step::Mount {
-            source: Source::new("devtmpfs", "devtmpfs", MountFlags::SCRATCH),
+            source: Source::new("devtmpfs", "devtmpfs", MountFlags::DEV),
             target: PathBuf::from("/dev"),
         },
         Step::Mount {
@@ -638,6 +650,69 @@ fn visit_module(
     order.push(m.to_path_buf());
 }
 
+/// A partition found in a disk's GPT: its 1-based partition number (so `/dev/vda2` is number 2)
+/// and its GPT partition name (the PARTLABEL). This is what lets the init resolve the Key's
+/// partitions in a minimal initramfs with no udev: the squashfs base and the dm-verity hash
+/// device carry no filesystem label at all, only a GPT partition name, so the name in the table
+/// is the only universal handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GptPart {
+    pub number: u32,
+    pub name: String,
+}
+
+/// Parse the partition entries out of a disk's GPT. `header` is the 512-byte primary GPT header
+/// (the disk's LBA 1) and `entries` is the partition entry array it points at (read from the
+/// header's entry LBA). Returns the non-empty partitions, each with its 1-based number (its slot
+/// index plus one, which is how the kernel numbers `/dev/vdaN`) and its name. Returns `None` if
+/// `header` is not a GPT (no `EFI PART` signature) or its entry size is impossible. Pure byte
+/// handling, so it is unit-tested with a crafted table; the Linux side reads the bytes off a real
+/// disk and calls this. keybuild owns the GPT writer, so this is the symmetric reader.
+pub fn parse_gpt(header: &[u8], entries: &[u8]) -> Option<Vec<GptPart>> {
+    if header.len() < 92 || &header[0..8] != b"EFI PART" {
+        return None;
+    }
+    let num = u32::from_le_bytes(header[80..84].try_into().ok()?) as usize;
+    let size = u32::from_le_bytes(header[84..88].try_into().ok()?) as usize;
+    // A GPT entry is at least 128 bytes (type+unique GUID, the two LBAs, attrs, the 72-byte
+    // name); a smaller declared size is a malformed table.
+    if size < 128 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for i in 0..num {
+        let off = i.checked_mul(size)?;
+        if off + 128 > entries.len() {
+            break;
+        }
+        let entry = &entries[off..off + 128];
+        // An all-zero partition type GUID marks an unused slot; skip it but keep counting, so
+        // the partition numbers stay aligned with the kernel's even past a gap.
+        if entry[0..16].iter().all(|&b| b == 0) {
+            continue;
+        }
+        parts.push(GptPart {
+            number: (i + 1) as u32,
+            name: decode_utf16le(&entry[56..128]),
+        });
+    }
+    Some(parts)
+}
+
+// Decode a NUL-terminated little-endian UTF-16 string (a GPT partition name), stopping at the
+// first 0x0000 unit.
+fn decode_utf16le(bytes: &[u8]) -> String {
+    let mut units = Vec::new();
+    for chunk in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([chunk[0], chunk[1]]);
+        if u == 0 {
+            break;
+        }
+        units.push(u);
+    }
+    String::from_utf16_lossy(&units)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,6 +775,17 @@ mod tests {
                 source.flags.nosuid && source.flags.nodev && source.flags.noexec,
             _ => true,
         }));
+        // devtmpfs is the device filesystem, so it must NOT be nodev (a nodev /dev makes the
+        // kernel refuse to open /dev/vda and the encrypted layer), though nosuid hardening stays.
+        let dev = m
+            .iter()
+            .find_map(|s| match s {
+                Step::Mount { source, .. } if source.fstype == "devtmpfs" => Some(source.flags),
+                _ => None,
+            })
+            .expect("a devtmpfs mount");
+        assert!(!dev.nodev, "/dev must allow device nodes");
+        assert!(dev.nosuid, "/dev should still be nosuid");
     }
 
     #[test]
@@ -979,6 +1065,61 @@ kernel/drivers/md/dm-mod.ko:
         assert_eq!(order.len(), 6);
         let unique: std::collections::BTreeSet<_> = order.iter().collect();
         assert_eq!(unique.len(), 6);
+    }
+
+    // A 128-byte GPT partition entry: a non-zero type GUID (so it is not an empty slot) and the
+    // partition name in UTF-16LE at offset 56, or all zeros for an unused slot.
+    fn gpt_entry(name: Option<&str>) -> Vec<u8> {
+        let mut e = vec![0u8; 128];
+        if let Some(name) = name {
+            e[0] = 0x01; // any non-zero type GUID byte marks the slot used
+            for (i, u) in name.encode_utf16().enumerate() {
+                e[56 + i * 2..58 + i * 2].copy_from_slice(&u.to_le_bytes());
+            }
+        }
+        e
+    }
+
+    #[test]
+    fn parse_gpt_reads_partition_names_and_numbers() {
+        // A primary GPT header pointing at a four-slot entry array.
+        let mut header = vec![0u8; 512];
+        header[0..8].copy_from_slice(b"EFI PART");
+        header[72..80].copy_from_slice(&2u64.to_le_bytes()); // entry array LBA
+        header[80..84].copy_from_slice(&4u32.to_le_bytes()); // 4 slots
+        header[84..88].copy_from_slice(&128u32.to_le_bytes()); // 128-byte entries
+
+        // Slot 0 ESP, slot 1 base, slot 2 empty, slot 3 home: the numbers follow the slot index
+        // (kernel /dev/vdaN), and the empty slot is skipped without renumbering the rest.
+        let mut entries = Vec::new();
+        entries.extend(gpt_entry(Some("HORIZON-ESP")));
+        entries.extend(gpt_entry(Some("HORIZON-BASE")));
+        entries.extend(gpt_entry(None));
+        entries.extend(gpt_entry(Some("HORIZON-HOME")));
+
+        let parts = parse_gpt(&header, &entries).expect("a valid GPT");
+        assert_eq!(
+            parts,
+            vec![
+                GptPart {
+                    number: 1,
+                    name: "HORIZON-ESP".into()
+                },
+                GptPart {
+                    number: 2,
+                    name: "HORIZON-BASE".into()
+                },
+                GptPart {
+                    number: 4,
+                    name: "HORIZON-HOME".into()
+                },
+            ]
+        );
+
+        // A non-GPT header (no signature) is refused, so a disk without a table is skipped.
+        let mut not_gpt = vec![0u8; 512];
+        not_gpt[0..8].copy_from_slice(b"NOTAPART");
+        assert!(parse_gpt(&not_gpt, &entries).is_none());
     }
 }
 
