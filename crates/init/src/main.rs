@@ -34,6 +34,14 @@ fn run() -> init::Result<()> {
     // PATH. Without this the LUKS and dm-verity opens fail with "No such file or directory".
     std::env::set_var("PATH", "/usr/sbin:/usr/bin:/sbin:/bin");
 
+    // The booted system has no seat daemon (no logind, no seatd): Horizon boots straight into one
+    // compositor as root on the console. libseat will not fall back to its embedded seatd on its
+    // own, so point it at the builtin backend, which opens the DRM and input devices directly as
+    // root. This is inherited across the switch_root (execv keeps the environment), so the
+    // compositor `horizon boot` launches gets a seat with no daemon to run. A full system with a
+    // seat daemon would set this itself.
+    std::env::set_var("LIBSEAT_BACKEND", "builtin");
+
     // Mount proc first so the kernel command line is readable, then plan from it.
     mount_proc()?;
     let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();

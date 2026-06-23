@@ -20,6 +20,12 @@ render = ["smithay/renderer_pixman"]
 # session and present the composited Space on screen. This is the part that needs
 # a display and a GPU, verified by eye, not in CI. Pulls libwayland, EGL, and GL.
 winit = ["render", "smithay/backend_winit"]
+# Internal marker enabled by both DRM/KMS backends (the GLES `udev` one and the
+# software-scanout `softdrm` one). It gates the backend-facing accessors the two
+# share (the scene, the shell background and its generation, the per-frame tick),
+# so they exist whenever either backend is built without spelling out both
+# features at every call site. Not meant to be turned on directly.
+drm-backend = ["render"]
 # Bare-metal DRM/KMS + libinput backend: drive a real display directly off a GPU,
 # with no nesting session, the path Horizon boots into on hardware. Same split as
 # winit: it reuses the already-tested compositing and seat routing, so only the
@@ -28,7 +34,7 @@ winit = ["render", "smithay/backend_winit"]
 # are runtime-loaded), this links system libraries: libdrm, libgbm, libinput,
 # libseat, and libudev.
 udev = [
-    "render",
+    "drm-backend",
     "smithay/backend_drm",
     "smithay/backend_gbm",
     "smithay/backend_libinput",
@@ -36,6 +42,28 @@ udev = [
     "smithay/backend_session_libseat",
     "smithay/renderer_gl",
     "smithay/renderer_multi",
+]
+# Software (pixman) DRM/KMS scanout backend: composite with the tested pixman
+# renderer into a DRM dumb buffer (plain CPU memory) and page-flip it, with no GPU
+# in the path. Where `udev` needs a GBM/GLES device (virtio-gpu with virgl, or real
+# hardware with working EGL), this drives any KMS device, including plain
+# virtio-gpu and real hardware with no usable GLES, so it is both the QEMU boot
+# target and the no-GPU fallback a "boots anywhere" Key wants. It reuses the same
+# seat routing and the same whole-space compositing the winit backend presents,
+# only swapping the on-screen target for a KMS dumb buffer, so almost nothing here
+# is new logic. Smithay's `DrmCompositor` (the plane/damage/page-flip machinery the
+# GLES backend also trusts) lives behind `backend_gbm`, so this links libgbm too,
+# but never creates a gbm device (the cursor plane is unused) and never calls into
+# it: the renderer is pixman (CPU) and the buffers are dumb (CPU), so at runtime
+# there is still no GPU, GLES, EGL, or virgl, only libdrm, libgbm, libinput,
+# libseat, and libudev.
+softdrm = [
+    "drm-backend",
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_udev",
+    "smithay/backend_session_libseat",
 ]
 
 [dependencies]

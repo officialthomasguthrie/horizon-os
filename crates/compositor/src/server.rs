@@ -70,7 +70,7 @@ pub enum ShellKey {
 /// to redraw the background, or `None` to leave it unchanged. This is the one
 /// callback [`Compositor::show`] and [`Compositor::run_drm`] take, so the owner
 /// holds the shell across clicks, keys, and ticks behind a single mutable borrow.
-#[cfg(any(feature = "winit", feature = "udev"))]
+#[cfg(any(feature = "winit", feature = "drm-backend"))]
 pub enum ShellEvent {
     /// A pointer press landed on the shell background at this output-logical
     /// position (no client window was over it), e.g. a click on a Glass `sever`
@@ -171,11 +171,12 @@ struct State {
     // drawing it needs a renderer.
     #[cfg(feature = "render")]
     background: Option<crate::render::ShellBackground>,
-    // Bumped on every `set_shell_background`. The DRM backend caches an upload of
-    // the background and rebuilds it only when this changes, so an idle desktop is
-    // not re-uploaded each frame (which would defeat its damage tracking). Only the
-    // DRM path caches, so this is udev-gated; winit redraws every frame regardless.
-    #[cfg(feature = "udev")]
+    // Bumped on every `set_shell_background`. Both DRM backends cache the
+    // background (the GLES one as a texture upload, the software one as a pixman
+    // texture) and rebuild it only when this changes, so an idle desktop is not
+    // re-uploaded each frame (which would defeat the damage tracking). Only the DRM
+    // paths cache, so this is drm-backend-gated; winit redraws every frame.
+    #[cfg(feature = "drm-backend")]
     background_gen: u64,
     // Where the next toplevel is placed. Without a real layout we just step
     // windows across so several are distinct in the scene.
@@ -527,11 +528,22 @@ impl Compositor {
 
         let mut seats: SeatState<State> = SeatState::new();
         let mut seat = seats.new_wl_seat(&dh, "seat0");
-        // The keyboard compiles an xkb keymap (libxkbcommon). Treat a failure as
-        // non-fatal: a host with no xkb data can still run the compositor, just
-        // without a keyboard, which is enough for the headless core.
-        if let Err(e) = seat.add_keyboard(Default::default(), 200, 25) {
-            eprintln!("compositor: no keyboard ({e})");
+        // The keyboard compiles an xkb keymap from libxkbcommon's data (under
+        // XKB_CONFIG_ROOT, /usr/share/X11/xkb by default). A host with that data
+        // gets a keyboard; one without it, like the minimal boot base, must run
+        // without one. libxkbcommon does not fail cleanly when the data is missing
+        // (it can crash inside the C library rather than returning an error), so
+        // gate on the data being present instead of catching a failure: only add the
+        // keyboard when the directory exists. Either way the pointer is added, so a
+        // dataless host still has a usable seat, the non-fatal degradation intended.
+        let xkb_root =
+            std::env::var("XKB_CONFIG_ROOT").unwrap_or_else(|_| "/usr/share/X11/xkb".to_string());
+        if std::path::Path::new(&xkb_root).is_dir() {
+            if let Err(e) = seat.add_keyboard(Default::default(), 200, 25) {
+                eprintln!("compositor: no keyboard ({e})");
+            }
+        } else {
+            eprintln!("compositor: no xkb data at {xkb_root}; running without a keyboard");
         }
         seat.add_pointer();
 
@@ -578,7 +590,7 @@ impl Compositor {
             next_output_id: 0,
             #[cfg(feature = "render")]
             background: None,
-            #[cfg(feature = "udev")]
+            #[cfg(feature = "drm-backend")]
             background_gen: 0,
             next_x: 0,
             pointer_loc: (0.0, 0.0).into(),
@@ -885,23 +897,23 @@ impl Compositor {
         let ok = width > 0 && height > 0 && rgba.len() >= (width as usize * height as usize * 4);
         self.state.background =
             ok.then(|| crate::render::ShellBackground::new(rgba.to_vec(), width, height));
-        // A change (including a clear) invalidates the DRM backend's cached upload.
-        #[cfg(feature = "udev")]
+        // A change (including a clear) invalidates a DRM backend's cached upload.
+        #[cfg(feature = "drm-backend")]
         {
             self.state.background_gen = self.state.background_gen.wrapping_add(1);
         }
     }
 
     // The shell background an on-screen backend paints behind the scene, if set.
-    #[cfg(any(feature = "winit", feature = "udev"))]
+    #[cfg(any(feature = "winit", feature = "drm-backend"))]
     pub(crate) fn background(&self) -> Option<&crate::render::ShellBackground> {
         self.state.background.as_ref()
     }
 
-    // A counter bumped on every `set_shell_background`, so the DRM backend knows
-    // when to rebuild its cached background upload (an unchanged value means the
-    // desktop is unchanged and the upload can be reused).
-    #[cfg(feature = "udev")]
+    // A counter bumped on every `set_shell_background`, so a DRM backend knows when
+    // to rebuild its cached background upload (an unchanged value means the desktop
+    // is unchanged and the upload can be reused).
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn background_generation(&self) -> u64 {
         self.state.background_gen
     }
@@ -919,14 +931,14 @@ impl Compositor {
 
     // The scene an on-screen backend paints: the same `Space` the headless render
     // path composites. Shared by the winit and DRM backends.
-    #[cfg(any(feature = "winit", feature = "udev"))]
+    #[cfg(any(feature = "winit", feature = "drm-backend"))]
     pub(crate) fn space(&self) -> &Space<Window> {
         &self.state.space
     }
 
     // Tell each mapped client it may draw its next frame. A static client shows
     // its first buffer without this, but an animating one waits on the callback.
-    #[cfg(any(feature = "winit", feature = "udev"))]
+    #[cfg(any(feature = "winit", feature = "drm-backend"))]
     pub(crate) fn send_frames(&self, time_ms: u32) {
         let output = self.state.output.clone();
         for window in self.state.space.elements() {
@@ -972,6 +984,23 @@ impl Compositor {
     #[cfg(feature = "udev")]
     pub fn run_drm(&mut self, on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>) -> Result<()> {
         crate::drm::run(self, on_shell)
+    }
+
+    /// Drive a real display through KMS with no GPU: composite the scene with the
+    /// software (pixman) renderer into a DRM dumb buffer and page-flip it. Runs on
+    /// any KMS device, including plain virtio-gpu (no virgl) and real hardware with
+    /// no usable GLES, where [`run_drm`](Compositor::run_drm) cannot, so it is the
+    /// QEMU boot target and the no-GPU fallback. Like `run_drm` it takes over a seat
+    /// and runs on a console until stopped, driving the Wayland server between
+    /// frames; only the scanout differs (a CPU dumb buffer instead of a GBM/GLES
+    /// scanout). `on_shell` is the same one-closure protocol as
+    /// [`show`](Compositor::show) and `run_drm`.
+    #[cfg(feature = "softdrm")]
+    pub fn run_softdrm(
+        &mut self,
+        on_shell: impl FnMut(ShellEvent) -> Option<Vec<u8>>,
+    ) -> Result<()> {
+        crate::softdrm::run(self, on_shell)
     }
 }
 

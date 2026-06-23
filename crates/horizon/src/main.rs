@@ -222,6 +222,20 @@ enum CompositorOp {
         #[arg(long, default_value_t = 7)]
         days: u64,
     },
+    /// Drive a real display through KMS with no GPU: composite in software (pixman)
+    /// into a DRM dumb buffer and page-flip it. Runs where the GPU path cannot,
+    /// including plain virtio-gpu (no virgl) and hardware with no usable GLES, so it
+    /// is the QEMU boot target and the no-GPU fallback. Run it from a console.
+    #[cfg(feature = "compositor-softdrm")]
+    Softdrm {
+        /// Draw the Glass surface of this store as the shell background (the L5
+        /// home screen); clicking a `sever` button revokes that capability live
+        #[arg(long)]
+        background: Option<PathBuf>,
+        /// Window to summarize for the background Glass surface, in days
+        #[arg(long, default_value_t = 7)]
+        days: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -921,6 +935,10 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
         }
         #[cfg(feature = "compositor-udev")]
         CompositorOp::Drm { background, days } => compositor_drm(background.as_deref(), days, None),
+        #[cfg(feature = "compositor-softdrm")]
+        CompositorOp::Softdrm { background, days } => {
+            compositor_softdrm(background.as_deref(), days, None)
+        }
     }
 }
 
@@ -1127,10 +1145,7 @@ fn compositor_show(background: Option<&Path>, days: u64, master: Option<[u8; 32]
 // second reads as immediate while the per-frame cost stays a clock check; an
 // actual store read happens at most this often, and re-uploads the surface only
 // when the audit log actually changed.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 const SHELL_POLL: Duration = Duration::from_millis(500);
 
 // A launched palette client runs confined in a Cell, so it starts with no ambient
@@ -1154,34 +1169,22 @@ const SHELL_POLL: Duration = Duration::from_millis(500);
 // Inside the cell the socket is bound here and the client is pointed at it. A
 // fixed name decouples the in-cell path from the host's wayland-N, and a private
 // runtime dir keeps the client from seeing anything else under the host's.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 const CELL_RUNTIME_DIR: &str = "/run/horizon";
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 const CELL_WAYLAND_NAME: &str = "wayland-0";
 
 // Where the Wayland socket is bound inside the cell: the runtime dir joined with
 // the display name, so XDG_RUNTIME_DIR + WAYLAND_DISPLAY resolve to exactly it.
 // This equality is the invariant a confined client relies on to connect.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 fn cell_wayland_socket() -> PathBuf {
     Path::new(CELL_RUNTIME_DIR).join(CELL_WAYLAND_NAME)
 }
 
 // The host path of the compositor's listening socket: WAYLAND_DISPLAY under
 // XDG_RUNTIME_DIR, or the display itself when it is already an absolute path.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 fn host_wayland_socket(runtime: &Path, display: &str) -> PathBuf {
     let p = Path::new(display);
     if p.is_absolute() {
@@ -1194,10 +1197,7 @@ fn host_wayland_socket(runtime: &Path, display: &str) -> PathBuf {
 // The environment a confined client sees: a private writable runtime dir holding
 // only the brokered Wayland socket, the matching display name, a minimal PATH into
 // the bound system dirs, and a HOME. Nothing from the host's runtime dir leaks in.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 fn client_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     use std::ffi::OsString;
     vec![
@@ -1221,10 +1221,7 @@ fn client_env() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
 // libraries, the compositor's Wayland socket bound in writable at the one path the
 // client is pointed at, and nothing else. See the note above on why the empty net
 // namespace still reaches the display and what is deliberately withheld.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 fn client_cell(host_sock: &Path) -> cells::Cell {
     cells::Cell::new()
         .bind_host_system()
@@ -1242,10 +1239,7 @@ fn client_cell(host_sock: &Path) -> cells::Cell {
 // redraws when it changed. Shared by the winit (`show`) and bare-metal (`drm`)
 // backends. The model is cached so a typed line resolves against it without a store
 // read per keystroke; it is rebuilt whenever the broker state changes.
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 struct Shell {
     broker: Broker,
     window: glass::Window,
@@ -1267,10 +1261,7 @@ struct Shell {
     last_poll: std::time::Instant,
 }
 
-#[cfg(all(
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 impl Shell {
     // Open a store's Glass shell at a surface size, rendering the first frame.
     // `wayland_display` is the socket a launched client connects back to. Returns
@@ -1557,6 +1548,60 @@ fn compositor_drm(background: Option<&Path>, days: u64, master: Option<[u8; 32]>
         }
     })
     .context("run drm backend")
+}
+
+// The software DRM/KMS path: drive the screen through KMS with no GPU, compositing
+// in software (pixman) into a dumb buffer and page-flipping it. The shell and the
+// click/key/tick wiring are identical to `compositor_drm`; only the backend differs
+// (a CPU dumb buffer instead of a GBM/GLES scanout), which is what lets it run on
+// plain virtio-gpu (no virgl) and on hardware with no usable GLES, the no-GPU
+// fallback and the QEMU boot target.
+#[cfg(all(target_os = "linux", feature = "compositor-softdrm"))]
+fn compositor_softdrm(
+    background: Option<&Path>,
+    days: u64,
+    master: Option<[u8; 32]>,
+) -> Result<()> {
+    compositor_ensure_runtime_dir()?;
+
+    let mut comp = compositor::Compositor::new().context("start compositor")?;
+    let socket = comp.socket_name().to_string_lossy().into_owned();
+    println!("compositor: software DRM/KMS backend (pixman scanout, no GPU)");
+    println!("compositor: listening on WAYLAND_DISPLAY={socket}");
+    println!("compositor: connect a client, e.g.  WAYLAND_DISPLAY={socket} <wayland-app>");
+    println!("compositor: click a window to focus it; keyboard and pointer go to it");
+
+    // Optional clickable Glass shell, rendered at the output size, exactly as the
+    // GPU DRM and winit backends draw it.
+    let (ow, oh) = comp.output_size();
+    let mut shell = match background {
+        Some(store) => {
+            let (shell, rgba) =
+                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
+            comp.set_shell_background(&rgba, ow, oh);
+            println!(
+                "compositor: Glass shell background from {} (click `sever` to revoke a \
+                 capability; with no window focused, type a command: launch <app>, sever \
+                 <name>, or any text to filter; refreshes live as the audit log changes)",
+                store.display()
+            );
+            Some(shell)
+        }
+        None => None,
+    };
+
+    println!("compositor: switch VT or kill the process to stop");
+    io::stdout().flush().ok();
+
+    comp.run_softdrm(|event| {
+        let s = shell.as_mut()?;
+        match event {
+            compositor::ShellEvent::Click(x, y) => s.click(x, y),
+            compositor::ShellEvent::Key(k) => s.key(k),
+            compositor::ShellEvent::Tick => s.refresh(),
+        }
+    })
+    .context("run software drm backend")
 }
 
 // Constellation sync. Both stores belong to one identity, so they share the
@@ -2112,18 +2157,38 @@ fn launch_session(store: &Path, days: u64, nested: bool, master: [u8; 32]) -> Re
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "compositor-udev"))]
+// Prefer the software backend when it is built in: it drives any KMS device with
+// no GPU, so it is the safe boot default for a Key that lands on unknown hardware
+// (or a plain virtio-gpu, as in QEMU), where the GLES path may not start. A build
+// that wants the GPU path turns on compositor-udev alone; one that wants the
+// universal path turns on compositor-softdrm (probing for GLES and falling back at
+// runtime is a later refinement).
+#[cfg(all(target_os = "linux", feature = "compositor-softdrm"))]
+fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
+    println!("boot: launching the desktop (software DRM/KMS, no GPU)");
+    compositor_softdrm(Some(store), days, Some(master))
+}
+
+#[cfg(all(
+    target_os = "linux",
+    feature = "compositor-udev",
+    not(feature = "compositor-softdrm")
+))]
 fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
     println!("boot: launching the desktop (bare-metal DRM/KMS)");
     compositor_drm(Some(store), days, Some(master))
 }
 
-#[cfg(not(all(target_os = "linux", feature = "compositor-udev")))]
+#[cfg(not(all(
+    target_os = "linux",
+    any(feature = "compositor-softdrm", feature = "compositor-udev")
+)))]
 fn launch_drm(_store: &Path, _days: u64, _master: [u8; 32]) -> Result<()> {
     Err(anyhow!(
-        "this build has no bare-metal DRM backend; rebuild with --features \
-         compositor-udev to boot into the desktop, or pass --nested in a build with \
-         --features compositor-winit to nest in an existing session"
+        "this build has no DRM backend; rebuild with --features compositor-softdrm \
+         (software scanout, drives any KMS device with no GPU) or --features \
+         compositor-udev (GPU/GLES), or pass --nested in a build with --features \
+         compositor-winit to nest in an existing session"
     ))
 }
 
@@ -2544,11 +2609,7 @@ mod boot_tests {
     }
 }
 
-#[cfg(all(
-    test,
-    target_os = "linux",
-    any(feature = "compositor-winit", feature = "compositor-udev")
-))]
+#[cfg(all(test, target_os = "linux", feature = "compositor-shell"))]
 mod client_cell_tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;

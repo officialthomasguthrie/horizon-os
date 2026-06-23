@@ -62,7 +62,7 @@ pub use server::Compositor;
 // ShellEvent (the backend callback) is gated to the on-screen backends. ShellKey,
 // the keystrokes the shell owns when no client is focused, is plain input, so it
 // is available to the headless core and its tests too, not just those backends.
-#[cfg(all(target_os = "linux", any(feature = "winit", feature = "udev")))]
+#[cfg(all(target_os = "linux", any(feature = "winit", feature = "drm-backend")))]
 pub use server::ShellEvent;
 #[cfg(target_os = "linux")]
 pub use server::ShellKey;
@@ -89,6 +89,16 @@ mod winit;
 // in CI and eye-verified on bare metal.
 #[cfg(all(target_os = "linux", feature = "udev"))]
 mod drm;
+
+// The software (pixman) DRM/KMS scanout backend (the `softdrm` feature): composite
+// with the tested pixman renderer into a DRM dumb buffer and page-flip it, with no
+// GPU. It drives any KMS device, including plain virtio-gpu and real hardware with
+// no usable GLES, where the GBM/GLES `udev` backend cannot, so it is both the QEMU
+// boot target and the no-GPU fallback. Same split as the rest of the backends: the
+// compositing it presents is already headless-tested, only the KMS scanout is new
+// and eye-verified.
+#[cfg(all(target_os = "linux", feature = "softdrm"))]
+mod softdrm;
 
 /// Whether a compositor can run on this host. Linux only; elsewhere there is no
 /// Wayland server to host and [`Compositor`] does not exist.

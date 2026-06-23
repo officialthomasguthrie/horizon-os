@@ -64,20 +64,21 @@ impl ShellBackground {
         }
     }
 
-    // The raw bytes and size, for the DRM backend to rebuild a `MemoryRenderBuffer`
-    // (its element-list present loop cannot draw the texture directly the way
-    // `paint_space` does). The winit and pixman paths read the fields directly.
-    #[cfg(feature = "udev")]
+    // The raw bytes and size, for a DRM backend to rebuild its own element from
+    // them (the GLES one a `MemoryRenderBuffer`, the software one a pixman
+    // `TextureBuffer`), since the element-list present loop cannot draw the texture
+    // directly the way `paint_space` does. The winit path reads the fields directly.
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn rgba(&self) -> &[u8] {
         &self.rgba
     }
 
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn width(&self) -> i32 {
         self.width
     }
 
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn height(&self) -> i32 {
         self.height
     }

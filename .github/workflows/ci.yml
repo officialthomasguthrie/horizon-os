@@ -49,6 +49,13 @@ jobs:
       # It links the DRM system libraries installed above.
       - run: cargo build -p compositor --features udev
       - run: cargo clippy -p compositor --all-targets --features udev -- -D warnings
+      # The software DRM/KMS scanout backend (no GPU): it composites with pixman
+      # into a dumb buffer and page-flips it, so it runs on any KMS device and is
+      # eye-verified in QEMU on plain virtio-gpu, not here, but it must keep
+      # compiling. It links the same DRM system libraries as udev (installed above),
+      # not GLES.
+      - run: cargo build -p compositor --features softdrm
+      - run: cargo clippy -p compositor --all-targets --features softdrm -- -D warnings
       # The horizon Glass shell behind the backends is feature-gated, so the
       # default build above never compiles it. Lint and run it under one backend
       # feature (the shell is shared by both): this compile-checks the shell and
@@ -58,6 +65,10 @@ jobs:
       # despite the empty network namespace. Needs the userns knob set above.
       - run: cargo clippy -p horizon --all-targets --features compositor-winit -- -D warnings
       - run: cargo test -p horizon --features compositor-winit
+      # The software DRM backend's CLI wiring (the `compositor softdrm` command and
+      # the boot path that launches it) only compiles under compositor-softdrm, so
+      # lint it too; the shell it drives is the same one the winit step runs.
+      - run: cargo clippy -p horizon --all-targets --features compositor-softdrm -- -D warnings
       # The identity crate's real FIDO2 authenticator (the `fido2` feature) talks to
       # a USB security key, verified on real hardware, not here, but it must keep
       # compiling. It statically builds hidapi's hidraw backend, which links libudev

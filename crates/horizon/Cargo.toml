@@ -13,13 +13,24 @@ repository.workspace = true
 # screenshot` dumps a composited frame to an image with no display. Off by
 # default so the standard binary stays renderer-free.
 compositor-render = ["compositor/render"]
+# Internal marker: the interactive Glass shell and confined-client launch the CLI
+# wraps around every on-screen backend (the click/key/tick wiring, the cell a
+# launched client runs in). Each on-screen feature below enables it; not meant to
+# be turned on directly.
+compositor-shell = ["compositor-render"]
 # Build the on-screen (winit) backend in too: `horizon compositor show` opens a
 # nested window. Off by default so the standard binary does not pull EGL/GL.
-compositor-winit = ["compositor/winit", "compositor-render"]
+compositor-winit = ["compositor/winit", "compositor-shell"]
 # Build the bare-metal DRM/KMS backend in: `horizon compositor drm` drives a real
 # display directly off the GPU. Off by default so the standard binary does not
 # link libdrm/libgbm/libinput/libseat/libudev.
-compositor-udev = ["compositor/udev", "compositor-render"]
+compositor-udev = ["compositor/udev", "compositor-shell"]
+# Build the software DRM/KMS backend in: `horizon compositor softdrm` drives a real
+# display through KMS with no GPU (pixman scanout into a dumb buffer). This is the
+# path `horizon boot` launches on a machine with no usable GLES, and the QEMU boot
+# target. Off by default; like compositor-udev it links libdrm/libgbm/libinput/
+# libseat/libudev, but at runtime needs no GPU, GLES, EGL, or virgl.
+compositor-softdrm = ["compositor/softdrm", "compositor-shell"]
 # Build the real USB-HID FIDO2 authenticator into the identity commands, so
 # `horizon identity ... --fido2` unlocks with a security key. Off by default so the
 # standard binary stays free of the FIDO2/HID stack; the software-token path always

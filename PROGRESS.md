@@ -1461,6 +1461,59 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   with working GLES (virgl or a real GPU); plain QEMU TCG offers only a dumb-buffer KMS device with
   no 3D, so the on-screen session is the last eye-verify and waits for a GPU-backed virtio-gpu (or a
   software-DRM/pixman scanout backend). Eye-verified in qemu-system-aarch64.
+- Phase 0 step (5) the on-screen desktop via a software DRM/KMS scanout backend (`compositor`
+  `softdrm` feature, Linux): the last step-(5) piece, the Horizon desktop on a real screen, now
+  eye-verified in qemu-system-aarch64 on plain virtio-gpu. The GLES `udev` backend needs a GBM/GLES
+  device (virtio-gpu with virgl, or real hardware with a working EGL stack); plain QEMU TCG and a
+  fair amount of real hardware offer only a dumb-buffer KMS device with no usable 3D, where that
+  path cannot start. This backend drives exactly those: it composites the scene with the same pixman
+  software renderer the headless render test asserts on, straight into a DRM dumb buffer (ordinary
+  CPU memory the scanout engine reads), and page-flips it, so it runs on any KMS device and is both
+  the QEMU boot target and the no-GPU fallback a "boots anywhere" Key wants. It is on the same split
+  as the rest of the compositor, so almost none of it is new logic: the frame is the same
+  `space_render_elements` the headless test asserts on, handed to a Smithay `DrmCompositor`
+  (`DrmCompositor<DumbAllocator, DrmDeviceFd, (), DrmDeviceFd>`, the allocator making dumb buffers,
+  the device fd exporting each as a scanout framebuffer, no gbm device, a held `PixmanRenderer`), and
+  the input is the same libseat/libinput seat routing the GLES backend and the headless input test
+  use. So the plane assignment, damage tracking, and page-flip lifecycle are the same `DrmCompositor`
+  machinery the GLES backend already trusts; only the renderer (pixman, not GLES) and the buffer kind
+  (dumb, not GBM) differ. The one thing the GLES backend gets for free that this expresses itself is
+  the shell background: the GLES path draws it as a `MemoryRenderBufferRenderElement`, which needs a
+  `Send` texture the pixman one is not, so here it is a stable-id `TextureRenderElement` over a cached
+  pixman texture (no `Send` bound, and the stable id lets the damage tracker skip re-scanning out an
+  idle desktop). `FrameFlags::empty()` forces every element through the renderer into the one dumb
+  buffer rather than attempting plane promotion that a CPU buffer could never satisfy. First cut is
+  single device, single output, no hotplug, exactly where the GLES backend started before its
+  multi-GPU/hotplug/VT-switch hardening, which can follow here over the same shared routing and
+  compositing. `DrmCompositor` lives behind smithay's `backend_gbm`, so this links libgbm, but never
+  creates a gbm device and never calls into it, so at runtime there is still no GPU, GLES, EGL, or
+  virgl, only a KMS device with dumb buffers. A `drm-backend` marker feature (both DRM backends turn
+  it on) gates the compositor accessors the two share, and a `compositor-shell` marker in horizon
+  gates the interactive Glass shell shared by every on-screen backend. Two enabling fixes the boot
+  surfaced: `Compositor::new` now adds the seat keyboard only when libxkbcommon's data
+  (`XKB_CONFIG_ROOT`, `/usr/share/X11/xkb`) is actually present, because a base without it does not
+  make libxkbcommon fail cleanly but crash inside the C library, so a dataless base now degrades to
+  no keyboard (the non-fatal path the seat always intended) instead of taking down the compositor;
+  and `horizon-init` sets `LIBSEAT_BACKEND=builtin` for the booted environment (inherited across the
+  `switch_root`), since the minimal boot has no logind or seatd and libseat will not fall back to its
+  embedded seatd on its own, so the compositor gets a seat as root with no daemon. `horizon compositor
+  softdrm` runs it from a console, and `horizon boot` launches it when built `--features
+  compositor-softdrm` (the no-GPU-safe default for a Key that boots on unknown hardware, preferred over
+  the GLES path when both are built). On the usual split the compositing is already proven headlessly
+  (the pixman render tests) and only the KMS scanout is new and eye-verified, compile-checked and
+  clippy-clean under the `softdrm` feature in CI. Verified for real: a Key built with the softdrm
+  horizon binary and `virtio_gpu` added to the initramfs (init loads it and its DRM closure, which
+  persist across `switch_root`, so `/dev/dri/card0` exists post-pivot) boots in qemu-system-aarch64 on
+  `-device virtio-gpu-pci`; `horizon boot` launches the software desktop, which takes the seat (libseat
+  builtin), opens the dumb-buffer scanout on `/dev/dri/card0` at 1920x1080, and composites the Glass
+  L5 desktop onto the virtio-gpu, captured with QEMU `screendump`: the four-principal capability
+  dashboard (browser/editor/sync/camera with their live network, data, and device channels and per-
+  channel `sever` kill switches), the colored status header, the activity timeline, and the Aura
+  command palette, all rendered with no GPU in the path. Left next: a working keyboard on the base
+  (ship the xkb data so the Aura palette takes input) and the on-screen interactive eye-verify
+  (clicking `sever`, typing a command), then the multi-output/hotplug/VT-switch hardening the GLES
+  backend got. Built and tested on darwin and in the Linux container, eye-verified in
+  qemu-system-aarch64.
 
 ## Next
 
