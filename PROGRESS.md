@@ -1381,6 +1381,30 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   boot-path drivers as modules and a minimal initramfs has no udev), so it reaches and mounts the
   partitions, then the overlay/`switch_root` into `horizon boot` and the desktop. Built and tested on
   darwin and in the Linux container, eye-verified in qemu-system-aarch64.
+- Phase 0 step (5) init module loading (`init` crate, Linux): `horizon-init` now loads the boot-path
+  kernel modules the initramfs carries, in dependency order, so a Debian-class kernel reaches and
+  opens the Key's partitions. That kernel ships squashfs, overlay, ext4, the device-mapper targets
+  (dm-mod/dm-crypt/dm-verity), and the virtio block drivers as modules, not built in; a full distro
+  kernel cannot build every driver in, and a minimal initramfs has no udev or modprobe to autoload
+  them on demand, so PID 1 loads them itself. It reads the closure-consistent `modules.dep` keybuild
+  already writes into the initramfs, orders it so every module's dependencies load first
+  (`module_load_order`, a deterministic post-order walk of the dependency graph), and `finit_module`s
+  each `.ko`. The modules are uncompressed, so the load is a plain fd-passing syscall with no
+  decompression and no compressed-file flag; an already-loaded module (`EEXIST`) is fine, and any
+  other failure is logged but does not abort, so a driver that will not load surfaces at the mount
+  that needs it rather than wedging the boot. keybuild owns which modules ship (`--initramfs-module`
+  plus the closure) and init loads whatever is there, so policy and mechanism stay separate and init
+  carries no hardcoded driver list (the running kernel's modules directory is found by `uname`, with
+  the single versioned directory an initramfs holds as the fallback). On the usual headless split the
+  ordering is pure and unit-tested on every host (every dependency precedes its dependent, a shared
+  dependency is loaded once, the order is deterministic) while the `finit_module` execution is
+  Linux-only and eye-verified at the QEMU boot, the part the container kernel cannot prove. Verified
+  for real: the same aarch64 Key, rebuilt with the boot-path modules in its initramfs, booted in
+  qemu-system-aarch64 to `horizon-init`, which loaded 16 modules (the 8 named plus their closure)
+  from `/lib/modules`, after which the kernel brought up the virtio disk and enumerated its GPT
+  partitions (`vda: vda1 vda2 vda3 vda4`); the boot then stops at the by-label partition resolve, the
+  next piece, since a minimal initramfs has no udev to maintain `/dev/disk/by-label`. Built and tested
+  on darwin and in the Linux container, eye-verified in qemu-system-aarch64.
 
 ## Next
 
