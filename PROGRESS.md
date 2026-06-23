@@ -1574,6 +1574,14 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   when the only pointer is the absolute tablet, so the button must ride in the same `input-send-event`
   batch as the `abs` position. Built and compile-checked from the Linux container; eye-verified in
   qemu-system-aarch64.
+- Phase 0 step (5) keybuild `--mode` flag (`horizon-keybuild`): expose the default boot mode on the
+  CLI so a Ghost-only (or Home-only) Key boots with no `horizon.mode=` override. `KeySpec.mode`
+  already existed and `boot_cmdline` already emitted it; only the CLI never set it (always Auto).
+  `--mode <auto|home|ghost>` now sets it (an unknown value is a usage error), so the loader entry
+  carries `horizon.mode=ghost` directly instead of relying on an appended `--cmdline horizon.mode=ghost`
+  token. The mechanism is covered by the existing cmdline round-trip test (it already iterates every
+  mode through `init`'s parser); verified through the binary (`--mode ghost` emits `horizon.mode=ghost`,
+  the default still `auto`). Built and tested on darwin and in the Linux container.
 
 ## Next
 

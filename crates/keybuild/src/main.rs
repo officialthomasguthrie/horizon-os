@@ -25,6 +25,9 @@
 // /init from --init-bin (horizon-init), each --initramfs-bin (cryptsetup) under /usr/sbin, and
 // each --initramfs-module under /lib/modules/<kver>, all with their shared-library / modules.dep
 // closures; it is built before the ESP so a bootable ESP can write it in.
+// --mode <auto|home|ghost> sets the default boot mode baked into the loader's kernel command
+// line (default auto: Home if a data device is present, else Ghost), so a Ghost-only Key boots
+// without a horizon.mode= override.
 // The build logic is in the keybuild library, tested there; this is the thin CLI over it.
 
 use std::path::PathBuf;
@@ -53,6 +56,7 @@ struct Args {
     esp_efi: Vec<PathBuf>,
     loader_timeout: Option<u32>,
     cmdline_extra: Vec<String>,
+    mode: Option<keybuild::ModeChoice>,
 }
 
 fn main() -> ExitCode {
@@ -67,7 +71,8 @@ fn main() -> ExitCode {
              [--initramfs --init-bin <path> [--initramfs-bin <path>]... \
              [--initramfs-module <name>]...] \
              [--kernel <path> --bootloader <path> [--esp-efi <path>]... \
-             [--loader-timeout <secs>] [--cmdline <token>]...]"
+             [--loader-timeout <secs>] [--cmdline <token>]...] \
+             [--mode <auto|home|ghost>]"
         );
         return ExitCode::FAILURE;
     };
@@ -94,6 +99,9 @@ fn main() -> ExitCode {
         spec.loader_timeout = t;
     }
     spec.cmdline_extra = parsed.cmdline_extra;
+    if let Some(m) = parsed.mode {
+        spec.mode = m;
+    }
     let verity = parsed.verity;
     let disk = parsed.disk;
     let initramfs = parsed.initramfs;
@@ -268,6 +276,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
     let mut esp_efi = Vec::new();
     let mut loader_timeout = None;
     let mut cmdline_extra = Vec::new();
+    let mut mode = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -293,6 +302,14 @@ fn parse_args(args: &[String]) -> Option<Args> {
             "--esp-efi" => esp_efi.push(PathBuf::from(it.next()?)),
             "--loader-timeout" => loader_timeout = Some(it.next()?.parse().ok()?),
             "--cmdline" => cmdline_extra.push(it.next()?.clone()),
+            "--mode" => {
+                mode = Some(match it.next()?.as_str() {
+                    "auto" => keybuild::ModeChoice::Auto,
+                    "home" => keybuild::ModeChoice::Home,
+                    "ghost" => keybuild::ModeChoice::Ghost,
+                    _ => return None,
+                })
+            }
             _ => return None,
         }
     }
@@ -319,6 +336,7 @@ fn parse_args(args: &[String]) -> Option<Args> {
         esp_efi,
         loader_timeout,
         cmdline_extra,
+        mode,
     })
 }
 
