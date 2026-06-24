@@ -2537,7 +2537,10 @@ mod linux_tests {
                 panic!("the baked store must be discoverable on the data partition: {e}");
             }
         };
-        assert_eq!(discovered, data_mnt, "the seeded store sits at the partition root");
+        assert_eq!(
+            discovered, data_mnt,
+            "the seeded store sits at the partition root"
+        );
 
         // Recover the master from the baked store the way the init does with no token (the
         // passphrase path), and open the encrypted Home layer with it: a successful open is the
@@ -2569,11 +2572,16 @@ mod linux_tests {
             let ls = Lifestream::open(&discovered, &recovered).map_err(|e| e.to_string())?;
             let parents = ls.head().map_err(|e| e.to_string())?.into_iter().collect();
             let tree = ls.snapshot_dir(&seed).map_err(|e| e.to_string())?;
-            let g1 = ls.commit(tree, parents, "second").map_err(|e| e.to_string())?;
+            let g1 = ls
+                .commit(tree, parents, "second")
+                .map_err(|e| e.to_string())?;
             drop(ls);
             // Reopen to prove the write reached the partition, not just an in-memory store.
             let reopened = Lifestream::open(&discovered, &recovered).map_err(|e| e.to_string())?;
-            let head = reopened.head().map_err(|e| e.to_string())?.ok_or("no HEAD")?;
+            let head = reopened
+                .head()
+                .map_err(|e| e.to_string())?
+                .ok_or("no HEAD")?;
             Ok((g1, head))
         })();
         let (g1, head) = match writable {
