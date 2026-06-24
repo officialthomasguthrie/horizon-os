@@ -854,7 +854,7 @@ impl Compositor {
     /// reference rather than minting one.
     ///
     /// [`add_output`]: Compositor::add_output
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn map_output(&mut self, output: &Output, x: i32, y: i32) {
         // Keep the advertised location (what this output's `wl_output` global reports
         // to clients) and the Space mapping (the region it scans out) in step, so a
@@ -865,7 +865,7 @@ impl Compositor {
 
     /// Remove a real output from the shared space (its connector was unplugged). Its
     /// `wl_output` global is withdrawn separately by the backend, which owns the id.
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn unmap_output(&mut self, output: &Output) {
         self.state.space.unmap_output(output);
     }
@@ -874,7 +874,7 @@ impl Compositor {
     /// withdraw a `wl_output` global per connector as monitors come and go (through
     /// [`create_output_global`] / [`remove_output_global`], which name the private
     /// server `State` this handle is typed against).
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn display_handle(&self) -> DisplayHandle {
         self.state.dh.clone()
     }
@@ -883,7 +883,7 @@ impl Compositor {
     /// withdraws it once it lights its first real connector (so clients enumerate
     /// the actual monitors, not the phantom) and restores it if every monitor goes
     /// dark, so a client still sees one screen.
-    #[cfg(feature = "udev")]
+    #[cfg(feature = "drm-backend")]
     pub(crate) fn set_placeholder_global(&mut self, advertised: bool) {
         self.state.set_placeholder_global(advertised);
     }
@@ -1010,14 +1010,14 @@ impl Compositor {
 /// enumerates every real monitor at its layout position and mode. These live here,
 /// not on the backend, because creating a global names the private server `State`
 /// the display handle is typed against.
-#[cfg(feature = "udev")]
+#[cfg(feature = "drm-backend")]
 pub(crate) fn create_output_global(dh: &DisplayHandle, output: &Output) -> GlobalId {
     output.create_global::<State>(dh)
 }
 
 /// Withdraw a `wl_output` global created by [`create_output_global`] (its connector
 /// was unplugged or its GPU went away).
-#[cfg(feature = "udev")]
+#[cfg(feature = "drm-backend")]
 pub(crate) fn remove_output_global(dh: &DisplayHandle, id: GlobalId) {
     dh.remove_global::<State>(id);
 }
