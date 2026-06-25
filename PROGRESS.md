@@ -1695,6 +1695,42 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   not `canokey` or `u2f-emulated`, and U2F/CTAP1 emulation could not carry the keyslot's hmac-secret
   extension anyway. Left of step (5): the real FIDO2 touch on hardware, and the x86-64 cross-compiled
   product.
+- Phase 0 step (5) the x86-64 cross-compiled product (`keybuild` cross-ldd + the cross build): the
+  shippable Key is now an x86-64 one, the whole chain proven in qemu-system-x86_64, so Horizon is no
+  longer tied to the build container's native aarch64. The binaries cross-compile to
+  `x86_64-unknown-linux-gnu` (a `gcc-x86-64-linux-gnu` linker, amd64 `-dev` libs, and cross
+  pkg-config for the softdrm backend's libdrm/libgbm/libinput/libseat/libudev/libpixman; the `-sys`
+  crates ship pre-generated bindings so no bindgen/clang is needed), and the base is assembled from
+  the amd64 Debian kernel, modules, and runtime libraries. The one cross obstacle was the
+  shared-library closure: keybuild shells out to `ldd`, but the host `ldd` wrapper refuses a binary
+  whose `e_machine` is not the host's, so an x86-64 binary returns "not a dynamic executable" and an
+  empty closure. The fix is one new code path: `ldd_closure` reads `HORIZON_TARGET_LOADER` and, when
+  set, lists the closure with the target arch's own dynamic loader (`ld-linux-x86-64.so.2 --list`)
+  instead of `ldd`, run transparently under the container's qemu-user binfmt (registered with the F
+  fix-binary flag on the Docker VM kernel, so a foreign binary runs even though the interpreter is
+  not in the container's filesystem); the loader resolves the same multiarch paths, so the base is
+  built from x86-64 libraries. The selection is a pure `closure_invocation` helper (unit-tested: no
+  loader uses `ldd`, an empty value is unset, a loader gives `ld.so --list`), leaving only the exec
+  in `ldd_closure`; the native path is byte-for-byte unchanged when the env var is unset. keybuild
+  itself stays a native host tool (it only assembles files); the x86-64 binaries, the amd64
+  cryptsetup/veritysetup/udevadm, and their closures are staged into the Key via that cross-ldd.
+  Eye-verified in qemu-system-x86_64 (TCG, OVMF firmware, `-vga none` so the virtio-gpu is the only
+  display the PC machine exposes to `screendump`, not the default std VGA): a five-partition x86-64
+  Key boots OVMF -> systemd-boot off `BOOTX64.EFI` (the arch name keybuild derives from the
+  bootloader's PE machine type) -> the amd64 kernel -> `horizon-init`, which loads the boot-path
+  modules, opens dm-verity over the base, opens the dm-crypt Home layer with the master recovered
+  from the staged software token (`xts`/`ecb` templates loaded; `aes` is built into the amd64
+  kernel, unlike aarch64's `=m`), hands that master across `switch_root` via the memfd, and
+  `horizon boot` adopts it and launches the softdrm desktop with no passphrase. The Glass L5 desktop
+  scans out at 1920x1080 through the pixman software backend, captured with QMP `screendump` (the
+  four-principal capability dashboard), and input routes end to end: typing `camera` into the Aura
+  palette live-filters the list to one principal, and clicking the camera channel's `sever` button
+  takes on the writable Home store (`compositor: severed <id>`, the header `4 live / 0 severed` ->
+  `3 live / 1 severed`, the channel turning red). So the same source, recipe, init orchestration,
+  dm-verity/dm-crypt opens, token unlock, master handoff, and softdrm desktop that were proven on
+  aarch64 now produce and boot a real x86-64 Key. Left of step (5): the real FIDO2 touch on
+  hardware (the one part with no in-container equivalent). Code: the keybuild cross-ldd change; the
+  cross build is environment plus the gitignored `target/x86-build-and-verify.sh` harness.
 
 ## Next
 
@@ -1917,9 +1953,13 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   the boot bring-up: a FIDO2 key at the initramfs (touch-to-boot, not only a console passphrase),
   handing the master from init to horizon boot so the session does not unlock twice, `horizon-init`
   reaching `cryptsetup` by an absolute path or a set `PATH` (the kernel gives PID 1 none), and udev (or
-  UUID) resolution so by-label finds the partitions in a minimal initramfs. Environment notes for
-  that last stretch: this build container is aarch64 with no KVM, so a shippable x86-64
-  Key needs cross-compilation (the `x86_64-unknown-linux-gnu` target plus a kernel and
-  libs) and QEMU runs in TCG; an aarch64 image booted with
-  qemu-system-aarch64 proves the chain on the native ISA short of the x86-64 product.
-  Keep build artifacts off the 92%-full `/work` mount (use the container's own fs).
+  UUID) resolution so by-label finds the partitions in a minimal initramfs. Step (5) is now done on
+  BOTH ISAs: the aarch64 chain proved it on the container's native ISA, and the x86-64 product is now
+  cross-compiled and booted in qemu-system-x86_64 (see the x86-64 bullet above; the only cross code
+  change was keybuild's `HORIZON_TARGET_LOADER` cross-ldd, the rest is environment plus the gitignored
+  `target/x86-build-and-verify.sh` harness). The one remaining step-(5) item is the real FIDO2 touch
+  on hardware, which has no in-container equivalent. Environment notes: this build container is aarch64
+  with no KVM, so QEMU runs in TCG on both ISAs; the x86-64 cross-build links with `x86_64-linux-gnu-gcc`
+  and amd64 multiarch `-dev` libs, and the foreign-arch ldd closure resolves under the qemu-user binfmt
+  (registered F-flag on the Docker VM kernel). Keep build artifacts off the 92%-full `/work` mount (use
+  the container's own fs, e.g. `/tmp` or `/root`).

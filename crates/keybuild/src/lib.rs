@@ -972,28 +972,63 @@ fn strip_load_address(s: &str) -> &str {
 /// to `ldd`, whose output [`parse_ldd`] reads; a statically linked or non-ELF input has
 /// an empty closure rather than an error. There is no `ldd` on a non-Linux host, so the
 /// populate path that calls this runs in the build container.
+///
+/// Cross builds set `HORIZON_TARGET_LOADER` to the target arch's dynamic loader (e.g.
+/// `/lib64/ld-linux-x86-64.so.2`): its `--list` lists a foreign-arch binary's closure,
+/// run under binfmt qemu-user, in the same format `ldd` prints for a native one, because
+/// the host `ldd` wrapper refuses a binary whose `e_machine` is not the host's. The
+/// loader resolves the same multiarch library paths, so a base for another arch is built
+/// from that arch's libraries.
 pub fn ldd_closure(bin: &Path) -> Result<Vec<PathBuf>> {
-    let mut cmd = Command::new("ldd");
-    cmd.arg(bin);
+    let inv = closure_invocation(std::env::var_os("HORIZON_TARGET_LOADER"), bin);
+    let tool = inv.tool;
+    let mut cmd = Command::new(&inv.program);
+    cmd.args(&inv.args);
     let out = match cmd.output() {
         Ok(o) => o,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Missing("ldd")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Error::Missing(tool)),
         Err(e) => return Err(Error::Io(e)),
     };
     if !out.status.success() {
-        // ldd exits nonzero for a static or non-dynamic ELF; that is an empty closure.
+        // ldd (or the loader) exits nonzero for a static or non-dynamic ELF; that is an
+        // empty closure, not a failure.
         let text = String::from_utf8_lossy(&out.stdout);
         let err = String::from_utf8_lossy(&out.stderr);
         if text.contains("not a dynamic executable") || err.contains("not a dynamic executable") {
             return Ok(Vec::new());
         }
         return Err(Error::Tool {
-            name: "ldd",
+            name: tool,
             code: out.status.code(),
             stderr: err.trim().to_string(),
         });
     }
     Ok(parse_ldd(&String::from_utf8_lossy(&out.stdout)))
+}
+
+// The command [`ldd_closure`] runs to list a binary's shared objects. A native build uses
+// `ldd`; a cross build names the target arch's loader in `HORIZON_TARGET_LOADER` and the
+// loader's own `--list` does the listing (run under binfmt qemu-user). Split out so the
+// selection is a pure unit test, leaving only the exec in `ldd_closure`.
+struct Invocation {
+    tool: &'static str,
+    program: std::ffi::OsString,
+    args: Vec<std::ffi::OsString>,
+}
+
+fn closure_invocation(loader: Option<std::ffi::OsString>, bin: &Path) -> Invocation {
+    match loader {
+        Some(loader) if !loader.is_empty() => Invocation {
+            tool: "ld.so --list",
+            program: loader,
+            args: vec!["--list".into(), bin.as_os_str().to_owned()],
+        },
+        _ => Invocation {
+            tool: "ldd",
+            program: "ldd".into(),
+            args: vec![bin.as_os_str().to_owned()],
+        },
+    }
 }
 
 /// Parse a `modules.dep` file into a map from each module's path (relative to the
@@ -1499,6 +1534,29 @@ mod tests {
     fn parse_ldd_of_a_static_binary_is_empty() {
         assert!(parse_ldd("\tstatically linked\n").is_empty());
         assert!(parse_ldd("").is_empty());
+    }
+
+    #[test]
+    fn closure_invocation_picks_ldd_or_the_target_loader() {
+        let bin = Path::new("/usr/bin/horizon");
+        // No loader set: the native path runs `ldd <bin>`.
+        let native = closure_invocation(None, bin);
+        assert_eq!(native.tool, "ldd");
+        assert_eq!(native.program, std::ffi::OsString::from("ldd"));
+        assert_eq!(native.args, vec![std::ffi::OsString::from(bin)]);
+        // An empty value is treated as unset, not a loader named "".
+        assert_eq!(closure_invocation(Some("".into()), bin).program, "ldd");
+        // A cross loader: `<loader> --list <bin>` lists the foreign-arch closure.
+        let cross = closure_invocation(Some("/lib64/ld-linux-x86-64.so.2".into()), bin);
+        assert_eq!(cross.tool, "ld.so --list");
+        assert_eq!(cross.program, "/lib64/ld-linux-x86-64.so.2");
+        assert_eq!(
+            cross.args,
+            vec![
+                std::ffi::OsString::from("--list"),
+                std::ffi::OsString::from(bin),
+            ]
+        );
     }
 
     #[test]
