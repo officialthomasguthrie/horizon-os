@@ -164,6 +164,14 @@ fn run() -> init::Result<()> {
                         .expect("home_wanted implies a Home device");
                     let mapper = luks_open(&dev.dev, HOME_MAPPER, &master)?;
                     mode = Mode::Home(Source::new(mapper, &params.homefs, MountFlags::default()));
+
+                    // Hand the master we just recovered across the switch_root so the
+                    // session does not unlock a second time: stash it in a memfd left
+                    // open across the execv and name that fd in the environment. A
+                    // failure here is not fatal; horizon boot falls back to prompting.
+                    if let Err(e) = stash_master(&master) {
+                        eprintln!("horizon-init: could not hand the master to the session ({e}); it will prompt again");
+                    }
                 }
             }
             Err(e) => eprintln!("horizon-init: no identity store on the data partition ({e})"),
@@ -194,9 +202,9 @@ fn run() -> init::Result<()> {
 // Recover the 32-byte identity master from the store, the same key that opens the
 // encrypted Home layer. No authenticator is wired into the initramfs yet, so the master
 // is recovered from the console passphrase; a FIDO2 key at the initramfs (identity's
-// HardwareKey behind the fido2 feature, the touch-to-boot path) is a later refinement, as
-// is handing the recovered master to horizon boot so the session does not unlock a second
-// time after the pivot.
+// HardwareKey behind the fido2 feature, the touch-to-boot path) is a later refinement. The
+// recovered master is handed to horizon boot (stash_master) so the session does not unlock
+// a second time after the pivot.
 #[cfg(target_os = "linux")]
 fn recover_master(store: &std::path::Path) -> init::Result<[u8; 32]> {
     let (master, method) =

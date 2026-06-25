@@ -2119,11 +2119,23 @@ fn boot_cmd(
         None
     };
 
-    eprintln!("boot: unlocking {}", store.display());
-    let booted = boot::boot(&store, auth.as_deref_mut(), || {
-        passphrase().map_err(|e| boot::Error::Passphrase(e.to_string()))
-    })
-    .map_err(|e| anyhow!("{e}"))?;
+    // If the initramfs handed us the master it already recovered to open the Home layer,
+    // adopt it instead of unlocking a second time (the single-passphrase Home boot).
+    // Otherwise unlock normally: a security key, a token, or the passphrase.
+    let booted = match boot::take_handed_master() {
+        Some(master) => {
+            let master = master.map_err(|e| anyhow!("{e}"))?;
+            eprintln!("boot: adopting the master handed from the initramfs");
+            boot::adopt(&store, master).map_err(|e| anyhow!("{e}"))?
+        }
+        None => {
+            eprintln!("boot: unlocking {}", store.display());
+            boot::boot(&store, auth.as_deref_mut(), || {
+                passphrase().map_err(|e| boot::Error::Passphrase(e.to_string()))
+            })
+            .map_err(|e| anyhow!("{e}"))?
+        }
+    };
 
     println!(
         "boot: unlocked {} with the {}",

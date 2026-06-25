@@ -42,7 +42,7 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
     execute, is_unprivileged_error, load_modules, luks_close, luks_open, modules_dir, mount_proc,
-    resolve, verity_close, verity_open,
+    resolve, stash_master, verity_close, verity_open,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -1231,5 +1231,28 @@ mod linux_tests {
         let _ = umount2(&l.root, MntFlags::MNT_DETACH);
         let _ = umount2(&l.over, MntFlags::MNT_DETACH);
         let _ = umount2(&scratch, MntFlags::MNT_DETACH);
+    }
+
+    // The master handoff over the real carrier: stash_master writes the key into a memfd
+    // and names its fd in the environment, exactly as the init does before the switch_root,
+    // and boot::take_handed_master reads it back. The boot crate's own unit test stands the
+    // memfd in with a temp file; this exercises the actual memfd_create path the boot uses.
+    // Run serially with the other env-touching cases is fine: the variable name is unique.
+    #[test]
+    fn stash_master_hands_the_key_to_boot_over_a_memfd() {
+        let master = [0x5au8; MASTER_KEY_SIZE];
+        std::env::remove_var(boot::MASTER_FD_ENV);
+        stash_master(&master).expect("stash into a memfd");
+
+        // The variable now names the open fd; boot reads the same 32 bytes back.
+        assert!(std::env::var(boot::MASTER_FD_ENV).is_ok());
+        let got = boot::take_handed_master()
+            .expect("a master was handed over")
+            .expect("the memfd read back cleanly");
+        assert_eq!(got, master);
+
+        // Taking it clears the variable and closes the fd, so a second take finds nothing.
+        assert!(std::env::var(boot::MASTER_FD_ENV).is_err());
+        assert!(boot::take_handed_master().is_none());
     }
 }

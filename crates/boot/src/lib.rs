@@ -58,6 +58,11 @@ pub enum Method {
     Keyslot,
     /// The store passphrase: the fallback, when no key is present or enrolled.
     Passphrase,
+    /// The master the initramfs already recovered and handed across the switch_root
+    /// (see [`take_handed_master`]): the booted session reusing it instead of asking
+    /// a second time. The real unlock (a key or the passphrase) happened once, in the
+    /// init, before the pivot.
+    Handed,
 }
 
 impl Method {
@@ -66,6 +71,7 @@ impl Method {
         match self {
             Method::Keyslot => "security key / token",
             Method::Passphrase => "passphrase",
+            Method::Handed => "key handed from the initramfs",
         }
     }
 }
@@ -213,6 +219,69 @@ pub fn boot(
         store: store.to_path_buf(),
         master,
         method,
+        head,
+        objects,
+    })
+}
+
+/// The environment variable carrying the file descriptor of an anonymous in-memory
+/// file holding the master, handed from `horizon-init` across the switch_root.
+///
+/// A Home boot unlocks the master once in the initramfs (to open the encrypted Home
+/// layer), then execs `horizon boot`. Without a handoff the session unlocks a second
+/// time, so the device asks for the passphrase twice. The init stashes the master it
+/// already recovered in a memfd left open across the execv and names that fd here; the
+/// booted session reads it once and clears the variable. Only an integer fd, never the
+/// key, is in the environment, and the key never touches disk (the memfd is RAM only).
+pub const MASTER_FD_ENV: &str = "HORIZON_MASTER_FD";
+
+/// Take the master the initramfs stashed for us, if it left one: read it from the fd
+/// named in [`MASTER_FD_ENV`], close that fd, and clear the variable so the key reaches
+/// this process and no child it later spawns. Returns `None` when no fd was handed over
+/// (a Ghost boot, or any standalone invocation), so the caller falls back to the normal
+/// unlock. The variable is cleared even on a malformed value, so a stale or corrupt
+/// handoff never lingers in the environment.
+#[cfg(unix)]
+pub fn take_handed_master() -> Option<Result<[u8; 32]>> {
+    use std::io::Read;
+    use std::os::unix::io::{FromRawFd, RawFd};
+
+    let raw = std::env::var(MASTER_FD_ENV).ok()?;
+    std::env::remove_var(MASTER_FD_ENV);
+    let fd: RawFd = match raw.parse() {
+        Ok(fd) => fd,
+        Err(e) => return Some(Err(Error::Passphrase(format!("bad {MASTER_FD_ENV}: {e}")))),
+    };
+    // Owning the fd here means it is closed when this File drops, so the handoff fd does
+    // not leak past the one read into any session client the desktop later spawns.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut master = [0u8; 32];
+    Some(match f.read_exact(&mut master) {
+        Ok(()) => Ok(master),
+        Err(e) => Err(Error::Io(e)),
+    })
+}
+
+/// No fd is handed across a non-Unix exec, so there is never a stashed master to take.
+#[cfg(not(unix))]
+pub fn take_handed_master() -> Option<Result<[u8; 32]>> {
+    None
+}
+
+/// Adopt a master another stage already recovered (the initramfs handoff): confirm the
+/// store and [`prove`] the master opens it, exactly as [`boot`] does, then return the
+/// [`Booted`] tagged [`Method::Handed`]. The unlock work happened once, before the
+/// switch_root; this is the booted session reusing it. Proving still runs, so a torn or
+/// corrupt handoff fails here rather than launching onto a store it cannot read.
+pub fn adopt(store: &Path, master: [u8; 32]) -> Result<Booted> {
+    if !is_store(store) {
+        return Err(Error::NotAStore(store.display().to_string()));
+    }
+    let (head, objects) = prove(store, &master)?;
+    Ok(Booted {
+        store: store.to_path_buf(),
+        master,
+        method: Method::Handed,
         head,
         objects,
     })
@@ -387,5 +456,61 @@ mod tests {
         make_store(&store);
         // A master that is not the store's must fail the HEAD decrypt.
         assert!(matches!(prove(&store, &[0u8; 32]), Err(Error::KeyMismatch)));
+    }
+
+    #[test]
+    fn adopt_proves_a_handed_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let master = make_store(&store);
+
+        // The right master is adopted with no unlock and tagged as handed.
+        let booted = adopt(&store, master).unwrap();
+        assert_eq!(booted.master, master);
+        assert_eq!(booted.method, Method::Handed);
+        assert!(booted.head.is_some());
+
+        // A wrong handed master still fails the proof rather than launching blind.
+        assert!(matches!(adopt(&store, [0u8; 32]), Err(Error::KeyMismatch)));
+        // A non-store path is refused before any read.
+        let nope = dir.path().join("nope");
+        std::fs::create_dir_all(&nope).unwrap();
+        assert!(matches!(adopt(&nope, master), Err(Error::NotAStore(_))));
+    }
+
+    // The handoff fd roundtrip: write a master into a file, name its open fd in the
+    // env, and confirm take_handed_master reads it back, clears the variable, and
+    // returns None when nothing was handed over. A seek-to-start temp file stands in
+    // for the init's memfd; both are just a Unix fd holding 32 bytes at offset 0.
+    #[cfg(unix)]
+    #[test]
+    fn take_handed_master_reads_and_clears_the_env() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::io::IntoRawFd;
+
+        // Nothing handed: None, and the variable stays unset.
+        std::env::remove_var(MASTER_FD_ENV);
+        assert!(take_handed_master().is_none());
+
+        let master = [7u8; 32];
+        let mut f = tempfile::tempfile().unwrap();
+        f.write_all(&master).unwrap();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let fd = f.into_raw_fd(); // keep the fd open across the take (no drop)
+        std::env::set_var(MASTER_FD_ENV, fd.to_string());
+
+        let got = take_handed_master().unwrap().unwrap();
+        assert_eq!(got, master);
+        // The variable is cleared, so a second take finds nothing and no child inherits it.
+        assert!(std::env::var(MASTER_FD_ENV).is_err());
+        assert!(take_handed_master().is_none());
+
+        // A malformed value is consumed (cleared) and reported, not left to linger.
+        std::env::set_var(MASTER_FD_ENV, "not-a-fd");
+        assert!(matches!(
+            take_handed_master(),
+            Some(Err(Error::Passphrase(_)))
+        ));
+        assert!(std::env::var(MASTER_FD_ENV).is_err());
     }
 }

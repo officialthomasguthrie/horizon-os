@@ -1641,6 +1641,30 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   readiness line `software scanout up, 1 output(s) on 1 device(s)` prints, and a clicked `sever`
   takes on the writable store), proving the new per-output render path and relayout did not
   regress the working desktop.
+- Phase 0 step (5) single-passphrase Home boot, the master handoff from init to the session
+  (`boot` + `init` + `horizon`): a Home boot used to unlock twice (horizon-init reads the
+  passphrase to open the encrypted Home layer, then post-pivot `horizon boot` reads it again to
+  open the store), so the device asked for the passphrase a second time. The switch_root is an
+  in-process `execv`, which keeps non-close-on-exec fds and the environment, so the recovered
+  master can be handed across it. `init::stash_master` writes the 32-byte master into an anonymous
+  in-memory file (`memfd_create`, no `MFD_CLOEXEC` so it survives the execv) and names that fd in
+  `boot::MASTER_FD_ENV` (`HORIZON_MASTER_FD`); `boot::take_handed_master` reads it once on the far
+  side, closes the fd, and clears the variable so the key reaches that one process and no client
+  the desktop later spawns. `boot::adopt` then proves the handed master against the store (a torn
+  or corrupt handoff fails the HEAD decrypt rather than launching blind) and tags the boot
+  `Method::Handed`; `horizon boot` prefers a handed master over prompting, falling back to the
+  normal keyslot/passphrase unlock when none was handed (a Ghost boot, a standalone invocation).
+  The key never touches disk (memfd is RAM only) and only an integer fd, never the key, is in the
+  environment. On the usual split, the testable core is proven headlessly: a boot unit test of the
+  fd roundtrip (read back, env cleared, malformed value consumed and reported) and of `adopt`
+  (right master proves, wrong master is `KeyMismatch`, non-store refused), plus an init Linux test
+  that exercises the real `memfd_create` carrier end to end (stash then `take_handed_master`).
+  Eye-verified in QEMU: with a single passphrase fed after the menu (the pipe closes to EOF, so any
+  fallback re-prompt would derive a wrong master and fail to scan out), the boot log shows
+  `boot: adopting the master handed from the initramfs`, the desktop scans out, and a clicked
+  `sever` takes on the writable store. Left of step (5): a FIDO2 touch at the initramfs (the
+  identity `HardwareKey` is built but not wired into the init), and the x86-64 cross-compiled
+  product (this container is aarch64/TCG).
 
 ## Next
 

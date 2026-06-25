@@ -493,6 +493,41 @@ fn tool_error(stderr: &[u8]) -> std::io::Error {
     std::io::Error::other(String::from_utf8_lossy(stderr).trim().to_string())
 }
 
+/// Stash the recovered master in an anonymous in-memory file and advertise its fd in the
+/// environment ([`boot::MASTER_FD_ENV`]), so the `horizon boot` this init execs reuses it
+/// instead of prompting for the passphrase a second time.
+///
+/// A Home boot recovers the master here to open the encrypted Home layer; without this the
+/// post-pivot session would unlock again and the device would ask twice. The memfd is
+/// created without `MFD_CLOEXEC` and deliberately leaked open, so it survives the execv in
+/// [`switch_root`] (which keeps non-close-on-exec fds and the environment); the reader
+/// ([`boot::take_handed_master`]) reads it once, closes it, and clears the variable, so the
+/// key reaches that one process and no further. The key never touches disk (memfd is RAM
+/// only) and only the integer fd, never the key, is in the environment.
+pub fn stash_master(master: &[u8; MASTER_KEY_SIZE]) -> Result<(), Error> {
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
+    let at = Path::new(boot::MASTER_FD_ENV);
+    // flags 0: no MFD_CLOEXEC, so the fd survives the switch_root execv into horizon boot.
+    let fd = unsafe { libc::memfd_create(c"horizon-master".as_ptr(), 0) };
+    if fd < 0 {
+        return Err(Error::step(
+            "memfd_create",
+            at,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(master)
+        .map_err(|e| Error::step("stash master", at, e))?;
+    // The reader reads from offset 0; a fresh memfd is already there, but rewind to be
+    // explicit. Then leak the File so the fd stays open across the execv (drop would close
+    // it); the reader owns and closes it on the far side.
+    f.rewind().map_err(|e| Error::step("stash master", at, e))?;
+    let fd = f.into_raw_fd();
+    std::env::set_var(boot::MASTER_FD_ENV, fd.to_string());
+    Ok(())
+}
+
 /// Whether an error is the host refusing a privileged operation (mount and friends),
 /// so a test can skip gracefully on an unprivileged runner rather than fail. The
 /// privileged container runs these steps for real; a CI runner without privilege
