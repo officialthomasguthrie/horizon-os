@@ -166,12 +166,18 @@ impl Catalog {
     }
 
     pub fn standard() -> Catalog {
+        Catalog::with_embedder(Arc::new(HashingEmbedder::default()))
+    }
+
+    // The standard catalog with the `find` tool ranking under a chosen embedder,
+    // so a caller can hand `find` a real model (the `llama` feature's
+    // `GgufEmbedder`) the same way `aura index`/`search` take one, instead of the
+    // hashing stand-in `standard()` wires.
+    pub fn with_embedder(embedder: Arc<dyn Embedder>) -> Catalog {
         let mut c = Catalog::empty();
         c.add(Box::new(ListDir));
         c.add(Box::new(ReadFile));
-        c.add(Box::new(Find {
-            embedder: Arc::new(HashingEmbedder::default()),
-        }));
+        c.add(Box::new(Find { embedder }));
         c.add(Box::new(MoveFile));
         c.add(Box::new(DeleteFile));
         c

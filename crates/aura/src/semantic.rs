@@ -51,6 +51,18 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Vec<f32>;
 }
 
+// So a caller can choose the embedder at runtime (the hashing stand-in or a real
+// model behind the `llama` feature) and still drive one `SemanticIndex<Box<dyn
+// Embedder>>`, rather than monomorphizing the whole CLI twice.
+impl Embedder for Box<dyn Embedder> {
+    fn dim(&self) -> usize {
+        (**self).dim()
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        (**self).embed(text)
+    }
+}
+
 // The deterministic stand-in embedder: feature hashing over word tokens and
 // their character trigrams into a fixed-width vector. Words give exact-term
 // overlap; trigrams give a little morphological robustness (cow / cows share

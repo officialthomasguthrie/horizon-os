@@ -8,10 +8,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+# Fill the Embedder (and later the Planner) seam with a real model over
+# llama.cpp: a GGUF embedding model in place of the deterministic HashingEmbedder.
+# Off by default so the standard build stays model-free and cross-platform (the
+# default cargo build pulls no C++ engine); the gated build links llama.cpp, which
+# the sys crate compiles from source via cmake. One engine serves both seams.
+llama = ["dep:llama-cpp-2"]
+
 [dependencies]
 weave = { path = "../weave" }
 lifestream = { path = "../lifestream" }
 thiserror.workspace = true
+# The llama.cpp engine behind the `llama` feature. Pinned exactly: the crate
+# tracks llama.cpp closely and makes breaking changes within patch releases, so an
+# exact pin keeps the build reproducible (Cargo.lock holds the rest).
+llama-cpp-2 = { version = "=0.1.150", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

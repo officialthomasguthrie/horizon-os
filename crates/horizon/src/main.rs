@@ -389,6 +389,11 @@ enum AuraOp {
         store: PathBuf,
         /// The directory whose files to index
         dir: PathBuf,
+        /// Embed with a real GGUF model at this path instead of the deterministic
+        /// stand-in (needs a build with `--features aura-llama`; also read from
+        /// HORIZON_EMBED_MODEL). Search must use the same model the index was built with.
+        #[arg(long)]
+        model: Option<PathBuf>,
     },
     /// Search the persisted semantic index by meaning, printing ranked hits with
     /// their relevance score and a snippet
@@ -400,6 +405,10 @@ enum AuraOp {
         /// How many hits to show
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Embed the query with the same real GGUF model the index was built with
+        /// (needs `--features aura-llama`; also read from HORIZON_EMBED_MODEL)
+        #[arg(long)]
+        model: Option<PathBuf>,
     },
     /// Run a scripted end-to-end story: an intent becomes a plan, the missing
     /// capabilities are surfaced (never silently acquired), you approve, it runs
@@ -745,12 +754,13 @@ fn aura_cmd(op: AuraOp) -> Result<()> {
             Ok(())
         }
         AuraOp::Plan { intent } => aura_plan(&intent.join(" ")),
-        AuraOp::Index { store, dir } => aura_index(&store, &dir),
+        AuraOp::Index { store, dir, model } => aura_index(&store, &dir, model),
         AuraOp::Search {
             store,
             query,
             limit,
-        } => aura_search(&store, &query.join(" "), limit),
+            model,
+        } => aura_search(&store, &query.join(" "), limit, model),
         AuraOp::Demo => aura_demo(),
     }
 }
@@ -759,9 +769,9 @@ fn aura_cmd(op: AuraOp) -> Result<()> {
 // regular file under the directory is embedded under its path; the index is a
 // single Lifestream object referenced by name, so it is encrypted at rest and
 // reachable for gc exactly like the Weave audit log.
-fn aura_index(store: &Path, dir: &Path) -> Result<()> {
+fn aura_index(store: &Path, dir: &Path, model: Option<PathBuf>) -> Result<()> {
     let ls = open(store)?;
-    let mut index = aura::SemanticIndex::new(aura::HashingEmbedder::default());
+    let mut index = aura::SemanticIndex::new(aura_embedder(model)?);
     let mut count = 0usize;
     index_dir(dir, &mut |path, text| {
         index.add(path.to_string_lossy(), &text);
@@ -780,9 +790,9 @@ fn aura_index(store: &Path, dir: &Path) -> Result<()> {
 }
 
 // Query the persisted index and print the ranked hits.
-fn aura_search(store: &Path, query: &str, limit: usize) -> Result<()> {
+fn aura_search(store: &Path, query: &str, limit: usize, model: Option<PathBuf>) -> Result<()> {
     let ls = open(store)?;
-    let index = aura::SemanticIndex::load(aura::HashingEmbedder::default(), &ls, aura::INDEX_REF)
+    let index = aura::SemanticIndex::load(aura_embedder(model)?, &ls, aura::INDEX_REF)
         .map_err(|e| anyhow!("{e}"))?;
     if index.is_empty() {
         println!(
@@ -807,6 +817,36 @@ fn aura_search(store: &Path, query: &str, limit: usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Choose the embedder a semantic command runs under: a real GGUF model when one
+// is named (on the command line or in HORIZON_EMBED_MODEL) and this build carries
+// the backend, otherwise the deterministic hashing stand-in. Boxed so index and
+// search drive one `SemanticIndex<Box<dyn Embedder>>` either way; the same choice
+// must be made for index and search, since the two vectors only compare if they
+// came from the same embedder.
+fn aura_embedder(model: Option<PathBuf>) -> Result<Box<dyn aura::Embedder>> {
+    let model = model.or_else(|| std::env::var_os("HORIZON_EMBED_MODEL").map(PathBuf::from));
+    match model {
+        Some(path) => load_model_embedder(path),
+        None => Ok(Box::new(aura::HashingEmbedder::default())),
+    }
+}
+
+#[cfg(feature = "aura-llama")]
+fn load_model_embedder(path: PathBuf) -> Result<Box<dyn aura::Embedder>> {
+    let embedder = aura::GgufEmbedder::load(&path).map_err(|e| anyhow!("loading model: {e}"))?;
+    eprintln!("aura: embeddings via {}", path.display());
+    Ok(Box::new(embedder))
+}
+
+#[cfg(not(feature = "aura-llama"))]
+fn load_model_embedder(path: PathBuf) -> Result<Box<dyn aura::Embedder>> {
+    Err(anyhow!(
+        "a model was given ({}) but this build has no model backend; \
+         rebuild horizon with `--features aura-llama`",
+        path.display()
+    ))
 }
 
 // Walk a directory to a bounded depth, handing each regular file's path and a

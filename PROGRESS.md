@@ -1811,6 +1811,50 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `aura demo` gained a semantic-search beat ranking the demo files by a natural-language query.
   Next on the AI layer: drop a real embedding model into the `Embedder` seam (the GGUF shim, shared
   with the llama.cpp planner backend), and Aura as the Glass desktop's command palette.
+- Phase 4 Aura real embedding model (`aura` crate `llama` feature + `horizon`): the `Embedder` seam the
+  semantic search was built around now carries a real model, EmbeddingGemma over llama.cpp, so `search`
+  and the `find` tool rank by true meaning instead of the deterministic `HashingEmbedder`'s lexical
+  overlap. This is the first half of the "one engine, both seams" plan: llama.cpp is the shared backend,
+  this fills the `Embedder` seam, and the tool-calling planner that fills the `Planner` seam rides the
+  same engine next. It is the weights-gated shim the whole `semantic` module was written around, the
+  analog of identity's `HardwareKey` over its `SoftwareAuthenticator` or the compositor's display
+  backends, and unlike those two it is eye-verifiable right here: the model runs on this Mac's Metal
+  (Apple M4), where the still-open FIDO2 touch and NAT traversal need physical gear this environment
+  lacks. The crate piece is `GgufEmbedder` behind the off-by-default `llama` feature (so the standard
+  build pulls no C++ engine and stays cross-platform; the `llama-cpp-sys` crate builds llama.cpp from
+  source via cmake): it loads a GGUF, holds the read-only weights, and embeds a string by tokenizing
+  (with BOS), decoding one sequence, and reading back the model's pooled (mean) sequence embedding,
+  L2-normalized so a dot product is cosine exactly as the `VectorIndex` and the hashing stand-in already
+  assume. The `LlamaBackend` is a process-global (`OnceLock`) because llama.cpp refuses a second init,
+  and a fresh context is built per call so the embedder carries no mutable inference state and stays
+  `Send + Sync` as the trait requires (reusing a context or batching a whole directory in one decode is a
+  throughput refinement, not a correctness one, at this scale); llama.cpp's own console logging is routed
+  into tracing and disabled so `aura search` prints only its hits. An `impl Embedder for Box<dyn
+  Embedder>` and `Catalog::with_embedder` let one `SemanticIndex<Box<dyn Embedder>>` and the `find` tool
+  choose the embedder at runtime. The determinism the hashing stand-in needed (a persisted index is only
+  valid if the same text embeds the same way on a later run) does not bind the real model the same way:
+  the index persists the document vectors, so a search re-embeds only the query and ranks it against the
+  stored ones, and cosine ordering is robust to the sub-1e-3 float drift a Metal embedding can carry run
+  to run, so the model needs no bit-reproducibility (the stand-in needed it precisely because it has no
+  weights to re-run, only a hash). CLI: `horizon aura index/search --model <gguf>` (or
+  `HORIZON_EMBED_MODEL`) behind the `aura-llama` feature, with a build that lacks the backend giving a
+  clear "rebuild with --features aura-llama" error rather than a silent fallback; index and search must
+  name the same model, since two vectors only compare if one embedder made them. Proven on the usual
+  split: the default build is model-free and `cargo test --all` covers the hashing path (23 aura tests),
+  the feature is compile-checked in CI (clippy of `aura --features llama` and `horizon --features
+  aura-llama`, with cmake + libclang installed for the source build) but never run there (no weights),
+  and two model-gated tests skip themselves unless `HORIZON_EMBED_MODEL` points at a GGUF, exactly the
+  way the FIDO2 hardware tests gate on a real key. Eye-verified end to end on the Mac with ggml-org's
+  `embeddinggemma-300M-Q8_0.gguf` (768-wide, 334 MB) on Metal: five natural-language queries each ranked
+  the right note first by roughly a 2x margin, every query sharing no content word with its target
+  ("where do the cows feed" -> a note about a herd on fresh pasture; "filing my income taxes" -> one
+  about estimated payments and the revenue office; "looking at the planets after dark" -> Jupiter's moons
+  through binoculars), the leap the seam exists for: the hashing stand-in collapses to a noise-thin
+  0.093-vs-0.073 near-tie on that same zero-overlap query while the model holds a confident 0.449 vs
+  0.226. Left on the embedder: EmbeddingGemma's task-specific query/document prompt prefixes for a further
+  quality bump (raw symmetric text now), and context reuse / batch decode for indexing throughput. Next
+  on the AI layer: the tool-calling planner over the same llama.cpp engine (GGUF, GBNF-constrained tool
+  calls into the `Planner` seam), and Aura as the Glass desktop's command palette.
 
 ## Next
 

@@ -13,6 +13,8 @@
 //! shim, eye-verified later, the same split the compositor backends use.
 
 mod error;
+#[cfg(feature = "llama")]
+mod llama;
 mod plan;
 mod semantic;
 mod tool;
@@ -22,6 +24,8 @@ use std::collections::HashMap;
 use weave::{Broker, Capability, GrantId, Limits, PrincipalId, Resource, Rights, Status};
 
 pub use error::{Error, Result};
+#[cfg(feature = "llama")]
+pub use llama::GgufEmbedder;
 pub use plan::{Plan, Planner, RulePlanner, Step};
 pub use semantic::{
     dot, normalize, Embedder, HashingEmbedder, Hit, SemanticIndex, VectorIndex, DEFAULT_DIM,

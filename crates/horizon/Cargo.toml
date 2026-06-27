@@ -36,6 +36,12 @@ compositor-softdrm = ["compositor/softdrm", "compositor-shell"]
 # standard binary stays free of the FIDO2/HID stack; the software-token path always
 # works. Linux.
 identity-fido2 = ["identity/fido2"]
+# Build the real GGUF embedding model into the Aura semantic commands, so
+# `horizon aura index/search --model <gguf>` ranks by true meaning instead of the
+# deterministic hashing stand-in. Off by default so the standard binary pulls no
+# llama.cpp engine (the sys crate builds it from source via cmake); the hashing
+# path always works.
+aura-llama = ["aura/llama"]
 
 [dependencies]
 lifestream = { path = "../lifestream" }

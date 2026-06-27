@@ -21,6 +21,8 @@ pub enum Error {
     Index(&'static str),
     #[error("planning failed: {0}")]
     Plan(String),
+    #[error("model: {0}")]
+    Model(String),
 }
 
 impl Error {
@@ -29,6 +31,9 @@ impl Error {
     }
     pub fn lifestream(e: impl fmt::Display) -> Error {
         Error::Lifestream(e.to_string())
+    }
+    pub fn model(e: impl fmt::Display) -> Error {
+        Error::Model(e.to_string())
     }
 }
 
