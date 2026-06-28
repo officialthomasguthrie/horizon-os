@@ -25,7 +25,7 @@ use weave::{Broker, Capability, GrantId, Limits, PrincipalId, Resource, Rights, 
 
 pub use error::{Error, Result};
 #[cfg(feature = "llama")]
-pub use llama::GgufEmbedder;
+pub use llama::{GgufEmbedder, LlmPlanner};
 pub use plan::{Plan, Planner, RulePlanner, Step};
 pub use semantic::{
     dot, normalize, Embedder, HashingEmbedder, Hit, SemanticIndex, VectorIndex, DEFAULT_DIM,

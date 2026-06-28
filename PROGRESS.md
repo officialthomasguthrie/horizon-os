@@ -1855,6 +1855,50 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   quality bump (raw symmetric text now), and context reuse / batch decode for indexing throughput. Next
   on the AI layer: the tool-calling planner over the same llama.cpp engine (GGUF, GBNF-constrained tool
   calls into the `Planner` seam), and Aura as the Glass desktop's command palette.
+- Phase 4 Aura tool-calling planner (`aura` crate `llama` feature + `horizon`): the `Planner` seam the
+  intent layer was built around now carries a real model, a small instruct GGUF over the SAME llama.cpp
+  engine as the embedder, so `aura plan` understands a request in plain language instead of the
+  deterministic `RulePlanner`'s fixed verb grammar. This is the second half of "one engine, both seams":
+  one llama.cpp backend behind the `llama` feature fills both the `Embedder` seam (done) and now the
+  `Planner` seam, and like the embedder it is eye-verifiable right here on this Mac's Metal (Apple M4),
+  where the still-open FIDO2 touch and NAT traversal need physical gear this environment lacks. The crate
+  piece is `LlmPlanner` in `llama.rs` next to `GgufEmbedder`: it turns an intent into a `Plan` of catalog
+  tool calls by prompting the model with the tool schema and decoding under a GBNF grammar GENERATED from
+  that same `Catalog`, so the output is constrained to a JSON array of well-formed calls naming only real
+  tools with their real argument keys. The grammar makes a malformed call, a hallucinated tool, or a
+  missing required key UNREPRESENTABLE rather than something to catch after the fact (each tool gets a rule
+  pinning its name literal and its own required arg keys; the array requires at least one call, so an intent
+  the planner cannot truly serve still produces a call the capability layer then refuses, which is the
+  docs/05 prompt-injection point the demo's `/etc/shadow` beat makes); the only freedom left to the model is
+  which tool and what string values, which is the decision it should make. Generation rides the engine
+  exactly as the embedder does: a process-global `LlamaBackend`, a fresh context per call so it carries no
+  mutable state and stays `Send + Sync`, the model's own chat template (ChatML fallback), and a
+  grammar+greedy sampler chain (greedy keeps a plan reproducible for one intent; `sample` accepts each token
+  into the chain itself, advancing the grammar, so it is not accepted twice). Token pieces are accumulated as
+  bytes and decoded once, and a small owned JSON reader parses the array into typed `Step`s with no serde,
+  the same way `semantic` owns its index codec. It is not a catalog member: the CLI wires it where the
+  `RulePlanner` stand-in sat, exactly as a real embedder is wired where the `HashingEmbedder` sits. On the
+  usual headless split, the grammar generation and the JSON reader are pure code, proven in CI without
+  weights (3 unit tests: the grammar pins each tool and its keys, the reader handles a tool-call array with
+  escapes, and `parse_tool_calls` builds steps and refuses an unknown tool or non-JSON), the feature is
+  compile-checked (clippy of `aura --features llama` and `horizon --features aura-llama`) but never run there,
+  and two model-gated tests skip unless `HORIZON_PLAN_MODEL` points at a GGUF, the same way the embedder
+  tests gate on `HORIZON_EMBED_MODEL` and the FIDO2 tests gate on a real key. CLI: `aura plan --model <gguf>`
+  (or `HORIZON_PLAN_MODEL`) plans with the LLM and previews the capability-checked plan, else the
+  `RulePlanner`; `aura demo --model <gguf>` runs the whole scripted execute-through-the-broker story with the
+  LLM in place of the rule grammar. The planner model is separate from the embedding model
+  (`HORIZON_PLAN_MODEL` vs `HORIZON_EMBED_MODEL`): one understands the request, the other ranks files, two
+  different GGUFs. Eye-verified end to end on the Mac with `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf` (940 MB, kept
+  small because disk is tight) on Metal: natural-language intents with no verb a `RulePlanner` could match
+  planned the right tool and copied the exact paths ("where do I keep my notes about the cattle under
+  /home/me/farm" -> a `find` over that dir; "what is inside /etc/hosts" -> `read_file` that file; "what files
+  are in /home/me/Downloads" -> `list_dir`; "move /tmp/draft.txt to /home/me/docs/final.txt" -> `move_file`
+  surfacing TWO capabilities, read+write at the source and write at the destination), and `aura demo --model`
+  ran the full story through the broker, with the model planning the `/etc/shadow` read it was asked for and
+  the broker refusing it, the least-privilege punchline. Left on the planner: a larger model for harder or
+  multi-step intents (the grammar already admits multiple calls), the task-specific embedder prompt prefixes
+  noted before, and the payoff both seams now enable, Aura as the Glass desktop's real command palette
+  (wire `aura`'s `Planner` + executor into `glass::aura`, which already parses launch/sever/filter).
 
 ## Next
 

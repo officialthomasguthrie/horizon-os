@@ -380,6 +380,12 @@ enum AuraOp {
     Plan {
         /// The intent, e.g. "find cows in /home/me/docs"
         intent: Vec<String>,
+        /// Plan with a real instruct GGUF (the LLM planner) at this path instead of
+        /// the deterministic verb-grammar stand-in (needs `--features aura-llama`;
+        /// also read from HORIZON_PLAN_MODEL). A small model is plenty: the output is
+        /// grammar-constrained to valid tool calls.
+        #[arg(long)]
+        model: Option<PathBuf>,
     },
     /// Build a semantic index over a directory and persist it inside a store's
     /// Lifestream (encrypted at rest, referenced so it survives gc). The
@@ -414,7 +420,13 @@ enum AuraOp {
     /// capabilities are surfaced (never silently acquired), you approve, it runs
     /// through the broker (every access audited), and a destructive step waits for
     /// confirmation, while a reach for something ungranted is refused
-    Demo,
+    Demo {
+        /// Plan the story's intents with a real instruct GGUF (the LLM planner) at
+        /// this path instead of the verb-grammar stand-in (needs `--features
+        /// aura-llama`; also read from HORIZON_PLAN_MODEL)
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -753,7 +765,7 @@ fn aura_cmd(op: AuraOp) -> Result<()> {
             print!("{}", aura::Catalog::standard().describe());
             Ok(())
         }
-        AuraOp::Plan { intent } => aura_plan(&intent.join(" ")),
+        AuraOp::Plan { intent, model } => aura_plan(&intent.join(" "), model),
         AuraOp::Index { store, dir, model } => aura_index(&store, &dir, model),
         AuraOp::Search {
             store,
@@ -761,7 +773,7 @@ fn aura_cmd(op: AuraOp) -> Result<()> {
             limit,
             model,
         } => aura_search(&store, &query.join(" "), limit, model),
-        AuraOp::Demo => aura_demo(),
+        AuraOp::Demo { model } => aura_demo(model),
     }
 }
 
@@ -849,6 +861,38 @@ fn load_model_embedder(path: PathBuf) -> Result<Box<dyn aura::Embedder>> {
     ))
 }
 
+// Choose the planner a command runs under: the LLM over a small instruct GGUF when
+// one is named (on the command line or in HORIZON_PLAN_MODEL) and this build
+// carries the backend, otherwise the deterministic RulePlanner stand-in. Boxed so
+// the caller drives one `&dyn Planner` either way, exactly as `aura_embedder`
+// boxes the embedder. The planner model is separate from the embedding model
+// (HORIZON_PLAN_MODEL vs HORIZON_EMBED_MODEL): one understands the request, the
+// other ranks files, and they are different GGUFs.
+fn aura_planner(model: Option<PathBuf>) -> Result<Box<dyn aura::Planner>> {
+    let model = model.or_else(|| std::env::var_os("HORIZON_PLAN_MODEL").map(PathBuf::from));
+    match model {
+        Some(path) => load_planner(path),
+        None => Ok(Box::new(aura::RulePlanner)),
+    }
+}
+
+#[cfg(feature = "aura-llama")]
+fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner>> {
+    let planner =
+        aura::LlmPlanner::load(&path).map_err(|e| anyhow!("loading planner model: {e}"))?;
+    eprintln!("aura: planning via {}", path.display());
+    Ok(Box::new(planner))
+}
+
+#[cfg(not(feature = "aura-llama"))]
+fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner>> {
+    Err(anyhow!(
+        "a planner model was given ({}) but this build has no model backend; \
+         rebuild horizon with `--features aura-llama`",
+        path.display()
+    ))
+}
+
 // Walk a directory to a bounded depth, handing each regular file's path and a
 // capped slice of its text to `f`. Unreadable files are skipped, not fatal.
 fn index_dir(dir: &Path, f: &mut impl FnMut(&Path, String)) -> Result<()> {
@@ -889,16 +933,21 @@ fn throwaway_broker(tag: &str) -> Result<(PathBuf, Broker)> {
     Ok((dir, broker))
 }
 
-fn aura_plan(intent: &str) -> Result<()> {
+fn aura_plan(intent: &str, model: Option<PathBuf>) -> Result<()> {
+    let planner = aura_planner(model)?;
     let (dir, mut broker) = throwaway_broker("plan")?;
     let aura = aura::Aura::new(&mut broker);
     let result = (|| -> Result<()> {
         let plan = aura
-            .plan(&aura::RulePlanner, intent)
+            .plan(planner.as_ref(), intent)
             .map_err(|e| anyhow!("{e}"))?;
         let preview = aura.preview(&plan);
         println!("intent:  {}", plan.intent);
         println!();
+        if plan.is_empty() {
+            println!("the planner produced no tool calls for this intent");
+            return Ok(());
+        }
         print_aura_preview(&preview);
         println!();
         if preview.ready() {
@@ -923,14 +972,15 @@ fn aura_plan(intent: &str) -> Result<()> {
 // Weave, it acts only through capabilities you granted, missing ones are
 // surfaced rather than acquired, destructive steps wait for confirmation, audit
 // records every access, and a reach for something ungranted is simply refused.
-fn aura_demo() -> Result<()> {
+fn aura_demo(model: Option<PathBuf>) -> Result<()> {
+    let planner = aura_planner(model)?;
     let (dir, mut broker) = throwaway_broker("demo")?;
-    let result = aura_demo_inner(&dir, &mut broker);
+    let result = aura_demo_inner(&dir, &mut broker, planner.as_ref());
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
 
-fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
+fn aura_demo_inner(dir: &Path, broker: &mut Broker, planner: &dyn aura::Planner) -> Result<()> {
     // A little world for the file tools to act on.
     let work = dir.join("work");
     std::fs::create_dir_all(work.join("downloads"))?;
@@ -942,7 +992,6 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     std::fs::write(work.join("downloads").join("installer.tmp"), "junk\n")?;
     let work = work.canonicalize()?;
 
-    let planner = aura::RulePlanner;
     let mut aura = aura::Aura::new(broker);
     println!(
         "# Aura is the principal \"{}\" in the Weave",
@@ -953,7 +1002,7 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     // 1. A read intent. Preview surfaces the missing capability; you approve it;
     //    then it runs and the access is logged.
     let intent = format!("find cows in {}", work.display());
-    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let plan = aura.plan(planner, &intent).map_err(|e| anyhow!("{e}"))?;
     let pv = aura.preview(&plan);
     println!("intent:  {intent}");
     print_aura_preview(&pv);
@@ -967,7 +1016,7 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     // 2. A second intent the same directory grant already covers: no new
     //    authority needed (least privilege, reused).
     let intent = format!("read {}", work.join("cattle.md").display());
-    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let plan = aura.plan(planner, &intent).map_err(|e| anyhow!("{e}"))?;
     let pv = aura.preview(&plan);
     println!("intent:  {intent}");
     println!(
@@ -981,7 +1030,7 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     // 3. A destructive intent. It waits for confirmation even once authorized.
     let victim = work.join("downloads").join("installer.tmp");
     let intent = format!("delete {}", victim.display());
-    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let plan = aura.plan(planner, &intent).map_err(|e| anyhow!("{e}"))?;
     let pv = aura.preview(&plan);
     println!("intent:  {intent}");
     print_aura_preview(&pv);
@@ -997,7 +1046,7 @@ fn aura_demo_inner(dir: &Path, broker: &mut Broker) -> Result<()> {
     //    refused, no matter what the model was asked to do (docs/05 prompt
     //    injection stance: the capability model bounds the damage).
     let intent = "read /etc/shadow".to_string();
-    let plan = aura.plan(&planner, &intent).map_err(|e| anyhow!("{e}"))?;
+    let plan = aura.plan(planner, &intent).map_err(|e| anyhow!("{e}"))?;
     println!("intent:  {intent}");
     print_aura_report(&aura.execute(&plan, true));
     println!();
