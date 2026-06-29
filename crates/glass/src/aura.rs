@@ -387,6 +387,14 @@ pub struct Palette {
     /// routes Enter to running it; the shell sets and clears it (Glass cannot
     /// produce one). None the rest of the time.
     pub proposal: Option<Proposal>,
+    /// An `ask` intent the shell is still planning on its worker thread (the model
+    /// can take a moment to decode). While it is set the band shows a "planning"
+    /// indicator in place of the feedback line, so a slow plan reads as work in
+    /// progress rather than a frozen desktop. The shell sets it when the ask is
+    /// dispatched and clears it when the plan lands (becoming a `proposal`) or is
+    /// cancelled, so it is mutually exclusive with `proposal`: a plan is either
+    /// still being made or already proposed.
+    pub planning: Option<String>,
 }
 
 impl Palette {
@@ -445,13 +453,15 @@ impl Palette {
         self.cursor = self.len();
     }
 
-    /// Empty the input and reset the cursor, dropping any pending proposal (the
-    /// plan belongs to the line being cleared). The caller resets the message and
-    /// filter (which it derives by re-resolving the now-empty line).
+    /// Empty the input and reset the cursor, dropping any pending proposal or
+    /// in-flight plan (both belong to the line being cleared). The caller resets
+    /// the message and filter (which it derives by re-resolving the now-empty
+    /// line).
     pub fn clear(&mut self) {
         self.input.clear();
         self.cursor = 0;
         self.proposal = None;
+        self.planning = None;
     }
 
     // Byte offset of char index `i` (or the end), for editing a UTF-8 String by
@@ -707,5 +717,17 @@ mod tests {
         p.backspace(); // remove the multibyte 'é'
         assert_eq!(p.input, "caf");
         assert_eq!(p.cursor, 3);
+    }
+
+    #[test]
+    fn clear_drops_a_pending_proposal_and_an_in_flight_plan() {
+        let mut p = Palette::new();
+        p.insert('a');
+        p.planning = Some("read /etc/hosts".to_string());
+        p.proposal = Some(Proposal::failed("x", "y"));
+        p.clear();
+        assert!(p.is_empty());
+        assert!(p.planning.is_none(), "clear drops the in-flight plan");
+        assert!(p.proposal.is_none(), "clear drops the pending proposal");
     }
 }

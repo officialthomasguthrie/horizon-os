@@ -882,8 +882,10 @@ fn load_model_embedder(path: PathBuf) -> Result<Box<dyn aura::Embedder>> {
 // the caller drives one `&dyn Planner` either way, exactly as `aura_embedder`
 // boxes the embedder. The planner model is separate from the embedding model
 // (HORIZON_PLAN_MODEL vs HORIZON_EMBED_MODEL): one understands the request, the
-// other ranks files, and they are different GGUFs.
-fn aura_planner(model: Option<PathBuf>) -> Result<Box<dyn aura::Planner>> {
+// other ranks files, and they are different GGUFs. `Send` so the desktop shell can
+// move it onto a worker thread and plan off the render loop (both the LLM, which
+// holds read-only weights, and the RulePlanner are Send).
+fn aura_planner(model: Option<PathBuf>) -> Result<Box<dyn aura::Planner + Send>> {
     let model = model.or_else(|| std::env::var_os("HORIZON_PLAN_MODEL").map(PathBuf::from));
     match model {
         Some(path) => load_planner(path),
@@ -892,7 +894,7 @@ fn aura_planner(model: Option<PathBuf>) -> Result<Box<dyn aura::Planner>> {
 }
 
 #[cfg(feature = "aura-llama")]
-fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner>> {
+fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner + Send>> {
     let planner =
         aura::LlmPlanner::load(&path).map_err(|e| anyhow!("loading planner model: {e}"))?;
     eprintln!("aura: planning via {}", path.display());
@@ -900,7 +902,7 @@ fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner>> {
 }
 
 #[cfg(not(feature = "aura-llama"))]
-fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner>> {
+fn load_planner(path: PathBuf) -> Result<Box<dyn aura::Planner + Send>> {
     Err(anyhow!(
         "a planner model was given ({}) but this build has no model backend; \
          rebuild horizon with `--features aura-llama`",
@@ -1794,6 +1796,31 @@ fn report_summary(report: &aura::Report) -> String {
     }
 }
 
+// The Aura planner runs on its own thread so a slow model decode never hitches the
+// render loop (planning a multi-step intent on a small GGUF can take seconds). It
+// owns the planner and a standard catalog and serves one request at a time: an
+// (epoch, intent) in, an (epoch, plan-or-error) out. Serial by construction, so two
+// asks never decode concurrently on the one engine; the Shell tags each request
+// with an epoch and ignores a result whose ask it has since cancelled or replaced.
+// Ends when the Shell drops `plan_tx` and the request channel closes.
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
+fn planner_worker(
+    planner: Box<dyn aura::Planner + Send>,
+    requests: std::sync::mpsc::Receiver<(u64, String)>,
+    results: std::sync::mpsc::Sender<(u64, std::result::Result<aura::Plan, String>)>,
+) {
+    // The catalog is built here, not moved in, so the worker needs only the planner
+    // to be Send; it matches the one the Shell's executor previews and runs against
+    // (both Catalog::standard()), so a plan the worker makes lines up downstream.
+    let catalog = aura::Catalog::standard();
+    while let Ok((epoch, intent)) = requests.recv() {
+        let result = planner.plan(&intent, &catalog).map_err(|e| e.to_string());
+        if results.send((epoch, result)).is_err() {
+            break; // the Shell is gone
+        }
+    }
+}
+
 // The interactive Glass shell behind an on-screen backend. It holds the broker,
 // the window it summarizes, the cached model, the Aura command palette, the
 // planner, and the last scene it drew. A pointer click resolves against the
@@ -1820,10 +1847,19 @@ struct Shell {
     scene: glass::Scene,
     width: u32,
     height: u32,
-    // Turns an `ask` intent into a plan of catalog tool calls: the LLM over a
-    // GGUF when one was named (with the aura-llama backend), else the
-    // deterministic RulePlanner. The executor is built per-ask over the broker.
-    planner: Box<dyn aura::Planner>,
+    // The planner runs on its own thread so a slow model decode never hitches the
+    // render loop. An `ask` sends the intent down `plan_tx`; the finished plan
+    // comes back on `plan_rx`, picked up by `poll_planner` each tick. `planning` is
+    // the ask in flight: its epoch (to match the result against) and its intent (to
+    // show while it decodes), None when idle. `plan_epoch` tags each ask so a stale
+    // result, from an ask since cancelled or replaced, is dropped.
+    plan_tx: std::sync::mpsc::Sender<(u64, String)>,
+    plan_rx: std::sync::mpsc::Receiver<(u64, std::result::Result<aura::Plan, String>)>,
+    planning: Option<(u64, String)>,
+    plan_epoch: u64,
+    // The planner worker. Not joined: a decode in flight must not block shutdown, so
+    // it is detached and ends on its own when `plan_tx` drops and its channel closes.
+    _planner: std::thread::JoinHandle<()>,
     // The plan a pending proposal would run, kept between the ask (which plans and
     // previews) and the confirm (which brokers it). None when nothing is pending,
     // and None for a proposal the planner could not produce (which only shows a
@@ -1855,7 +1891,7 @@ impl Shell {
         height: u32,
         wayland_display: &str,
         key: Option<&[u8; 32]>,
-        planner: Box<dyn aura::Planner>,
+        planner: Box<dyn aura::Planner + Send>,
     ) -> Result<(Shell, Vec<u8>)> {
         // The compositor sets XDG_RUNTIME_DIR before opening the shell (its own
         // socket lives under it); the launch path needs it to find that socket on
@@ -1872,6 +1908,16 @@ impl Shell {
         let palette = glass::Palette::new();
         let scene = glass::layout(&model, &palette, width, height, 2);
         let rgba = glass::raster::rasterize(&scene).rgba;
+
+        // Hand the planner to a worker thread so an `ask` plans off the render loop.
+        let (plan_tx, requests) = std::sync::mpsc::channel::<(u64, String)>();
+        let (results, plan_rx) =
+            std::sync::mpsc::channel::<(u64, std::result::Result<aura::Plan, String>)>();
+        let planner_thread = std::thread::Builder::new()
+            .name("aura-planner".into())
+            .spawn(move || planner_worker(planner, requests, results))
+            .map_err(|e| anyhow!("spawn planner thread: {e}"))?;
+
         Ok((
             Shell {
                 broker,
@@ -1881,7 +1927,11 @@ impl Shell {
                 scene,
                 width,
                 height,
-                planner,
+                plan_tx,
+                plan_rx,
+                planning: None,
+                plan_epoch: 0,
+                _planner: planner_thread,
                 pending: None,
                 wayland_display: wayland_display.to_string(),
                 host_runtime,
@@ -1942,6 +1992,19 @@ impl Shell {
     // moving is a visible change, so every key returns a fresh frame.
     fn key(&mut self, key: compositor::ShellKey) -> Option<Vec<u8>> {
         use compositor::ShellKey;
+        // While the worker is planning an ask, the line is committed: Escape cancels
+        // (and the in-flight result is dropped), every other key is ignored until
+        // the plan lands. The desktop keeps drawing because the loop is no longer
+        // blocked on the decode, which is the whole point of the worker thread.
+        if self.planning.is_some() {
+            return match key {
+                ShellKey::Escape => {
+                    self.cancel_planning();
+                    Some(self.relayout())
+                }
+                _ => None,
+            };
+        }
         // A pending Aura proposal captures Enter (confirm and run) and Escape
         // (dismiss). Any other key abandons the proposal but keeps the line, so
         // the user can edit the intent and ask again.
@@ -2025,29 +2088,72 @@ impl Shell {
         }
     }
 
-    // Plan an `ask` intent and show it as a pending proposal (the first Enter on
-    // an ask). The planner turns the intent into a plan of catalog tool calls,
-    // the executor previews the capabilities each step needs (which Aura holds,
-    // which are missing), and that preview becomes the `glass::Proposal` the band
-    // draws; the plan is kept in `pending` for the confirm. Nothing is granted or
-    // run here: this is the disclosure, the next Enter is the approval. A planner
-    // that cannot serve the intent yields a failed proposal (a reason to show, no
-    // plan to run). Planning may block the render loop briefly while a model
-    // decodes; an idle desktop only pays it on an ask, and a background planner is
-    // a later refinement.
+    // Start planning an `ask` intent (the first Enter on an ask). The planner runs
+    // on a worker thread, so this only dispatches the intent and returns at once:
+    // the render loop keeps drawing (a "planning" indicator in the band) while the
+    // model decodes, and the finished plan is picked up by `poll_planner` on a
+    // later tick, which builds the pending proposal. Nothing is granted or run
+    // here. A second ask supersedes a still-running one (a fresh epoch), and the
+    // superseded result is dropped when it lands.
     fn propose(&mut self, intent: &str) {
-        let planned = {
-            let aura = aura::Aura::new(&mut self.broker);
-            match aura.plan(self.planner.as_ref(), intent) {
-                Ok(plan) => {
-                    let proposal = proposal_from(intent, &aura.preview(&plan));
-                    Ok((plan, proposal))
-                }
-                Err(e) => Err(e.to_string()),
+        self.plan_epoch += 1;
+        let epoch = self.plan_epoch;
+        // The line stays visible (e.g. "ask read /x") with the planning indicator
+        // under it; the proposal replaces the indicator when it lands.
+        self.pending = None;
+        self.palette.proposal = None;
+        self.palette.filter = None;
+        self.palette.planning = Some(intent.to_string());
+        self.palette.message = format!("planning: {intent}");
+        self.planning = Some((epoch, intent.to_string()));
+        if self.plan_tx.send((epoch, intent.to_string())).is_err() {
+            // The worker is gone (it only exits on shutdown); fail the ask in place
+            // rather than hang showing "planning" forever.
+            eprintln!("aura: planner thread is not available");
+            self.planning = None;
+            self.palette.planning = None;
+            let proposal = glass::Proposal::failed(intent, "the planner is not available");
+            self.palette.message = proposal.confirm_hint();
+            self.palette.proposal = Some(proposal);
+        }
+    }
+
+    // Pick up a finished plan from the worker thread, if one is ready: a cheap,
+    // non-blocking poll the tick runs every frame (not behind the store-poll rate
+    // limit), so a proposal appears as soon as the model returns. A result whose
+    // epoch is not the one currently awaited is stale (its ask was cancelled or
+    // superseded) and dropped; the loop drains any such backlog. Returns whether
+    // the pending proposal changed, so the caller redraws.
+    fn poll_planner(&mut self) -> bool {
+        loop {
+            let (epoch, result) = match self.plan_rx.try_recv() {
+                Ok(msg) => msg,
+                Err(_) => return false, // empty, or the worker is gone
+            };
+            match &self.planning {
+                Some((awaited, _)) if *awaited == epoch => {}
+                _ => continue, // stale: discard and look for a newer result
             }
-        };
-        match planned {
-            Ok((plan, proposal)) => {
+            let (_, intent) = self.planning.take().expect("an awaited plan");
+            self.finish_plan(&intent, result);
+            return true;
+        }
+    }
+
+    // Turn a worker result into the pending proposal (the second half of what the
+    // old synchronous propose did, now run when the plan comes back). On success
+    // the preview is computed here on the main thread, which is cheap (it reads the
+    // grant table, runs no model) and folded into the `glass::Proposal` the band
+    // draws; the plan is kept in `pending` for the confirm. A planner error becomes
+    // a failed proposal (a reason to show, nothing to run).
+    fn finish_plan(&mut self, intent: &str, result: std::result::Result<aura::Plan, String>) {
+        self.palette.planning = None;
+        match result {
+            Ok(plan) => {
+                let proposal = {
+                    let aura = aura::Aura::new(&mut self.broker);
+                    proposal_from(intent, &aura.preview(&plan))
+                };
                 println!("aura: planned {} step(s) for {intent:?}", plan.steps.len());
                 self.palette.message = proposal.confirm_hint();
                 self.palette.filter = None;
@@ -2062,6 +2168,17 @@ impl Shell {
                 self.pending = None;
             }
         }
+    }
+
+    // Cancel an ask still being planned (Escape while the worker decodes). The line
+    // is cleared and the worker's eventual result is dropped (its epoch no longer
+    // matches anything awaited), so the desktop returns to idle at once without
+    // waiting for the decode to finish.
+    fn cancel_planning(&mut self) {
+        self.planning = None;
+        self.pending = None;
+        self.palette.clear(); // drops the planning indicator and empties the line
+        self.preview();
     }
 
     // Confirm a pending proposal (the second Enter on an ask): grant the missing
@@ -2149,36 +2266,51 @@ impl Shell {
             .retain_mut(|c| matches!(c.try_wait(), Ok(None)));
     }
 
-    // A periodic tick from the render loop. The Shell holds one broker opened once,
-    // so it does not see appends another process makes to the store; this re-reads
-    // the audit log and, only if it changed, rebuilds the model, refreshes the
-    // palette preview, and returns the new RGBA to redraw, so the live desktop
-    // reflects a grant, use, or revoke made from outside (e.g. a `horizon weave
-    // grant` in another shell). Rate-limited to SHELL_POLL so a 60fps loop does not
-    // stat the store every frame; cheap when nothing changed (`Broker::reload` reads
-    // only the audit ref and walks no chain, so there is no relayout and no
-    // re-upload). It also reaps any apps launched from the palette.
+    // A periodic tick from the render loop, the one continuous hook the loop offers
+    // (clicks and keys are event-driven). Two jobs, redrawn in one relayout if
+    // either changed. First, pick up a finished plan from the worker thread: a
+    // cheap non-blocking poll run every tick, not rate-limited, so a proposal
+    // appears as soon as the model returns. Second, the store poll: the Shell holds
+    // one broker opened once, so it does not see appends another process makes;
+    // `poll_store` re-reads the audit log at most every SHELL_POLL and rebuilds the
+    // model only when it changed, so a grant, use, or revoke made from outside (a
+    // `horizon weave grant` in another shell) shows up here.
     fn refresh(&mut self) -> Option<Vec<u8>> {
+        let plan_changed = self.poll_planner();
+        let store_changed = self.poll_store();
+        if plan_changed || store_changed {
+            Some(self.relayout())
+        } else {
+            None
+        }
+    }
+
+    // The rate-limited store poll, factored out of `refresh`: reap exited clients
+    // and, at most once every SHELL_POLL, re-read the audit log; rebuild the model
+    // and refresh the palette preview only when the log actually changed. Returns
+    // whether the model changed. Cheap when nothing did (`Broker::reload` reads only
+    // the audit ref and walks no chain) and a no-op between polls.
+    fn poll_store(&mut self) -> bool {
         if self.last_poll.elapsed() < SHELL_POLL {
-            return None;
+            return false;
         }
         self.last_poll = std::time::Instant::now();
         self.reap();
         match self.broker.reload() {
-            Ok(false) => None,
+            Ok(false) => false,
             Ok(true) => match self.reload_model() {
                 Ok(()) => {
                     self.preview();
-                    Some(self.relayout())
+                    true
                 }
                 Err(e) => {
                     eprintln!("compositor: store reload failed: {e}");
-                    None
+                    false
                 }
             },
             Err(e) => {
                 eprintln!("compositor: store reload failed: {e}");
-                None
+                false
             }
         }
     }
@@ -3545,7 +3677,7 @@ mod shell_tests {
         // Shell::open needs a runtime dir on disk (the launch path binds the socket
         // from under it); these tests never launch, so the temp dir serves.
         std::env::set_var("XDG_RUNTIME_DIR", dir);
-        let planner: Box<dyn aura::Planner> = Box::new(aura::RulePlanner);
+        let planner: Box<dyn aura::Planner + Send> = Box::new(aura::RulePlanner);
         let (shell, _rgba) =
             Shell::open(&store, 7, 1200, 800, "wayland-test", Some(&master), planner).unwrap();
         (shell, work)
@@ -3555,6 +3687,21 @@ mod shell_tests {
         for c in s.chars() {
             shell.key(ShellKey::Char(c));
         }
+    }
+
+    // The planner now runs on a worker thread, so a proposal is not ready the
+    // instant Enter is pressed on an ask. Pump the render-loop tick until the
+    // worker returns (the RulePlanner these tests use is near-instant, so this
+    // resolves in a few polls); panic if it never does.
+    fn await_plan(shell: &mut Shell) {
+        for _ in 0..500 {
+            if shell.planning.is_none() {
+                return;
+            }
+            shell.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("planner did not return a plan");
     }
 
     fn has_use(shell: &mut Shell) -> bool {
@@ -3571,13 +3718,30 @@ mod shell_tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut shell, work) = shell(dir.path());
 
-        // First Enter on an ask: plan and show a pending proposal, run nothing.
+        // First Enter on an ask: dispatch to the worker thread and show a planning
+        // indicator, with no proposal yet and nothing run.
         type_line(
             &mut shell,
             &format!("ask read {}", work.join("hosts.txt").display()),
         );
         shell.key(ShellKey::Enter);
+        assert!(
+            shell.planning.is_some(),
+            "the ask is being planned off-thread"
+        );
+        assert!(
+            shell.palette.proposal.is_none(),
+            "no proposal until the plan lands"
+        );
+        assert!(
+            shell.palette.planning.is_some(),
+            "the band shows it planning"
+        );
+
+        // The worker returns; the tick picks the plan up and shows the proposal.
+        await_plan(&mut shell);
         let proposal = shell.palette.proposal.as_ref().expect("a pending proposal");
+        assert!(shell.palette.planning.is_none(), "no longer planning");
         assert_eq!(proposal.steps.len(), 1);
         assert_eq!(
             proposal.missing_count(),
@@ -3622,6 +3786,7 @@ mod shell_tests {
             &format!("ask read {}", work.join("hosts.txt").display()),
         );
         shell.key(ShellKey::Enter);
+        await_plan(&mut shell);
         assert!(shell.palette.proposal.is_some());
 
         shell.key(ShellKey::Escape);
@@ -3640,6 +3805,7 @@ mod shell_tests {
         let (mut shell, _work) = shell(dir.path());
         type_line(&mut shell, "ask teleport to mars");
         shell.key(ShellKey::Enter);
+        await_plan(&mut shell);
         let proposal = shell.palette.proposal.as_ref().expect("a failed proposal");
         assert!(proposal.failed.is_some(), "the planner could not serve it");
         assert!(shell.pending.is_none(), "nothing to run");
@@ -3648,5 +3814,75 @@ mod shell_tests {
         shell.key(ShellKey::Enter);
         assert!(shell.palette.proposal.is_none());
         assert!(!has_use(&mut shell));
+    }
+
+    #[test]
+    fn escape_cancels_an_in_flight_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, work) = shell(dir.path());
+        let line = format!("ask read {}", work.join("hosts.txt").display());
+        type_line(&mut shell, &line);
+        shell.key(ShellKey::Enter);
+        assert!(shell.planning.is_some(), "planning in flight");
+
+        // While planning, a normal key is ignored: the committed line is locked.
+        let before = shell.palette.input.clone();
+        shell.key(ShellKey::Char('x'));
+        assert_eq!(
+            shell.palette.input, before,
+            "keys are ignored while planning"
+        );
+
+        // Escape cancels: back to idle at once, the line cleared, without waiting
+        // for the decode.
+        shell.key(ShellKey::Escape);
+        assert!(shell.planning.is_none(), "the ask is cancelled");
+        assert!(shell.palette.planning.is_none());
+        assert!(shell.palette.proposal.is_none());
+        assert!(shell.palette.input.is_empty(), "the line is cleared");
+
+        // The worker's now-stale result (the decode may already have finished) is
+        // dropped, not turned into a proposal: pump the tick and confirm nothing
+        // reappears.
+        for _ in 0..20 {
+            shell.refresh();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            shell.palette.proposal.is_none(),
+            "the cancelled plan does not reappear"
+        );
+        assert!(shell.pending.is_none());
+        assert!(!has_use(&mut shell), "nothing was brokered");
+    }
+
+    #[test]
+    fn a_cancelled_ask_does_not_resolve_a_later_one() {
+        // Cancel an ask, then immediately start another. The first ask's result,
+        // which the worker still delivers, must not be mistaken for the second's;
+        // the epoch tag is what keeps them apart.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, work) = shell(dir.path());
+
+        type_line(
+            &mut shell,
+            &format!("ask read {}", work.join("hosts.txt").display()),
+        );
+        shell.key(ShellKey::Enter);
+        let first_epoch = shell.planning.as_ref().unwrap().0;
+        shell.key(ShellKey::Escape); // cancel the first
+
+        // A second, different ask: a fresh epoch and a different tool (list_dir).
+        type_line(&mut shell, &format!("ask list {}", work.display()));
+        shell.key(ShellKey::Enter);
+        let second_epoch = shell.planning.as_ref().unwrap().0;
+        assert!(second_epoch > first_epoch, "a fresh epoch per ask");
+        await_plan(&mut shell);
+
+        // The proposal is the second ask's (list_dir), not the first's (read_file),
+        // even though the worker delivered both results.
+        let proposal = shell.palette.proposal.as_ref().expect("the second plan");
+        assert_eq!(proposal.steps.len(), 1);
+        assert_eq!(proposal.steps[0].tool, "list_dir");
     }
 }

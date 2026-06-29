@@ -490,14 +490,27 @@ fn palette_band(s: &mut Surface, palette: &Palette, y: i32, h: i32) {
 
     match &palette.proposal {
         Some(p) => proposal_rows(s, p, ty + s.line),
-        None => {
-            let msg = if palette.message.trim().is_empty() {
-                aura::HINT_IDLE
-            } else {
-                palette.message.as_str()
-            };
-            s.text(s.margin, ty + s.line, DIM, msg);
-        }
+        // No proposal yet: either a plan is still decoding on the worker thread
+        // (show it in accent so the desktop reads as working, not frozen), or the
+        // one-line feedback (the message, or the idle hint when it has none).
+        None => match &palette.planning {
+            Some(intent) => {
+                s.text(
+                    s.margin,
+                    ty + s.line,
+                    ACCENT,
+                    format!("planning: {intent} ..."),
+                );
+            }
+            None => {
+                let msg = if palette.message.trim().is_empty() {
+                    aura::HINT_IDLE
+                } else {
+                    palette.message.as_str()
+                };
+                s.text(s.margin, ty + s.line, DIM, msg);
+            }
+        },
     }
 }
 
@@ -725,6 +738,23 @@ mod tests {
         };
         let scene = layout(&demo_model(), &palette, 1000, 700, 2);
         assert!(has_text(&scene, "no such verb"));
+    }
+
+    #[test]
+    fn an_in_flight_plan_shows_a_planning_indicator() {
+        // While the worker decodes, the band shows the intent as planning, not a
+        // stale message, and no proposal yet.
+        let palette = Palette {
+            input: "ask read /etc/hosts".to_string(),
+            cursor: 19,
+            message: "stale".to_string(),
+            planning: Some("read /etc/hosts".to_string()),
+            ..Palette::new()
+        };
+        let scene = layout(&demo_model(), &palette, 1200, 800, 2);
+        assert!(has_text(&scene, "ask read /etc/hosts"));
+        assert!(has_text(&scene, "planning: read /etc/hosts ..."));
+        assert!(!has_text(&scene, "stale"), "planning overrides the message");
     }
 
     #[test]

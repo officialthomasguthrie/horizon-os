@@ -1946,6 +1946,38 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   Left: a background planner so a slow model does not hitch the desktop, a larger model for multi-step intents,
   and finer-grained authority (separating the capability grant from the destructive confirm, and a Weave
   prompt for grants made outside an ask).
+- Phase 4 Aura background planner (`glass` + `horizon`): the Glass desktop's `ask` no longer plans on the
+  render loop. Planning a natural-language intent on a small instruct GGUF takes a beat (seconds for a
+  multi-step one), and the palette ran the planner synchronously inside the compositor's frame loop, so the
+  first Enter on an `ask` froze the whole desktop, no frames, no client servicing, no input, until the model
+  returned. The planner now runs on its own thread. The `Shell` hands its `Box<dyn Planner + Send>` to an
+  `aura-planner` worker at open (the planner only needs to be `Send` now, which both the `RulePlanner` and the
+  `LlmPlanner` are, the latter because `LlamaModel` and its `LlamaChatTemplate` are); an `ask` sends the intent
+  down a channel and returns at once, and the finished plan comes back on a second channel, picked up by
+  `poll_planner` on the render-loop tick, a cheap non-blocking `try_recv` run every frame, deliberately not
+  behind the 500ms store-poll rate limit, so the proposal appears the instant the model returns. While the
+  worker decodes, the band shows a `planning: <intent> ...` line (a new `glass::Palette::planning`, drawn in
+  accent and mutually exclusive with the pending `Proposal`), so a slow plan reads as work in progress rather
+  than a hang, and the desktop keeps drawing and stays interactive because the loop is no longer blocked on the
+  decode. The worker serves one request at a time, serial by construction, so two asks never decode
+  concurrently on the one llama.cpp engine, and the `Shell` tags each ask with a monotonic epoch so a result
+  whose ask was since cancelled or superseded is dropped, not mistaken for the current one. The planning state
+  is modal in the palette: Escape cancels (clears the line and drops the in-flight result without waiting for
+  the decode to finish), and every other key is ignored until the plan lands. Only the model decode moved
+  off-loop; the preview and the execute still run on the main thread, both cheap (they read the grant table and
+  broker steps, no model) and the broker is single-owner. On the usual headless split the whole flow is proven
+  without a display by the deterministic `RulePlanner`: the three existing `shell_tests` now await the
+  off-thread plan (a small tick-pump helper) and still assert ask -> propose -> confirm -> broker -> audit,
+  Escape-dismiss, and unplannable -> failed, and two new ones cover the async behavior, that the planning
+  indicator shows with no proposal yet and then resolves, and that Escape mid-decode cancels so a later ask's
+  plan is the one shown (the epoch keeping the cancelled result out, asserted by the two asks planning
+  different tools); a glass surface test asserts the planning row renders and overrides a stale message. The
+  planner is the same `Planner` seam already eye-verified on this Mac's Metal (`aura plan` / `aura demo
+  --model`), so the LLM is the drop-in upgrade and the live on-screen interaction rides the existing
+  softdrm/QEMU + winit recipe. Built and tested on darwin (glass, aura) and in the Linux container (the
+  `shell_tests` under both `compositor-softdrm` and `compositor-winit`, clippy clean under both with
+  `-D warnings`). Left: a larger model for multi-step intents, and finer-grained authority (separating the
+  capability grant from the destructive confirm, and a Weave prompt for grants made outside an ask).
 
 ## Next
 
@@ -2011,13 +2043,16 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `surface::layout` draws the input, caret, and feedback and filters the list, the
   compositor routes keystrokes to the shell when no client is focused (the new
   `ShellEvent::Key`), and the horizon `Shell` runs a command on Enter, all headless-tested.
-  An `ask <intent>` now goes all the way through Aura: the `Shell` holds a `Box<dyn Planner>`
-  (the LLM with a GGUF, the `RulePlanner` without), plans the intent into capability-checked
-  tool calls, draws them as a pending `Proposal` (the steps and the capabilities each needs,
-  held or missing), and on the confirm Enter grants the missing capabilities and runs the
-  plan through the broker (`Aura::approve_and_execute`), re-summarizing so Aura's brokered
-  uses show in the same surface; the three Shell `shell_tests` drive the ask/confirm/dismiss
-  loop headlessly, and the planner is the seam already eye-verified on Metal. A launched
+  An `ask <intent>` now goes all the way through Aura: the `Shell` holds a `Box<dyn Planner + Send>`
+  (the LLM with a GGUF, the `RulePlanner` without) and plans the intent into capability-checked
+  tool calls on a worker thread (so a slow model decode never hitches the render loop; the band
+  shows a `planning` indicator meanwhile and the tick picks the plan up when it lands, an epoch
+  dropping a cancelled or superseded one), draws them as a pending `Proposal` (the steps and the
+  capabilities each needs, held or missing), and on the confirm Enter grants the missing
+  capabilities and runs the plan through the broker (`Aura::approve_and_execute`), re-summarizing
+  so Aura's brokered uses show in the same surface; five Shell `shell_tests` drive the
+  ask/plan/confirm/dismiss/cancel loop headlessly, and the planner is the seam already eye-verified
+  on Metal. A launched
   client now runs confined in a
   Cell, not a plain spawn: `bind_host_system` for libraries, the compositor's Wayland socket
   bound in at the one path the client's env points at, an empty network namespace (a Wayland
@@ -2052,15 +2087,18 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   `ask <intent>` to plan and broker a request through Aura, drawn with a live caret and the
   resolved hint, fed by the compositor's `ShellEvent::Key` when no client is focused; parser,
   resolver, palette buffer, and rendering are all headless-tested. An `ask` plans the intent
-  (the LLM with a model, the `RulePlanner` without) into capability-checked tool calls and
-  draws them as a pending `Proposal` (each step's effect and the capabilities it needs, held
-  or missing); the confirm Enter grants the missing capabilities and runs the plan through
-  the broker (`Aura::approve_and_execute`), so the access lands in the same audit surface,
-  while the broker still refuses anything outside the granted scope. The `Proposal` is plain
-  data the horizon `Shell` builds from `aura::Preview`, so Glass renders it without depending
-  on the model engine; the band rendering, the `Proposal` folding, and the executor confirm
-  are headless-tested, the Shell ask/confirm loop is proven in three container `shell_tests`,
-  and the band itself was eye-verified through the pixman raster path. A client launched from
+  (the LLM with a model, the `RulePlanner` without) into capability-checked tool calls on a
+  worker thread, so a slow model decode never hitches the desktop: the band shows a `planning`
+  indicator while it decodes and the render-loop tick picks the plan up when it lands (an epoch
+  drops a cancelled or superseded ask), then draws them as a pending `Proposal` (each step's
+  effect and the capabilities it needs, held or missing); the confirm Enter grants the missing
+  capabilities and runs the plan through the broker (`Aura::approve_and_execute`), so the access
+  lands in the same audit surface, while the broker still refuses anything outside the granted
+  scope. The `Proposal` is plain data the horizon `Shell` builds from `aura::Preview`, so Glass
+  renders it without depending on the model engine; the band rendering, the `Proposal` folding,
+  and the executor confirm are headless-tested, the Shell ask/plan/confirm/cancel loop is proven
+  in five container `shell_tests`, and the band itself was eye-verified through the pixman raster
+  path. A client launched from
   the palette now runs confined in a Cell (only the Wayland socket reaches in, the net
   namespace is empty, no host data), with the cell construction and a connect through the
   bound socket asserted headlessly. The live on-screen interaction is the eye-verify on a
