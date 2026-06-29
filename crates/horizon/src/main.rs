@@ -213,6 +213,11 @@ enum CompositorOp {
         /// Window to summarize for the background Glass surface, in days
         #[arg(long, default_value_t = 7)]
         days: u64,
+        /// GGUF instruct model the intent bar's `ask` command plans with (needs
+        /// the aura-llama backend); falls back to HORIZON_PLAN_MODEL, then to the
+        /// deterministic RulePlanner
+        #[arg(long)]
+        plan_model: Option<PathBuf>,
     },
     /// Drive a real display directly off the GPU (DRM/KMS) with libinput input.
     /// This is the bare-metal path: run it from a console, not nested. Needs a
@@ -226,6 +231,11 @@ enum CompositorOp {
         /// Window to summarize for the background Glass surface, in days
         #[arg(long, default_value_t = 7)]
         days: u64,
+        /// GGUF instruct model the intent bar's `ask` command plans with (needs
+        /// the aura-llama backend); falls back to HORIZON_PLAN_MODEL, then to the
+        /// deterministic RulePlanner
+        #[arg(long)]
+        plan_model: Option<PathBuf>,
     },
     /// Drive a real display through KMS with no GPU: composite in software (pixman)
     /// into a DRM dumb buffer and page-flip it. Runs where the GPU path cannot,
@@ -240,6 +250,11 @@ enum CompositorOp {
         /// Window to summarize for the background Glass surface, in days
         #[arg(long, default_value_t = 7)]
         days: u64,
+        /// GGUF instruct model the intent bar's `ask` command plans with (needs
+        /// the aura-llama backend); falls back to HORIZON_PLAN_MODEL, then to the
+        /// deterministic RulePlanner
+        #[arg(long)]
+        plan_model: Option<PathBuf>,
     },
 }
 
@@ -1386,15 +1401,23 @@ fn compositor_cmd(op: CompositorOp) -> Result<()> {
             days,
         } => compositor_screenshot(&out, seconds, background.as_deref(), days),
         #[cfg(feature = "compositor-winit")]
-        CompositorOp::Show { background, days } => {
-            compositor_show(background.as_deref(), days, None)
-        }
+        CompositorOp::Show {
+            background,
+            days,
+            plan_model,
+        } => compositor_show(background.as_deref(), days, plan_model, None),
         #[cfg(feature = "compositor-udev")]
-        CompositorOp::Drm { background, days } => compositor_drm(background.as_deref(), days, None),
+        CompositorOp::Drm {
+            background,
+            days,
+            plan_model,
+        } => compositor_drm(background.as_deref(), days, plan_model, None),
         #[cfg(feature = "compositor-softdrm")]
-        CompositorOp::Softdrm { background, days } => {
-            compositor_softdrm(background.as_deref(), days, None)
-        }
+        CompositorOp::Softdrm {
+            background,
+            days,
+            plan_model,
+        } => compositor_softdrm(background.as_deref(), days, plan_model, None),
     }
 }
 
@@ -1554,7 +1577,12 @@ fn write_ppm(path: &Path, frame: &compositor::RenderedFrame) -> io::Result<()> {
 // window (`take_shell_click`); the Shell maps it through the scene's hit targets
 // (Scene::action_at) to the grant and severs it, exactly as `glass sever` does.
 #[cfg(all(target_os = "linux", feature = "compositor-winit"))]
-fn compositor_show(background: Option<&Path>, days: u64, master: Option<[u8; 32]>) -> Result<()> {
+fn compositor_show(
+    background: Option<&Path>,
+    days: u64,
+    plan_model: Option<PathBuf>,
+    master: Option<[u8; 32]>,
+) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -1568,13 +1596,22 @@ fn compositor_show(background: Option<&Path>, days: u64, master: Option<[u8; 32]
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) =
-                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
+            let planner = aura_planner(plan_model)?;
+            let (shell, rgba) = Shell::open(
+                store,
+                days,
+                ow as u32,
+                oh as u32,
+                &socket,
+                master.as_ref(),
+                planner,
+            )?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
-                 capability; with no window focused, type a command: launch <app>, sever \
-                 <name>, or any text to filter; refreshes live as the audit log changes)",
+                 capability; with no window focused, type a command: ask <intent> to plan and \
+                 broker through Aura, launch <app>, sever <name>, or any text to filter; \
+                 refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -1684,17 +1721,96 @@ fn client_cell(host_sock: &Path) -> cells::Cell {
         .bind_rw(host_sock, cell_wayland_socket())
 }
 
+// Map Aura's capability-checked preview into the plain-data proposal Glass draws,
+// the one place the model engine's types meet the surface's. Glass stays unaware
+// of `aura`: it renders this and derives the confirm line from it (and tests
+// that), while the per-step facts (which tool, what it would touch, which
+// capabilities are held vs missing) are translated here. A hard block (an unknown
+// tool or bad arguments) is carried on the step; a merely-missing capability
+// rides on the needs, and a destructive-needs-confirm is implied by the effect,
+// so `glass::Proposal::new` can fold readiness the same way the preview does.
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
+fn proposal_from(intent: &str, preview: &aura::Preview) -> glass::Proposal {
+    let steps = preview
+        .steps
+        .iter()
+        .map(|s| {
+            let needs = s
+                .needs
+                .iter()
+                .map(|n| glass::ProposalNeed {
+                    resource: n.resource.to_string(),
+                    rights: n.rights.to_string(),
+                    held: n.is_held(),
+                })
+                .collect();
+            let block = match &s.block {
+                Some(aura::Block::UnknownTool) => Some("unknown tool".to_string()),
+                Some(aura::Block::BadArgs(e)) => Some(format!("bad arguments: {e}")),
+                // NeedsCapability rides on the needs; NeedsConfirmation is implied
+                // by the destructive effect; neither is a hard block here.
+                _ => None,
+            };
+            glass::ProposalStep {
+                tool: s.tool.clone(),
+                rationale: s.rationale.clone(),
+                effect: s.effect.map(|e| e.label()).unwrap_or("?").to_string(),
+                needs,
+                block,
+            }
+        })
+        .collect();
+    glass::Proposal::new(intent, steps)
+}
+
+// A one-line summary of an executed plan for the palette feedback row: how many
+// steps ran, and either the first reason a step did not (blocked or failed) or the
+// last step's outcome. The full per-step report goes to stdout (the dev log).
+#[cfg(all(target_os = "linux", feature = "compositor-shell"))]
+fn report_summary(report: &aura::Report) -> String {
+    let total = report.results.len();
+    if total == 0 {
+        return "nothing to run".to_string();
+    }
+    let ran = report.ran();
+    let problem = report.results.iter().find_map(|r| match &r.status {
+        aura::StepStatus::Blocked(b) => Some(b.reason()),
+        aura::StepStatus::Failed(e) => Some(e.clone()),
+        aura::StepStatus::Done(_) => None,
+    });
+    match problem {
+        Some(reason) => format!("ran {ran}/{total} steps ({reason})"),
+        None => {
+            let last = report
+                .results
+                .last()
+                .and_then(|r| match &r.status {
+                    aura::StepStatus::Done(o) => Some(o.summary()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            format!("ran {ran}/{total} steps: {last}")
+        }
+    }
+}
+
 // The interactive Glass shell behind an on-screen backend. It holds the broker,
-// the window it summarizes, the cached model, the Aura command palette, and the
-// last scene it drew. A pointer click resolves against the scene's hit targets and
-// severs through Glass; keystrokes (which the compositor routes here when no client
-// holds focus) edit the palette, and Enter runs an Aura command: launch a client,
-// sever the channels matching a name, or filter the view. It also refreshes on a
-// periodic tick: the broker is opened once and would not otherwise see appends
-// another process makes to the store, so each poll re-reads the audit log and
-// redraws when it changed. Shared by the winit (`show`) and bare-metal (`drm`)
-// backends. The model is cached so a typed line resolves against it without a store
-// read per keystroke; it is rebuilt whenever the broker state changes.
+// the window it summarizes, the cached model, the Aura command palette, the
+// planner, and the last scene it drew. A pointer click resolves against the
+// scene's hit targets and severs through Glass; keystrokes (which the compositor
+// routes here when no client holds focus) edit the palette, and Enter runs a
+// command: launch a client, sever the channels matching a name, filter the view,
+// or `ask <intent>` to hand a natural-language line to Aura. An ask plans the
+// intent (the planner seam: the LLM with a model, the RulePlanner without),
+// previews the capabilities the plan needs, and shows it as a pending proposal;
+// the next Enter confirms, granting the missing capabilities and running the plan
+// through the broker, so the access lands in the audit log this same surface
+// shows. It also refreshes on a periodic tick: the broker is opened once and
+// would not otherwise see appends another process makes to the store, so each
+// poll re-reads the audit log and redraws when it changed. Shared by the winit
+// (`show`) and bare-metal (`drm`) backends. The model is cached so a typed line
+// resolves against it without a store read per keystroke; it is rebuilt whenever
+// the broker state changes.
 #[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 struct Shell {
     broker: Broker,
@@ -1704,6 +1820,15 @@ struct Shell {
     scene: glass::Scene,
     width: u32,
     height: u32,
+    // Turns an `ask` intent into a plan of catalog tool calls: the LLM over a
+    // GGUF when one was named (with the aura-llama backend), else the
+    // deterministic RulePlanner. The executor is built per-ask over the broker.
+    planner: Box<dyn aura::Planner>,
+    // The plan a pending proposal would run, kept between the ask (which plans and
+    // previews) and the confirm (which brokers it). None when nothing is pending,
+    // and None for a proposal the planner could not produce (which only shows a
+    // reason and dismisses on the next key).
+    pending: Option<aura::Plan>,
     // WAYLAND_DISPLAY a launched client connects back to (this compositor).
     wayland_display: String,
     // The host XDG_RUNTIME_DIR the compositor's socket lives under, used to find
@@ -1720,8 +1845,9 @@ struct Shell {
 #[cfg(all(target_os = "linux", feature = "compositor-shell"))]
 impl Shell {
     // Open a store's Glass shell at a surface size, rendering the first frame.
-    // `wayland_display` is the socket a launched client connects back to. Returns
-    // the shell and the RGBA to set as the background.
+    // `wayland_display` is the socket a launched client connects back to, and
+    // `planner` is the Aura planner an `ask` command runs under. Returns the
+    // shell and the RGBA to set as the background.
     fn open(
         store: &Path,
         days: u64,
@@ -1729,6 +1855,7 @@ impl Shell {
         height: u32,
         wayland_display: &str,
         key: Option<&[u8; 32]>,
+        planner: Box<dyn aura::Planner>,
     ) -> Result<(Shell, Vec<u8>)> {
         // The compositor sets XDG_RUNTIME_DIR before opening the shell (its own
         // socket lives under it); the launch path needs it to find that socket on
@@ -1754,6 +1881,8 @@ impl Shell {
                 scene,
                 width,
                 height,
+                planner,
+                pending: None,
                 wayland_display: wayland_display.to_string(),
                 host_runtime,
                 children: Vec::new(),
@@ -1813,6 +1942,21 @@ impl Shell {
     // moving is a visible change, so every key returns a fresh frame.
     fn key(&mut self, key: compositor::ShellKey) -> Option<Vec<u8>> {
         use compositor::ShellKey;
+        // A pending Aura proposal captures Enter (confirm and run) and Escape
+        // (dismiss). Any other key abandons the proposal but keeps the line, so
+        // the user can edit the intent and ask again.
+        if self.palette.proposal.is_some() {
+            match key {
+                ShellKey::Enter => self.confirm(),
+                ShellKey::Escape => self.dismiss_proposal(),
+                _ => {
+                    self.palette.proposal = None;
+                    self.pending = None;
+                    return self.key(key);
+                }
+            }
+            return Some(self.relayout());
+        }
         match key {
             ShellKey::Char(c) => {
                 self.palette.insert(c);
@@ -1847,6 +1991,7 @@ impl Shell {
         let r = glass::resolve(&glass::parse(&self.palette.input), &self.model);
         match r.action {
             glass::PaletteAction::None => {}
+            glass::PaletteAction::Ask(intent) => self.propose(&intent),
             glass::PaletteAction::Launch(cmd) => {
                 match self.launch(&cmd) {
                     Ok(()) => {
@@ -1878,6 +2023,95 @@ impl Shell {
                 self.palette.filter = None;
             }
         }
+    }
+
+    // Plan an `ask` intent and show it as a pending proposal (the first Enter on
+    // an ask). The planner turns the intent into a plan of catalog tool calls,
+    // the executor previews the capabilities each step needs (which Aura holds,
+    // which are missing), and that preview becomes the `glass::Proposal` the band
+    // draws; the plan is kept in `pending` for the confirm. Nothing is granted or
+    // run here: this is the disclosure, the next Enter is the approval. A planner
+    // that cannot serve the intent yields a failed proposal (a reason to show, no
+    // plan to run). Planning may block the render loop briefly while a model
+    // decodes; an idle desktop only pays it on an ask, and a background planner is
+    // a later refinement.
+    fn propose(&mut self, intent: &str) {
+        let planned = {
+            let aura = aura::Aura::new(&mut self.broker);
+            match aura.plan(self.planner.as_ref(), intent) {
+                Ok(plan) => {
+                    let proposal = proposal_from(intent, &aura.preview(&plan));
+                    Ok((plan, proposal))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        match planned {
+            Ok((plan, proposal)) => {
+                println!("aura: planned {} step(s) for {intent:?}", plan.steps.len());
+                self.palette.message = proposal.confirm_hint();
+                self.palette.filter = None;
+                self.palette.proposal = Some(proposal);
+                self.pending = Some(plan);
+            }
+            Err(e) => {
+                eprintln!("aura: could not plan {intent:?}: {e}");
+                let proposal = glass::Proposal::failed(intent, e);
+                self.palette.message = proposal.confirm_hint();
+                self.palette.proposal = Some(proposal);
+                self.pending = None;
+            }
+        }
+    }
+
+    // Confirm a pending proposal (the second Enter on an ask): grant the missing
+    // capabilities the preview disclosed and run the plan through the broker, with
+    // destructive steps confirmed (the same Enter). The user pressing this is the
+    // broker's "yes", the authority the model never has; every step is still
+    // brokered and audited, and a reach outside the granted scope is still
+    // refused. Then re-summarize the store so the new grants and uses show in this
+    // same surface, and clear the line. A failed proposal has no plan, so the
+    // confirm just dismisses it.
+    fn confirm(&mut self) {
+        let plan = match self.pending.take() {
+            Some(plan) => plan,
+            None => {
+                self.dismiss_proposal();
+                return;
+            }
+        };
+        let outcome = {
+            let mut aura = aura::Aura::new(&mut self.broker);
+            aura.approve_and_execute(&plan, Limits::none())
+        };
+        let message = match outcome {
+            Ok(report) => {
+                let summary = report_summary(&report);
+                println!("aura: {summary}");
+                if let Err(e) = self.reload_model() {
+                    eprintln!("compositor: store reload failed: {e}");
+                }
+                summary
+            }
+            Err(e) => {
+                eprintln!("aura: execute failed: {e}");
+                format!("Aura failed: {e}")
+            }
+        };
+        self.palette.clear();
+        self.palette.filter = None;
+        self.preview();
+        self.palette.message = message;
+    }
+
+    // Drop a pending proposal and reset the line to idle (Escape on an ask, or
+    // confirming a failed one). `clear` also drops the proposal; `preview` resets
+    // the hint from the now-empty line.
+    fn dismiss_proposal(&mut self) {
+        self.pending = None;
+        self.palette.clear();
+        self.palette.filter = None;
+        self.preview();
     }
 
     // Launch a Wayland client confined in a Cell connected to this compositor (see
@@ -1963,7 +2197,12 @@ impl Shell {
 // monitor it sits at the top-left, the same single-scene limitation the rest of
 // the DRM backend has.
 #[cfg(all(target_os = "linux", feature = "compositor-udev"))]
-fn compositor_drm(background: Option<&Path>, days: u64, master: Option<[u8; 32]>) -> Result<()> {
+fn compositor_drm(
+    background: Option<&Path>,
+    days: u64,
+    plan_model: Option<PathBuf>,
+    master: Option<[u8; 32]>,
+) -> Result<()> {
     compositor_ensure_runtime_dir()?;
 
     let mut comp = compositor::Compositor::new().context("start compositor")?;
@@ -1978,13 +2217,22 @@ fn compositor_drm(background: Option<&Path>, days: u64, master: Option<[u8; 32]>
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) =
-                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
+            let planner = aura_planner(plan_model)?;
+            let (shell, rgba) = Shell::open(
+                store,
+                days,
+                ow as u32,
+                oh as u32,
+                &socket,
+                master.as_ref(),
+                planner,
+            )?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
-                 capability; with no window focused, type a command: launch <app>, sever \
-                 <name>, or any text to filter; refreshes live as the audit log changes)",
+                 capability; with no window focused, type a command: ask <intent> to plan and \
+                 broker through Aura, launch <app>, sever <name>, or any text to filter; \
+                 refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -2016,6 +2264,7 @@ fn compositor_drm(background: Option<&Path>, days: u64, master: Option<[u8; 32]>
 fn compositor_softdrm(
     background: Option<&Path>,
     days: u64,
+    plan_model: Option<PathBuf>,
     master: Option<[u8; 32]>,
 ) -> Result<()> {
     compositor_ensure_runtime_dir()?;
@@ -2032,13 +2281,22 @@ fn compositor_softdrm(
     let (ow, oh) = comp.output_size();
     let mut shell = match background {
         Some(store) => {
-            let (shell, rgba) =
-                Shell::open(store, days, ow as u32, oh as u32, &socket, master.as_ref())?;
+            let planner = aura_planner(plan_model)?;
+            let (shell, rgba) = Shell::open(
+                store,
+                days,
+                ow as u32,
+                oh as u32,
+                &socket,
+                master.as_ref(),
+                planner,
+            )?;
             comp.set_shell_background(&rgba, ow, oh);
             println!(
                 "compositor: Glass shell background from {} (click `sever` to revoke a \
-                 capability; with no window focused, type a command: launch <app>, sever \
-                 <name>, or any text to filter; refreshes live as the audit log changes)",
+                 capability; with no window focused, type a command: ask <intent> to plan and \
+                 broker through Aura, launch <app>, sever <name>, or any text to filter; \
+                 refreshes live as the audit log changes)",
                 store.display()
             );
             Some(shell)
@@ -2700,7 +2958,7 @@ fn udev_coldplug() {}
 #[cfg(all(target_os = "linux", feature = "compositor-softdrm"))]
 fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
     println!("boot: launching the desktop (software DRM/KMS, no GPU)");
-    compositor_softdrm(Some(store), days, Some(master))
+    compositor_softdrm(Some(store), days, None, Some(master))
 }
 
 #[cfg(all(
@@ -2710,7 +2968,7 @@ fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
 ))]
 fn launch_drm(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
     println!("boot: launching the desktop (bare-metal DRM/KMS)");
-    compositor_drm(Some(store), days, Some(master))
+    compositor_drm(Some(store), days, None, Some(master))
 }
 
 #[cfg(not(all(
@@ -2729,7 +2987,7 @@ fn launch_drm(_store: &Path, _days: u64, _master: [u8; 32]) -> Result<()> {
 #[cfg(all(target_os = "linux", feature = "compositor-winit"))]
 fn launch_nested(store: &Path, days: u64, master: [u8; 32]) -> Result<()> {
     println!("boot: launching the desktop (nested winit session)");
-    compositor_show(Some(store), days, Some(master))
+    compositor_show(Some(store), days, None, Some(master))
 }
 
 #[cfg(not(all(target_os = "linux", feature = "compositor-winit")))]
@@ -3260,5 +3518,135 @@ mod client_cell_tests {
             "confined client could not reach the socket (code {:?})",
             status.code
         );
+    }
+}
+
+// The Aura command palette's plan/confirm state machine, headlessly. The Shell's
+// key/propose/confirm methods are pure compute plus broker I/O (the display is the
+// outer loop's job), so the whole ask -> propose -> confirm -> broker -> audit loop
+// is driven here with no screen, the same split the click-to-sever and key-routing
+// tests use. The RulePlanner stands in for the LLM at the planner seam, exactly as
+// in the executor's own tests; the LLM is the drop-in upgrade eye-verified on Metal.
+#[cfg(all(test, target_os = "linux", feature = "compositor-shell"))]
+mod shell_tests {
+    use super::*;
+    use compositor::ShellKey;
+
+    // A Shell over a fresh store opened on a known master (no passphrase prompt),
+    // driven by the deterministic RulePlanner. Returns the shell and a workdir
+    // holding one file for a read intent to act on.
+    fn shell(dir: &Path) -> (Shell, PathBuf) {
+        let store = dir.join("store");
+        let master = [5u8; 32];
+        Lifestream::init(&store, &master).unwrap();
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("hosts.txt"), "127.0.0.1 localhost\n").unwrap();
+        // Shell::open needs a runtime dir on disk (the launch path binds the socket
+        // from under it); these tests never launch, so the temp dir serves.
+        std::env::set_var("XDG_RUNTIME_DIR", dir);
+        let planner: Box<dyn aura::Planner> = Box::new(aura::RulePlanner);
+        let (shell, _rgba) =
+            Shell::open(&store, 7, 1200, 800, "wayland-test", Some(&master), planner).unwrap();
+        (shell, work)
+    }
+
+    fn type_line(shell: &mut Shell, s: &str) {
+        for c in s.chars() {
+            shell.key(ShellKey::Char(c));
+        }
+    }
+
+    fn has_use(shell: &mut Shell) -> bool {
+        shell
+            .broker
+            .audit()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.event, weave::Event::Use { .. }))
+    }
+
+    #[test]
+    fn ask_proposes_then_confirm_brokers_and_audits() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, work) = shell(dir.path());
+
+        // First Enter on an ask: plan and show a pending proposal, run nothing.
+        type_line(
+            &mut shell,
+            &format!("ask read {}", work.join("hosts.txt").display()),
+        );
+        shell.key(ShellKey::Enter);
+        let proposal = shell.palette.proposal.as_ref().expect("a pending proposal");
+        assert_eq!(proposal.steps.len(), 1);
+        assert_eq!(
+            proposal.missing_count(),
+            1,
+            "the read needs one capability it lacks"
+        );
+        assert!(shell.pending.is_some());
+        assert!(
+            !has_use(&mut shell),
+            "nothing is brokered before the confirm"
+        );
+
+        // Second Enter: grant the missing capability and run; the read lands in the
+        // audit log this same surface shows.
+        shell.key(ShellKey::Enter);
+        assert!(
+            shell.palette.proposal.is_none(),
+            "the proposal clears after running"
+        );
+        assert!(shell.pending.is_none());
+        let audit = shell.broker.audit().unwrap();
+        assert!(audit
+            .iter()
+            .any(|e| matches!(e.event, weave::Event::Grant { .. })));
+        assert!(audit
+            .iter()
+            .any(|e| matches!(e.event, weave::Event::Use { .. })));
+        // The model the surface redraws now carries Aura's brokered channel.
+        assert!(shell
+            .model
+            .principals
+            .iter()
+            .any(|p| p.principal.0 == aura::PRINCIPAL));
+    }
+
+    #[test]
+    fn escape_dismisses_a_pending_proposal_without_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, work) = shell(dir.path());
+        type_line(
+            &mut shell,
+            &format!("ask read {}", work.join("hosts.txt").display()),
+        );
+        shell.key(ShellKey::Enter);
+        assert!(shell.palette.proposal.is_some());
+
+        shell.key(ShellKey::Escape);
+        assert!(
+            shell.palette.proposal.is_none(),
+            "Escape dismisses the proposal"
+        );
+        assert!(shell.pending.is_none());
+        assert!(shell.palette.input.is_empty(), "and clears the line");
+        assert!(!has_use(&mut shell), "nothing was brokered");
+    }
+
+    #[test]
+    fn an_unplannable_intent_shows_a_failed_proposal_that_runs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut shell, _work) = shell(dir.path());
+        type_line(&mut shell, "ask teleport to mars");
+        shell.key(ShellKey::Enter);
+        let proposal = shell.palette.proposal.as_ref().expect("a failed proposal");
+        assert!(proposal.failed.is_some(), "the planner could not serve it");
+        assert!(shell.pending.is_none(), "nothing to run");
+
+        // The next Enter just dismisses it; still nothing brokered.
+        shell.key(ShellKey::Enter);
+        assert!(shell.palette.proposal.is_none());
+        assert!(!has_use(&mut shell));
     }
 }

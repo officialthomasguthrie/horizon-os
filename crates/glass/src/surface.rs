@@ -14,11 +14,16 @@
 
 use weave::GrantId;
 
-use crate::aura::{self, Palette};
+use crate::aura::{self, Palette, Proposal};
 use crate::model::{Channel, ChannelStatus, Model, PrincipalView};
 
 // One bitmap glyph is 8x8; everything sizes off this.
 pub const GLYPH: i32 = 8;
+
+// How many plan steps a pending proposal draws before collapsing the rest into a
+// "+k more" line, so a long plan cannot grow the band off the screen. The
+// standard file plans are one step, so this only bounds a pathological one.
+const PROPOSAL_MAX_STEPS: usize = 6;
 
 // An RGBA color. Opaque unless an alpha is given, for the few translucent
 // overlays (the header band, the dimmed chrome).
@@ -201,10 +206,12 @@ pub fn layout(model: &Model, palette: &Palette, width: u32, height: u32, scale: 
     let scale = scale.max(1) as i32;
     let mut s = Surface::new(width as i32, height as i32, scale);
 
-    // Reserve the palette band at the very bottom (two rows: the input line and a
-    // feedback line under it) and lay the rest out above it.
+    // Reserve the palette band at the very bottom and lay the rest out above it.
+    // It is the input line plus one or more rows below: the one-line feedback
+    // normally, or a pending Aura proposal (its steps, their capabilities, and a
+    // confirm line), which grows the band upward into the room above.
     let pad = 3 * scale;
-    let band_h = 2 * s.line + 2 * pad;
+    let band_h = 2 * pad + (1 + band_below_rows(palette)) * s.line;
     let band_y = s.height - s.margin / 2 - band_h;
 
     let mut y = s.margin;
@@ -435,10 +442,32 @@ fn channel(s: &mut Surface, c: &Channel, y: i32) -> i32 {
     y
 }
 
+// The number of text rows the band draws below the input row: one for the
+// feedback line normally, or, when a proposal is pending, one per step plus one
+// per capability it needs plus the confirm line (a failed proposal is just its
+// one reason row). Sizing and drawing read this the same way so the band fits.
+fn band_below_rows(palette: &Palette) -> i32 {
+    match &palette.proposal {
+        None => 1,
+        Some(p) if p.failed.is_some() => 1,
+        Some(p) => {
+            let shown = p.steps.len().min(PROPOSAL_MAX_STEPS);
+            let mut rows = 0;
+            for st in p.steps.iter().take(shown) {
+                rows += 1 + st.needs.len() as i32;
+            }
+            if p.steps.len() > shown {
+                rows += 1; // the "+k more steps" line
+            }
+            rows + 1 // the confirm line
+        }
+    }
+}
+
 // The Aura command palette at the bottom: an input row (prompt, the typed line,
-// and a caret at the cursor) and a feedback row under it (the palette's message,
-// or the idle hint when it has none). The text is fixed width, so the caret sits
-// at the cursor's character column.
+// and a caret at the cursor) and, under it, either a pending proposal or the
+// one-line feedback (the palette's message, or the idle hint when it has none).
+// The text is fixed width, so the caret sits at the cursor's character column.
 fn palette_band(s: &mut Surface, palette: &Palette, y: i32, h: i32) {
     s.rect(0, y, s.width, h, PANEL);
     s.rect(0, y, s.width, s.scale, RULE);
@@ -459,12 +488,70 @@ fn palette_band(s: &mut Surface, palette: &Palette, y: i32, h: i32) {
         ACCENT,
     );
 
-    let msg = if palette.message.trim().is_empty() {
-        aura::HINT_IDLE
-    } else {
-        palette.message.as_str()
-    };
-    s.text(s.margin, ty + s.line, DIM, msg);
+    match &palette.proposal {
+        Some(p) => proposal_rows(s, p, ty + s.line),
+        None => {
+            let msg = if palette.message.trim().is_empty() {
+                aura::HINT_IDLE
+            } else {
+                palette.message.as_str()
+            };
+            s.text(s.margin, ty + s.line, DIM, msg);
+        }
+    }
+}
+
+// Draw a pending plan under the input row: each step (its tool, effect, and the
+// model's rationale, amber when the step is hard-blocked), each capability it
+// needs indented beneath it (dim when held, amber when missing), and a final
+// confirm line stating what Enter does. A plan the planner could not produce is
+// just its reason in red. Sized by `band_below_rows`, so the band already fits.
+fn proposal_rows(s: &mut Surface, p: &Proposal, mut y: i32) {
+    if let Some(reason) = &p.failed {
+        s.text(s.margin, y, SEVERED, format!("Aura: {reason}"));
+        return;
+    }
+    let shown = p.steps.len().min(PROPOSAL_MAX_STEPS);
+    for (i, st) in p.steps.iter().take(shown).enumerate() {
+        let head = match &st.block {
+            Some(b) => format!(
+                "{}. {}  ({})  {} -- {b}",
+                i + 1,
+                st.tool,
+                st.effect,
+                st.rationale
+            ),
+            None => format!("{}. {}  ({})  {}", i + 1, st.tool, st.effect, st.rationale),
+        };
+        let color = if st.block.is_some() { BLOCKED } else { FG };
+        s.text(s.margin, y, color, head);
+        y += s.line;
+        for n in &st.needs {
+            let (mark, color) = if n.held {
+                ("held", DIM)
+            } else {
+                ("missing", BLOCKED)
+            };
+            s.text(
+                s.margin + 2 * s.cell,
+                y,
+                color,
+                format!("{}  {}  {mark}", n.resource, n.rights),
+            );
+            y += s.line;
+        }
+    }
+    if p.steps.len() > shown {
+        s.text(
+            s.margin,
+            y,
+            DIM,
+            format!("+{} more steps", p.steps.len() - shown),
+        );
+        y += s.line;
+    }
+    let foot = if p.destructive { SEVERED } else { ACCENT };
+    s.text(s.margin, y, foot, p.confirm_hint());
 }
 
 // Right-pad the cursor to a column (in cells) from the row's left edge, so the
@@ -588,10 +675,56 @@ mod tests {
             cursor: 10,
             message: "Enter to sever 1 channel".to_string(),
             filter: Some("mail".to_string()),
+            ..Palette::new()
         };
         let scene = layout(&demo_model(), &palette, 1200, 800, 2);
         assert!(has_text(&scene, "sever mail"));
         assert!(has_text(&scene, "Enter to sever 1 channel"));
+    }
+
+    #[test]
+    fn a_pending_proposal_draws_its_steps_needs_and_confirm() {
+        use crate::aura::{Proposal, ProposalNeed, ProposalStep};
+        let proposal = Proposal::new(
+            "read /etc/hosts",
+            vec![ProposalStep {
+                tool: "read_file".into(),
+                rationale: "read /etc/hosts".into(),
+                effect: "read".into(),
+                needs: vec![ProposalNeed {
+                    resource: "file:/etc/hosts".into(),
+                    rights: "r".into(),
+                    held: false,
+                }],
+                block: None,
+            }],
+        );
+        let palette = Palette {
+            input: "ask read /etc/hosts".to_string(),
+            cursor: 19,
+            proposal: Some(proposal),
+            ..Palette::new()
+        };
+        let scene = layout(&demo_model(), &palette, 1200, 800, 2);
+        // The typed intent, the tool, the needed (missing) capability, and the
+        // confirm line all appear in the band.
+        assert!(has_text(&scene, "ask read /etc/hosts"));
+        assert!(has_text(&scene, "read_file"));
+        assert!(has_text(&scene, "file:/etc/hosts"));
+        assert!(has_text(&scene, "missing"));
+        assert!(has_text(&scene, "approve 1 capability"));
+    }
+
+    #[test]
+    fn a_failed_proposal_draws_its_reason() {
+        let palette = Palette {
+            input: "ask teleport".to_string(),
+            cursor: 12,
+            proposal: Some(crate::aura::Proposal::failed("teleport", "no such verb")),
+            ..Palette::new()
+        };
+        let scene = layout(&demo_model(), &palette, 1000, 700, 2);
+        assert!(has_text(&scene, "no such verb"));
     }
 
     #[test]

@@ -14,8 +14,9 @@ use weave::GrantId;
 use crate::model::{Channel, Model, PrincipalView};
 
 // The hint shown when nothing is typed: the verbs on offer. Also the line the
-// surface falls back to when the palette has no message of its own.
-pub const HINT_IDLE: &str = "type to filter   launch <app>   sever <name>   help";
+// surface falls back to when the palette has no message of its own. `ask` leads
+// because it is the headline: a natural-language intent Aura plans and brokers.
+pub const HINT_IDLE: &str = "ask <intent>   launch <app>   sever <name>   type to filter   help";
 
 /// A command parsed from the palette input: a verb and its argument. Pure string
 /// work with no Model, so it is tested on its own.
@@ -23,6 +24,12 @@ pub const HINT_IDLE: &str = "type to filter   launch <app>   sever <name>   help
 pub enum Command {
     /// Nothing actionable typed (empty or whitespace only).
     Empty,
+    /// Hand a natural-language intent to Aura: `ask <intent>` (also `do`).
+    /// Glass cannot plan it (the model lives in the shell), so this only carries
+    /// the intent text out; the shell runs the planner, previews the
+    /// capabilities, and brokers the plan on confirm. ("aura" is not a verb: it
+    /// is the principal's own name, so it stays usable as a filter query.)
+    Ask(String),
     /// Launch an app: `launch <cmd>`, `run <cmd>`, or `open <cmd>`.
     Launch(String),
     /// Sever the live channels matching a query: `sever <query>` (also `revoke`,
@@ -47,6 +54,7 @@ pub fn parse(line: &str) -> Command {
         None => (trimmed, ""),
     };
     match verb {
+        "ask" | "do" => Command::Ask(rest.to_string()),
         "launch" | "run" | "open" => Command::Launch(rest.to_string()),
         "sever" | "revoke" | "kill" => Command::Sever(rest.to_string()),
         "help" | "?" => Command::Help,
@@ -61,6 +69,12 @@ pub fn parse(line: &str) -> Command {
 pub enum PaletteAction {
     /// Nothing to commit (empty, help, a bare filter, or no match).
     None,
+    /// Hand this intent to Aura: the shell runs the planner, previews the
+    /// capabilities the plan needs, and (on confirm) executes through the
+    /// broker. Glass only classifies the line; the plan and the brokering live
+    /// in the shell, the same way [`PaletteAction::Launch`] hands a command
+    /// line out to be spawned.
+    Ask(String),
     /// Spawn this command line as a client (ideally confined in a Cell).
     Launch(String),
     /// Revoke these grants, one Glass sever each.
@@ -93,10 +107,26 @@ pub fn resolve(cmd: &Command, model: &Model) -> Resolved {
         Command::Help => Resolved {
             action: PaletteAction::None,
             filter: None,
-            hint: "launch <app> spawns a client   sever <name> revokes matching channels   \
-                   any other text filters the view"
+            hint: "ask <intent> plans and brokers through Aura   launch <app> spawns a client   \
+                   sever <name> revokes matching channels   any other text filters the view"
                 .to_string(),
         },
+        Command::Ask(intent) => {
+            let intent = intent.trim();
+            if intent.is_empty() {
+                Resolved {
+                    action: PaletteAction::None,
+                    filter: None,
+                    hint: "ask: say what you want Aura to do".to_string(),
+                }
+            } else {
+                Resolved {
+                    action: PaletteAction::Ask(intent.to_string()),
+                    filter: None,
+                    hint: format!("Enter to ask Aura: {intent}"),
+                }
+            }
+        }
         Command::Launch(program) => {
             let program = program.trim();
             if program.is_empty() {
@@ -204,6 +234,143 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     }
 }
 
+/// A plan Aura has proposed for an `ask` intent, reduced to what the surface
+/// draws and the palette holds while it awaits a confirm. The shell builds this
+/// from `aura::Preview` (which it cannot expose here without coupling Glass to
+/// the model engine), so this is plain data: Glass renders it and computes the
+/// confirm line from it, but never produces it. A confirm grants the missing
+/// capabilities and runs the plan through the broker; an Esc dismisses it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Proposal {
+    /// The natural-language intent the plan came from.
+    pub intent: String,
+    /// The tool calls the plan would make, in order.
+    pub steps: Vec<ProposalStep>,
+    /// Every tool is known, its arguments parse, and every capability it needs
+    /// is already held: the plan runs as-is (a destructive step still wants the
+    /// confirm, which is the same Enter).
+    pub ready: bool,
+    /// At least one step mutates irreversibly (a move or a delete), so the
+    /// confirm is also the destructive confirmation.
+    pub destructive: bool,
+    /// Set when the planner could not turn the intent into a plan at all (an
+    /// intent it cannot serve, or no model in this build): there is nothing to
+    /// run, and the confirm just dismisses it.
+    pub failed: Option<String>,
+}
+
+/// One tool call in a [`Proposal`]: which tool, why, what it would touch, and
+/// the capabilities it needs (each marked held or missing).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalStep {
+    pub tool: String,
+    pub rationale: String,
+    /// The effect class: "read", "write", or "destructive".
+    pub effect: String,
+    /// The capabilities this step needs (resource + rights), each held or not.
+    pub needs: Vec<ProposalNeed>,
+    /// A hard reason the step cannot run (an unknown tool or bad arguments),
+    /// which approving a capability would not fix. A merely-missing capability
+    /// is carried on `needs`, not here.
+    pub block: Option<String>,
+}
+
+/// One capability a [`ProposalStep`] needs: the resource and rights, and whether
+/// Aura already holds a grant covering it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProposalNeed {
+    /// The resource, as Weave displays it (e.g. "file:/etc/hosts").
+    pub resource: String,
+    /// The rights over it, as Weave displays them (e.g. "r", "rw").
+    pub rights: String,
+    /// True when Aura already holds a capability covering this need.
+    pub held: bool,
+}
+
+impl Proposal {
+    /// A planned proposal from its steps; `ready` and `destructive` are folded
+    /// from them, so the shell hands over the per-step facts and Glass derives
+    /// the rest (and tests it).
+    pub fn new(intent: impl Into<String>, steps: Vec<ProposalStep>) -> Proposal {
+        let destructive = steps.iter().any(|s| s.effect == "destructive");
+        // Ready means nothing blocks the run: no hard block, and every need is
+        // held. A destructive-but-held step is still ready (the confirm covers
+        // it), exactly as `aura::Preview::ready` treats it.
+        let ready = steps
+            .iter()
+            .all(|s| s.block.is_none() && s.needs.iter().all(|n| n.held));
+        Proposal {
+            intent: intent.into(),
+            steps,
+            ready,
+            destructive,
+            failed: None,
+        }
+    }
+
+    /// A proposal the planner could not produce: nothing to run, only a reason
+    /// to show.
+    pub fn failed(intent: impl Into<String>, reason: impl Into<String>) -> Proposal {
+        Proposal {
+            intent: intent.into(),
+            steps: Vec::new(),
+            ready: false,
+            destructive: false,
+            failed: Some(reason.into()),
+        }
+    }
+
+    /// The distinct capabilities the plan needs that Aura does not hold yet, the
+    /// exact set a confirm would grant. De-duplicated by resource+rights, the way
+    /// the preview's own `missing()` is.
+    pub fn missing(&self) -> Vec<&ProposalNeed> {
+        let mut out: Vec<&ProposalNeed> = Vec::new();
+        for n in self.steps.iter().flat_map(|s| &s.needs) {
+            if !n.held
+                && !out
+                    .iter()
+                    .any(|m| m.resource == n.resource && m.rights == n.rights)
+            {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    pub fn missing_count(&self) -> usize {
+        self.missing().len()
+    }
+
+    /// Whether any step is hard-blocked (unknown tool or bad arguments), which a
+    /// capability grant would not fix.
+    pub fn has_hard_block(&self) -> bool {
+        self.steps.iter().any(|s| s.block.is_some())
+    }
+
+    /// The one-line prompt under the plan: what Enter will do and that Esc
+    /// cancels. Drives both the band footer and the palette message, so they
+    /// always agree.
+    pub fn confirm_hint(&self) -> String {
+        if let Some(reason) = &self.failed {
+            return format!("Aura could not plan that: {reason}   Esc to dismiss");
+        }
+        if self.has_hard_block() {
+            return "some steps cannot run   Enter to run what can   Esc to cancel".to_string();
+        }
+        let missing = self.missing_count();
+        if missing > 0 {
+            return format!(
+                "Enter to approve {missing} {} and run   Esc to cancel",
+                plural(missing, "capability", "capabilities")
+            );
+        }
+        if self.destructive {
+            return "destructive   Enter to confirm and run   Esc to cancel".to_string();
+        }
+        "Enter to run   Esc to cancel".to_string()
+    }
+}
+
 /// The command palette's editable state: the typed line, the text cursor (a char
 /// index into it), the feedback line under it, and the view filter it currently
 /// previews. The shell owns one, feeds it keystrokes, and re-resolves it after
@@ -215,6 +382,11 @@ pub struct Palette {
     pub cursor: usize,
     pub message: String,
     pub filter: Option<String>,
+    /// A plan Aura proposed for an `ask` intent, awaiting a confirm. While it is
+    /// set the surface draws it in place of the one-line feedback and the shell
+    /// routes Enter to running it; the shell sets and clears it (Glass cannot
+    /// produce one). None the rest of the time.
+    pub proposal: Option<Proposal>,
 }
 
 impl Palette {
@@ -273,11 +445,13 @@ impl Palette {
         self.cursor = self.len();
     }
 
-    /// Empty the input and reset the cursor. The caller resets the message and
+    /// Empty the input and reset the cursor, dropping any pending proposal (the
+    /// plan belongs to the line being cleared). The caller resets the message and
     /// filter (which it derives by re-resolving the now-empty line).
     pub fn clear(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.proposal = None;
     }
 
     // Byte offset of char index `i` (or the end), for editing a UTF-8 String by
@@ -312,6 +486,121 @@ mod tests {
         assert_eq!(parse("   "), Command::Empty);
         // An unknown verb is a bare filter query, keeping the whole text.
         assert_eq!(parse("api.example"), Command::Filter("api.example".into()));
+    }
+
+    #[test]
+    fn ask_parses_and_resolves_to_an_aura_intent() {
+        assert_eq!(
+            parse("ask what is in /etc/hosts"),
+            Command::Ask("what is in /etc/hosts".into())
+        );
+        assert_eq!(
+            parse("do find my notes"),
+            Command::Ask("find my notes".into())
+        );
+        // "aura" is the principal's name, not a verb: it stays a filter query.
+        assert_eq!(parse("aura"), Command::Filter("aura".into()));
+        let r = interpret("ask read /etc/hosts", &demo_model());
+        assert_eq!(r.action, PaletteAction::Ask("read /etc/hosts".into()));
+        assert!(r.hint.contains("read /etc/hosts"));
+        // An ask with no intent is inert, not an empty plan.
+        assert_eq!(interpret("ask", &demo_model()).action, PaletteAction::None);
+        assert_eq!(
+            interpret("ask   ", &demo_model()).action,
+            PaletteAction::None
+        );
+    }
+
+    fn need(resource: &str, rights: &str, held: bool) -> ProposalNeed {
+        ProposalNeed {
+            resource: resource.into(),
+            rights: rights.into(),
+            held,
+        }
+    }
+
+    fn step(tool: &str, effect: &str, needs: Vec<ProposalNeed>) -> ProposalStep {
+        ProposalStep {
+            tool: tool.into(),
+            rationale: format!("{tool} something"),
+            effect: effect.into(),
+            needs,
+            block: None,
+        }
+    }
+
+    #[test]
+    fn proposal_folds_ready_and_destructive_from_its_steps() {
+        // A read whose capability is missing: not ready, one to approve.
+        let p = Proposal::new(
+            "read /etc/hosts",
+            vec![step(
+                "read_file",
+                "read",
+                vec![need("file:/etc/hosts", "r", false)],
+            )],
+        );
+        assert!(!p.ready);
+        assert!(!p.destructive);
+        assert_eq!(p.missing_count(), 1);
+        assert!(p.confirm_hint().contains("approve 1 capability"));
+
+        // The same read with the capability held: ready, nothing to approve.
+        let held = Proposal::new(
+            "read /etc/hosts",
+            vec![step(
+                "read_file",
+                "read",
+                vec![need("file:/etc/hosts", "r", true)],
+            )],
+        );
+        assert!(held.ready);
+        assert_eq!(held.missing_count(), 0);
+        assert_eq!(held.confirm_hint(), "Enter to run   Esc to cancel");
+
+        // A destructive move with both capabilities held: ready, but the confirm
+        // is the destructive confirmation.
+        let mv = Proposal::new(
+            "move a to b",
+            vec![step(
+                "move_file",
+                "destructive",
+                vec![need("file:/a", "rw", true), need("file:/b", "w", true)],
+            )],
+        );
+        assert!(mv.ready);
+        assert!(mv.destructive);
+        assert!(mv.confirm_hint().contains("destructive"));
+    }
+
+    #[test]
+    fn proposal_dedups_missing_and_reports_hard_blocks() {
+        // Two steps needing the same capability count it once.
+        let p = Proposal::new(
+            "two reads",
+            vec![
+                step("read_file", "read", vec![need("file:/x", "r", false)]),
+                step("list_dir", "read", vec![need("file:/x", "r", false)]),
+            ],
+        );
+        assert_eq!(p.missing_count(), 1);
+
+        // A hard-blocked step (unknown tool) takes precedence in the hint.
+        let mut blocked = step("teleport", "read", vec![]);
+        blocked.block = Some("unknown tool".into());
+        let p = Proposal::new("teleport", vec![blocked]);
+        assert!(p.has_hard_block());
+        assert!(!p.ready);
+        assert!(p.confirm_hint().contains("cannot run"));
+    }
+
+    #[test]
+    fn a_failed_proposal_shows_its_reason() {
+        let p = Proposal::failed("teleport to mars", "no rule for \"teleport\"");
+        assert!(p.failed.is_some());
+        assert!(!p.ready);
+        assert_eq!(p.missing_count(), 0);
+        assert!(p.confirm_hint().contains("could not plan"));
     }
 
     #[test]

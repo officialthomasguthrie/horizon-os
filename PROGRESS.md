@@ -1899,6 +1899,53 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   multi-step intents (the grammar already admits multiple calls), the task-specific embedder prompt prefixes
   noted before, and the payoff both seams now enable, Aura as the Glass desktop's real command palette
   (wire `aura`'s `Planner` + executor into `glass::aura`, which already parses launch/sever/filter).
+- Phase 4 Aura command palette in Glass (`glass` + `aura` + `horizon`): the payoff both seams now enable.
+  The Glass desktop's intent line was a launcher (launch / sever / filter); it is now also Aura's real command
+  palette, so a typed `ask <intent>` (or `do <intent>`) becomes a plan of capability-checked tool calls,
+  previewed before anything runs and brokered through the Weave on confirm, with the access landing in the
+  same audit surface you are looking at. Three layers on the usual headless split. (1) `glass::aura` gains an
+  `Ask` command and a `PaletteAction::Ask` that only carries the intent text out: Glass cannot plan it (the
+  model lives in the binary, and coupling the transparency surface to the model engine would be the wrong
+  layering), so it classifies the line and hands the intent to the shell exactly as `Launch` hands out a
+  command line. It also gains a plain-data `Proposal` (its steps, each step's effect and the capabilities it
+  needs marked held or missing, plus `ready`/`destructive`/`missing` folded from them and a one-line
+  `confirm_hint`), which the shell builds from `aura::Preview` and the palette holds as the pending plan; Glass
+  renders it and derives the confirm line from it but never produces it, so it stays independent of `aura`.
+  ("aura" is not a verb: it is the principal's own name, so it stays a filter query, the one collision the
+  tests caught.) (2) `surface::layout` draws a pending proposal in a band that grows upward: the intent on the
+  input row, then each tool with its effect and the model's rationale (amber when a step is hard-blocked), each
+  capability indented beneath it (dim held, amber missing), and a confirm line (`Enter to approve N
+  capabilities and run   Esc to cancel`, red when destructive), in the same 8x8-font dev look as the rest of
+  the surface. (3) the horizon `Shell` ties it together: it holds a `Box<dyn aura::Planner>` (the LLM over a
+  GGUF when one is named, the deterministic `RulePlanner` otherwise, so the whole loop runs with no model) and
+  a pending `aura::Plan`. The first Enter on an `ask` plans the intent and previews the capabilities (the
+  disclosure, nothing granted or run); the next Enter confirms, and a new `Aura::approve_and_execute` grants
+  exactly the previewed-missing capabilities (the user, the authority here, is the broker's yes) and runs the
+  plan with destructive steps confirmed, then the model is re-summarized so Aura's brokered grant and uses
+  show in the surface; Escape or editing the line abandons the proposal. The capability model is intact: the
+  preview is the non-silent disclosure, the broker brokers and audits every step, a reach outside the granted
+  scope is still refused, and every grant is severable in Glass and every write restorable from a snapshot
+  (docs/05 scoped-previewed-audited-reversible, the same story `aura demo` tells, now interactive). The planner
+  is the same `Planner` seam already eye-verified on this Mac's Metal (`aura plan` / `aura demo --model`), so
+  it is the drop-in upgrade; planning runs synchronously in the render loop for now (an idle desktop pays it
+  only on an ask), with a background planner the noted refinement. CLI: `compositor show/drm/softdrm
+  --background <store> [--plan-model <gguf>]` (also `HORIZON_PLAN_MODEL`, else `RulePlanner`); `horizon boot`
+  picks the model up from the env. On the usual split, the testable cores are proven without a screen: glass
+  units for the `ask` parse/resolve and the `Proposal` folding (ready, destructive, missing dedup, hard block,
+  failed) and that the band renders a proposal's steps, needs, and confirm line; an aura unit that
+  `approve_and_execute` grants the missing caps, runs, and audits a read (and runs a destructive step under
+  the confirm); and three horizon headless `shell_tests` that drive the Shell's keys with no display
+  (`ask read <f>` shows a pending proposal that brokers nothing, the confirm grants the capability, runs it,
+  lands a grant and a use in the audit log, and makes Aura appear in the model; Escape dismisses without
+  running; an unplannable intent shows a failed proposal that runs nothing), run in the Linux container under
+  both `compositor-softdrm` and `compositor-winit` (and in CI under winit). The proposal band itself was
+  eye-verified by rendering it through the real pixman raster path to an image (a destructive two-capability
+  move plan, both missing, with the red approve-and-run confirm). The live on-screen interaction (keystrokes
+  routed to the shell, the model decoding on a real display) rides the existing softdrm/QEMU + winit recipe,
+  the same eye-verify the rest of the shell waits on. Built and tested on darwin and in the Linux container.
+  Left: a background planner so a slow model does not hitch the desktop, a larger model for multi-step intents,
+  and finer-grained authority (separating the capability grant from the destructive confirm, and a Weave
+  prompt for grants made outside an ask).
 
 ## Next
 
@@ -1960,10 +2007,18 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   periodic `Tick` through the same `ShellEvent` closure as the click, and the shell polls
   `Broker::reload` and redraws only on a change), proven headlessly. The Aura intent line
   is now a real launcher and command palette: `glass::aura` parses and resolves a typed
-  line (launch an app, sever channels by name, filter the view), `surface::layout` draws
-  the input, caret, and feedback and filters the list, the compositor routes keystrokes to
-  the shell when no client is focused (the new `ShellEvent::Key`), and the horizon `Shell`
-  runs a command on Enter, all headless-tested. A launched client now runs confined in a
+  line (launch an app, sever channels by name, filter the view, or `ask <intent>`),
+  `surface::layout` draws the input, caret, and feedback and filters the list, the
+  compositor routes keystrokes to the shell when no client is focused (the new
+  `ShellEvent::Key`), and the horizon `Shell` runs a command on Enter, all headless-tested.
+  An `ask <intent>` now goes all the way through Aura: the `Shell` holds a `Box<dyn Planner>`
+  (the LLM with a GGUF, the `RulePlanner` without), plans the intent into capability-checked
+  tool calls, draws them as a pending `Proposal` (the steps and the capabilities each needs,
+  held or missing), and on the confirm Enter grants the missing capabilities and runs the
+  plan through the broker (`Aura::approve_and_execute`), re-summarizing so Aura's brokered
+  uses show in the same surface; the three Shell `shell_tests` drive the ask/confirm/dismiss
+  loop headlessly, and the planner is the seam already eye-verified on Metal. A launched
+  client now runs confined in a
   Cell, not a plain spawn: `bind_host_system` for libraries, the compositor's Wayland socket
   bound in at the one path the client's env points at, an empty network namespace (a Wayland
   pathname socket crosses it), and no host data, so an app starts with no ambient authority
@@ -1993,13 +2048,24 @@ Repo: https://github.com/officialthomasguthrie/horizon-os
   and the compositor offers the shell a periodic `Tick` (the same `ShellEvent` closure
   as the click) so the desktop redraws when another process grants, uses, or revokes.
   The intent line at the bottom is now the Aura command palette (`glass::aura`): a typed
-  line parses and resolves to launch an app, sever channels by name, or filter the view,
-  drawn with a live caret and the resolved hint, fed by the compositor's `ShellEvent::Key`
-  when no client is focused; parser, resolver, palette buffer, and rendering are all
-  headless-tested. A client launched from the palette now runs confined in a Cell (only the
-  Wayland socket reaches in, the net namespace is empty, no host data), with the cell
-  construction and a connect through the bound socket asserted headlessly. Eye-verify on a
-  screen.
+  line parses and resolves to launch an app, sever channels by name, filter the view, or
+  `ask <intent>` to plan and broker a request through Aura, drawn with a live caret and the
+  resolved hint, fed by the compositor's `ShellEvent::Key` when no client is focused; parser,
+  resolver, palette buffer, and rendering are all headless-tested. An `ask` plans the intent
+  (the LLM with a model, the `RulePlanner` without) into capability-checked tool calls and
+  draws them as a pending `Proposal` (each step's effect and the capabilities it needs, held
+  or missing); the confirm Enter grants the missing capabilities and runs the plan through
+  the broker (`Aura::approve_and_execute`), so the access lands in the same audit surface,
+  while the broker still refuses anything outside the granted scope. The `Proposal` is plain
+  data the horizon `Shell` builds from `aura::Preview`, so Glass renders it without depending
+  on the model engine; the band rendering, the `Proposal` folding, and the executor confirm
+  are headless-tested, the Shell ask/confirm loop is proven in three container `shell_tests`,
+  and the band itself was eye-verified through the pixman raster path. A client launched from
+  the palette now runs confined in a Cell (only the Wayland socket reaches in, the net
+  namespace is empty, no host data), with the cell construction and a connect through the
+  bound socket asserted headlessly. The live on-screen interaction is the eye-verify on a
+  screen (the same softdrm/QEMU + winit recipe), and the planner is already eye-verified on
+  Metal.
 - Phase 5 Constellation real-host verification: the whole networking stack that
   can be built and tested on one host is done and in CI, the QUIC + Noise
   transport, serve/sync CLI, concurrent multi-peer serving, mDNS LAN discovery,

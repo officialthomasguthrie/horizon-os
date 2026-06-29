@@ -26,7 +26,10 @@ pub mod surface;
 #[cfg(test)]
 mod tests_support;
 
-pub use aura::{interpret, parse, resolve, Command, Palette, PaletteAction, Resolved};
+pub use aura::{
+    interpret, parse, resolve, Command, Palette, PaletteAction, Proposal, ProposalNeed,
+    ProposalStep, Resolved,
+};
 pub use model::{
     build, Bucket, Channel, ChannelKind, ChannelStatus, Model, PrincipalView, Totals, Window,
     DAY_SECS, WEEK_SECS,

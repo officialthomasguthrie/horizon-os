@@ -248,6 +248,22 @@ impl<'b> Aura<'b> {
         planner.plan(intent, &self.catalog)
     }
 
+    // The interactive "you approve" step, the single action the Glass palette's
+    // confirm key resolves to. After a preview has shown the user exactly which
+    // capabilities a plan needs and which it lacks, confirming grants that missing
+    // set (the user, the authority here, is the broker's yes) and runs the plan
+    // with destructive steps confirmed. This is the demo's "you approve the
+    // missing capabilities, then it runs" collapsed into one call: the preview is
+    // the disclosure, this is the approval, and the broker still brokers and
+    // audits every step, so nothing is silently acquired and a step outside the
+    // granted scope is still refused. Reversible after the fact (the grants are
+    // severable in Glass, the writes restorable from a Lifestream snapshot).
+    pub fn approve_and_execute(&mut self, plan: &Plan, limits: Limits) -> Result<Report> {
+        let preview = self.preview(plan);
+        self.grant_missing(&preview, limits)?;
+        Ok(self.execute(plan, true))
+    }
+
     // Examine a plan without running it: resolve each step's tool, compute the
     // capabilities it needs, and mark which are held. No side effects, no audit
     // entries, and no capabilities acquired.
@@ -461,6 +477,58 @@ mod tests {
         assert!(audit
             .iter()
             .any(|e| matches!(e.event, weave::Event::Use { .. })));
+    }
+
+    #[test]
+    fn approve_and_execute_grants_the_missing_caps_and_runs() {
+        // The desktop confirm path: plan an intent Aura holds no capability for,
+        // then approve-and-execute grants exactly the previewed missing caps and
+        // runs it, the access landing in the audit log.
+        let mut b = broker();
+        let work = workdir();
+        let mut aura = Aura::new(&mut b);
+        let plan = aura
+            .plan(
+                &RulePlanner,
+                &format!("read {}", work.path().join("cows.md").display()),
+            )
+            .unwrap();
+        // Nothing held yet: the preview reports one missing capability.
+        assert_eq!(aura.preview(&plan).missing().len(), 1);
+
+        let report = aura.approve_and_execute(&plan, Limits::none()).unwrap();
+        assert!(report.all_done());
+        match &report.results[0].status {
+            StepStatus::Done(Outcome::Text(t)) => assert!(t.contains("grazing")),
+            other => panic!("unexpected: {other:?}"),
+        }
+        // The grant and the use both landed in the log: granted, then exercised.
+        drop(aura);
+        let audit = b.audit().unwrap();
+        assert!(audit
+            .iter()
+            .any(|e| matches!(e.event, weave::Event::Grant { .. })));
+        assert!(audit
+            .iter()
+            .any(|e| matches!(e.event, weave::Event::Use { .. })));
+    }
+
+    #[test]
+    fn approve_and_execute_runs_a_destructive_step_under_the_confirm() {
+        // A destructive intent: approve-and-execute confirms the destructive step
+        // (the same Enter), so the file is gone in one call, unlike a bare execute
+        // which would block it.
+        let mut b = broker();
+        let work = workdir();
+        let victim = work.path().join("notes.txt");
+        let mut aura = Aura::new(&mut b);
+        let plan = aura
+            .plan(&RulePlanner, &format!("delete {}", victim.display()))
+            .unwrap();
+        assert!(victim.exists());
+        let report = aura.approve_and_execute(&plan, Limits::none()).unwrap();
+        assert!(report.all_done());
+        assert!(!victim.exists());
     }
 
     #[test]
